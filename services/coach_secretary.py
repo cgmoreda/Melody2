@@ -1,10 +1,4 @@
-"""Coach Secretary service — manages coach routing with approval flow.
-
-Responsibilities (SRP):
-- Send approval requests to the coach (with Accept/Reject buttons)
-- Move members on approval
-- Deduplicate notifications
-"""
+"""Coach secretary service for waiting-room approval workflow."""
 
 from __future__ import annotations
 
@@ -18,33 +12,35 @@ from db.repository import CoachConfig, UserRepositoryBase
 
 logger = logging.getLogger(__name__)
 
+REQUEST_TIMEOUT_SECONDS = 300
+
 
 class CoachSecretaryBase(abc.ABC):
-    """Abstraction for coach-routing logic (DIP)."""
+    """Abstraction for coach-routing logic."""
 
     @abc.abstractmethod
-    async def handle_waiting_member(
-        self,
-        member: discord.Member,
-        guild: discord.Guild,
-    ) -> None:
-        """Process a member who just joined the waiting room."""
+    async def handle_waiting_member(self, member: discord.Member, guild: discord.Guild) -> None:
+        """Process a member who joined the waiting room."""
 
     @abc.abstractmethod
     async def get_config(self, guild_id: int) -> Optional[CoachConfig]:
-        """Return the coach config for a guild."""
+        """Return coach config for a guild."""
 
     @abc.abstractmethod
     async def save_config(self, config: CoachConfig) -> None:
-        """Save coach config for a guild."""
+        """Persist coach config for a guild."""
 
     @abc.abstractmethod
     async def remove_config(self, guild_id: int) -> bool:
-        """Remove coach config for a guild."""
+        """Delete coach config for a guild."""
+
+    @abc.abstractmethod
+    def clear_notification(self, guild_id: int, member_id: int) -> None:
+        """Clear dedupe state for a pending member request."""
 
 
 class ApprovalView(discord.ui.View):
-    """Discord button view sent to the coach for approval."""
+    """DM button view sent to the coach for approval."""
 
     def __init__(
         self,
@@ -53,103 +49,100 @@ class ApprovalView(discord.ui.View):
         guild: discord.Guild,
         config: CoachConfig,
     ) -> None:
-        super().__init__(timeout=300)  # 5 minute timeout
+        super().__init__(timeout=REQUEST_TIMEOUT_SECONDS)
         self._secretary = secretary
         self._member = member
         self._guild = guild
         self._config = config
         self._responded = False
 
-    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green, emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    def _finalize(self) -> None:
+        self._secretary.clear_notification(self._guild.id, self._member.id)
+        self.stop()
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if self._responded:
             await interaction.response.send_message("You already responded.", ephemeral=True)
             return
         self._responded = True
 
-        # Check if member is still in the waiting room.
         member = self._guild.get_member(self._member.id)
         if member is None or member.voice is None or member.voice.channel is None:
             await interaction.response.edit_message(
-                content=f"⚠️ **{self._member.display_name}** has already disconnected.",
+                content=f"{self._member.display_name} is no longer in voice.",
                 view=None,
             )
+            self._finalize()
             return
 
-        # Move to coach's office.
-        coach_channel = self._guild.get_channel(self._config.coach_channel_id)
-        if not isinstance(coach_channel, discord.VoiceChannel):
+        if member.voice.channel.id != self._config.waiting_room_id:
             await interaction.response.edit_message(
-                content="❌ Coach office channel not found.",
+                content=f"{self._member.display_name} is no longer in the waiting room.",
                 view=None,
             )
+            self._finalize()
+            return
+
+        coach_channel = self._guild.get_channel(self._config.coach_channel_id)
+        if not isinstance(coach_channel, discord.VoiceChannel):
+            await interaction.response.edit_message(content="Coach room channel was not found.", view=None)
+            self._finalize()
             return
 
         try:
-            await member.move_to(coach_channel, reason="Coach accepted the request")
-            await interaction.response.edit_message(
-                content=f"✅ **{self._member.display_name}** has been moved to your office.",
-                view=None,
-            )
-            logger.info("Coach accepted %s — moved to office", self._member)
+            await member.move_to(coach_channel, reason="Coach accepted waiting-room request")
         except discord.Forbidden:
-            await interaction.response.edit_message(
-                content="❌ Missing permissions to move the member.",
-                view=None,
-            )
+            await interaction.response.edit_message(content="Missing permissions to move that member.", view=None)
+            self._finalize()
+            return
         except discord.HTTPException as exc:
-            await interaction.response.edit_message(
-                content=f"❌ Could not move member: {exc}",
-                view=None,
-            )
+            await interaction.response.edit_message(content=f"Could not move member: {exc}", view=None)
+            self._finalize()
+            return
 
-        # Clean up deduplication.
-        self._secretary.clear_notification(self._guild.id, self._member.id)
-        self.stop()
+        await interaction.response.edit_message(
+            content=f"Accepted. Moved {self._member.display_name} to {coach_channel.name}.",
+            view=None,
+        )
+        logger.info("Coach accepted %s in guild %s", self._member.id, self._guild.id)
+        self._finalize()
 
-    @discord.ui.button(label="Reject", style=discord.ButtonStyle.red, emoji="❌")
-    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if self._responded:
             await interaction.response.send_message("You already responded.", ephemeral=True)
             return
         self._responded = True
 
         await interaction.response.edit_message(
-            content=f"❌ You rejected **{self._member.display_name}**'s request.",
+            content=f"Rejected {self._member.display_name}'s request.",
             view=None,
         )
-
-        # Notify the waiting member.
         try:
-            await self._member.send("❌ The coach is currently busy. Please try again later.")
+            await self._member.send("The coach declined your request. Please try again later.")
         except discord.Forbidden:
-            logger.warning("Cannot DM %s", self._member)
+            logger.warning("Cannot DM member %s after rejection", self._member.id)
 
-        self._secretary.clear_notification(self._guild.id, self._member.id)
-        self.stop()
+        self._finalize()
 
     async def on_timeout(self) -> None:
-        """Called when the coach doesn't respond in time."""
-        self._secretary.clear_notification(self._guild.id, self._member.id)
+        self._finalize()
 
 
 class CoachSecretary(CoachSecretaryBase):
-    """Concrete coach routing service with approval flow."""
+    """Concrete coach routing service with approval workflow."""
 
     def __init__(self, repo: UserRepositoryBase) -> None:
         self._repo = repo
-
-        # Per-guild deduplication: guild_id → set of notified member IDs.
         self._notified: dict[int, set[int]] = {}
-
-        # Cache of configs loaded from DB.
         self._configs: dict[int, CoachConfig] = {}
 
-    # ── config management ──────────────────────────────────────
-
     async def get_config(self, guild_id: int) -> Optional[CoachConfig]:
-        if guild_id in self._configs:
-            return self._configs[guild_id]
+        cached = self._configs.get(guild_id)
+        if cached is not None:
+            return cached
+
         config = await self._repo.get_coach_config(guild_id)
         if config is not None:
             self._configs[guild_id] = config
@@ -158,7 +151,7 @@ class CoachSecretary(CoachSecretaryBase):
     async def save_config(self, config: CoachConfig) -> None:
         await self._repo.upsert_coach_config(config)
         self._configs[config.guild_id] = config
-        logger.info("Coach config saved for guild %s", config.guild_id)
+        logger.info("Saved coach config for guild %s", config.guild_id)
 
     async def remove_config(self, guild_id: int) -> bool:
         removed = await self._repo.delete_coach_config(guild_id)
@@ -166,50 +159,41 @@ class CoachSecretary(CoachSecretaryBase):
         self._notified.pop(guild_id, None)
         return removed
 
-    # ── routing ────────────────────────────────────────────────
-
-    async def handle_waiting_member(
-        self,
-        member: discord.Member,
-        guild: discord.Guild,
-    ) -> None:
+    async def handle_waiting_member(self, member: discord.Member, guild: discord.Guild) -> None:
         config = await self.get_config(guild.id)
         if config is None:
             return
 
-        # Deduplicate: don't spam the coach for the same member.
         notified = self._notified.setdefault(guild.id, set())
         if member.id in notified:
             return
-        notified.add(member.id)
 
-        # Find the coach in the guild.
         coach = guild.get_member(config.coach_id)
         if coach is None:
-            logger.warning("Coach (ID %s) not found in guild %s", config.coach_id, guild.id)
+            logger.warning("Configured coach %s is not in guild %s", config.coach_id, guild.id)
             return
 
-        # Send approval request to the coach.
-        view = ApprovalView(self, member, guild, config)
+        notified.add(member.id)
+
         try:
             await coach.send(
-                f"📣 **{member.display_name}** is waiting in the Secretary. Accept?",
-                view=view,
+                f"{member.display_name} is in the waiting room. Accept request?",
+                view=ApprovalView(self, member, guild, config),
             )
-            logger.info("Sent approval request to coach for %s", member)
         except discord.Forbidden:
-            logger.warning("Cannot DM coach — DMs may be disabled")
-            notified.discard(member.id)
+            self.clear_notification(guild.id, member.id)
+            logger.warning("Cannot DM coach %s in guild %s", coach.id, guild.id)
             return
 
-        # Notify the waiting member.
         try:
-            await member.send("⏳ The coach has been notified — please wait for approval.")
+            await member.send("The coach has been notified. Please wait for a response.")
         except discord.Forbidden:
-            logger.warning("Cannot DM %s", member)
+            logger.info("Cannot DM waiting member %s in guild %s", member.id, guild.id)
 
     def clear_notification(self, guild_id: int, member_id: int) -> None:
-        """Remove a member from the notified set."""
         notified = self._notified.get(guild_id)
-        if notified:
-            notified.discard(member_id)
+        if notified is None:
+            return
+        notified.discard(member_id)
+        if not notified:
+            self._notified.pop(guild_id, None)

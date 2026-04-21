@@ -11,6 +11,7 @@ from db.repository import UserRepositoryBase
 
 CHECK_INTERVAL_SECONDS = 15 * 60
 CONFIRM_TIMEOUT_SECONDS = 3 * 60
+MAX_VOICEHOURS_LINES = 35
 
 
 def _hours(seconds: float) -> str:
@@ -18,9 +19,7 @@ def _hours(seconds: float) -> str:
 
 
 def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
-    if channel is None:
-        return False
-    return "solo" in channel.name.lower()
+    return channel is not None and "solo" in channel.name.lower()
 
 
 class WorkConfirmationView(discord.ui.View):
@@ -53,8 +52,26 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             task.cancel()
         self._watchdogs.clear()
 
+    async def _start_voice_session(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        channel: discord.VoiceChannel,
+        started_at: datetime,
+    ) -> None:
+        await self._repo.start_voice_session(
+            guild_id=guild_id,
+            discord_id=member_id,
+            channel_id=channel.id,
+            channel_name=channel.name,
+            is_solo=_is_solo_channel(channel),
+            started_at=started_at,
+        )
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        now = datetime.now(tz=UTC)
         for guild in self.bot.guilds:
             for voice_channel in guild.voice_channels:
                 if not _is_solo_channel(voice_channel):
@@ -64,13 +81,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         continue
                     has_open = await self._repo.has_open_voice_session(guild.id, member.id)
                     if not has_open:
-                        await self._repo.start_voice_session(
+                        await self._start_voice_session(
                             guild_id=guild.id,
-                            discord_id=member.id,
-                            channel_id=voice_channel.id,
-                            channel_name=voice_channel.name,
-                            is_solo=True,
-                            started_at=datetime.now(tz=UTC),
+                            member_id=member.id,
+                            channel=voice_channel,
+                            started_at=now,
                         )
                     self._start_watchdog(member)
 
@@ -90,19 +105,16 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         await self._repo.close_open_voice_sessions(member.guild.id, member.id, now)
         self._stop_watchdog(member.id)
 
-        if after.channel is None:
+        if not isinstance(after.channel, discord.VoiceChannel):
             return
 
-        is_solo = _is_solo_channel(after.channel)
-        await self._repo.start_voice_session(
+        await self._start_voice_session(
             guild_id=member.guild.id,
-            discord_id=member.id,
-            channel_id=after.channel.id,
-            channel_name=after.channel.name,
-            is_solo=is_solo,
+            member_id=member.id,
+            channel=after.channel,
             started_at=now,
         )
-        if is_solo:
+        if _is_solo_channel(after.channel):
             self._start_watchdog(member)
 
     def _start_watchdog(self, member: discord.Member) -> None:
@@ -121,6 +133,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         try:
             while True:
                 await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
                 guild = self.bot.get_guild(guild_id)
                 if guild is None:
                     break
@@ -134,9 +147,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     break
 
                 confirmed = await self._ask_still_working(member)
-                if confirmed is True:
-                    continue
-                if confirmed is None:
+                if confirmed is True or confirmed is None:
                     continue
 
                 disconnected = False
@@ -144,14 +155,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     try:
                         await member.move_to(None, reason="No response to solo-channel work check")
                         disconnected = True
-                    except discord.Forbidden:
+                    except (discord.Forbidden, discord.HTTPException):
                         disconnected = False
-                    except discord.HTTPException:
-                        disconnected = False
+
                 if not disconnected:
                     try:
                         await member.send(
-                            "You did not confirm in time. I could not disconnect you due missing permissions."
+                            "You did not confirm in time. I could not disconnect you due to missing permissions."
                         )
                     except discord.Forbidden:
                         pass
@@ -194,7 +204,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
     async def voicehours(self, ctx: commands.Context) -> None:
-        """Show solo-channel time per user for week, month, and all time."""
         assert ctx.guild is not None
 
         now = datetime.now(tz=UTC)
@@ -227,8 +236,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             )
 
         header = "**Handle | Last Week | Last Month | All Time**\n"
-        body = "\n".join(lines[:35])
-        extra = len(lines) - min(len(lines), 35)
+        body = "\n".join(lines[:MAX_VOICEHOURS_LINES])
+        extra = len(lines) - min(len(lines), MAX_VOICEHOURS_LINES)
         if extra > 0:
             body += f"\n... and {extra} more users"
         await ctx.send(header + body)
