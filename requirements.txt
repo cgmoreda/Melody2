@@ -1,3 +1,5 @@
 discord.py>=2.7,<3; python_version < "3.14"
 discord.py @ git+https://github.com/Rapptz/discord.py@84f9877860d434969443c68ad2bed5f66ac0270f ; python_version >= "3.14"
 python-dotenv>=1.0,<2
+aiohttp>=3.9,<4
+aiosqlite>=0.20,<1
