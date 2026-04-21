@@ -20,6 +20,20 @@ def _generate_code(length: int = 6) -> str:
     return "CF-VERIFY-" + "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _whois_colour(max_rating: int) -> discord.Colour:
+    if max_rating >= 2400:
+        return discord.Colour.red()
+    if max_rating >= 2100:
+        return discord.Colour.orange()
+    if max_rating >= 1900:
+        return discord.Colour.purple()
+    if max_rating >= 1600:
+        return discord.Colour.blue()
+    if max_rating >= 1200:
+        return discord.Colour.green()
+    return discord.Colour.light_grey()
+
+
 class VerificationCog(commands.Cog, name="Verification"):
     """Codeforces handle verification and automatic role assignment."""
 
@@ -151,15 +165,30 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
             return
 
+        rank = (info.rank or "unrated").title()
+        max_rank = (info.max_rank or "unrated").title()
+        location = ", ".join(part for part in [info.city, info.country] if part) or "Unknown"
+        organization = info.organization or "Not specified"
+
         embed = discord.Embed(
-            title=info.handle,
-            description=(
-                f"**CF Handle:** [{info.handle}](https://codeforces.com/profile/{info.handle})\n"
-                f"**Current Rating:** {info.rating}\n"
-                f"**Max Rating:** {info.max_rating}"
-            ),
-            colour=discord.Colour.blurple(),
+            title=f"Codeforces: {info.handle}",
+            url=f"https://codeforces.com/profile/{info.handle}",
+            description=f"Live profile lookup for **{info.handle}**",
+            colour=_whois_colour(info.max_rating),
         )
+        embed.add_field(name="Rank", value=rank, inline=True)
+        embed.add_field(name="Max Rank", value=max_rank, inline=True)
+        embed.add_field(name="Contribution", value=str(info.contribution), inline=True)
+        embed.add_field(name="Current Rating", value=str(info.rating), inline=True)
+        embed.add_field(name="Max Rating", value=str(info.max_rating), inline=True)
+        embed.add_field(name="Friends", value=str(info.friend_of_count), inline=True)
+        embed.add_field(name="Location", value=location, inline=False)
+        embed.add_field(name="Organization", value=organization, inline=False)
+        if info.avatar_url:
+            embed.set_thumbnail(url=info.avatar_url)
+        if info.title_photo_url:
+            embed.set_image(url=info.title_photo_url)
+        embed.set_footer(text="Data fetched live from Codeforces")
         await ctx.send(embed=embed)
 
     @verify.error

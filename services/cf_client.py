@@ -21,6 +21,15 @@ class CFUserInfo:
     first_name: Optional[str]
     rating: int
     max_rating: int
+    rank: Optional[str]
+    max_rank: Optional[str]
+    country: Optional[str]
+    city: Optional[str]
+    organization: Optional[str]
+    contribution: int
+    friend_of_count: int
+    avatar_url: Optional[str]
+    title_photo_url: Optional[str]
 
 
 class CodeforcesClientBase(abc.ABC):
@@ -65,4 +74,13 @@ class CodeforcesClient(CodeforcesClientBase):
             first_name=user.get("firstName"),
             rating=user.get("rating", 0),
             max_rating=user.get("maxRating", user.get("rating", 0)),
+            rank=user.get("rank"),
+            max_rank=user.get("maxRank"),
+            country=user.get("country"),
+            city=user.get("city"),
+            organization=user.get("organization"),
+            contribution=user.get("contribution", 0),
+            friend_of_count=user.get("friendOfCount", 0),
+            avatar_url=user.get("avatar"),
+            title_photo_url=user.get("titlePhoto"),
         )
