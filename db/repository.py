@@ -31,6 +31,18 @@ class CoachConfig:
     coach_channel_id: int
 
 
+@dataclass(slots=True)
+class GuildCommandConfig:
+    """Per-guild command behavior configuration."""
+
+    guild_id: int
+    reminder_preview_limit: int
+    roundchanges_max_lines: int
+    voicehours_max_lines: int
+    voice_check_interval_seconds: int
+    voice_confirm_timeout_seconds: int
+
+
 class UserRepositoryBase(abc.ABC):
     """Abstraction over persistent user storage."""
 
@@ -104,6 +116,18 @@ class UserRepositoryBase(abc.ABC):
     ) -> dict[int, float]:
         """Return total solo-channel voice time in seconds per user."""
 
+    @abc.abstractmethod
+    async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
+        """Return persisted command config for a guild if one exists."""
+
+    @abc.abstractmethod
+    async def upsert_guild_command_config(self, config: GuildCommandConfig) -> None:
+        """Insert or update command config for a guild."""
+
+    @abc.abstractmethod
+    async def delete_guild_command_config(self, guild_id: int) -> bool:
+        """Delete command config for a guild. Returns True if a row was deleted."""
+
 
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
@@ -163,6 +187,18 @@ class UserRepository(UserRepositoryBase):
                 """
                 CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
                 ON voice_sessions (guild_id, discord_id, started_at)
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_command_config (
+                    guild_id BIGINT PRIMARY KEY,
+                    reminder_preview_limit INTEGER NOT NULL DEFAULT 3 CHECK (reminder_preview_limit BETWEEN 1 AND 10),
+                    roundchanges_max_lines INTEGER NOT NULL DEFAULT 30 CHECK (roundchanges_max_lines BETWEEN 5 AND 60),
+                    voicehours_max_lines INTEGER NOT NULL DEFAULT 35 CHECK (voicehours_max_lines BETWEEN 5 AND 100),
+                    voice_check_interval_seconds INTEGER NOT NULL DEFAULT 900 CHECK (voice_check_interval_seconds BETWEEN 60 AND 7200),
+                    voice_confirm_timeout_seconds INTEGER NOT NULL DEFAULT 180 CHECK (voice_confirm_timeout_seconds BETWEEN 60 AND 900)
+                )
                 """
             )
         logger.info("Database initialised")
@@ -443,3 +479,71 @@ class UserRepository(UserRepositoryBase):
                     now,
                 )
         return {row["discord_id"]: float(row["seconds"]) for row in rows}
+
+    async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id,
+                       reminder_preview_limit,
+                       roundchanges_max_lines,
+                       voicehours_max_lines,
+                       voice_check_interval_seconds,
+                       voice_confirm_timeout_seconds
+                FROM guild_command_config
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        if row is None:
+            return None
+        return GuildCommandConfig(
+            guild_id=row["guild_id"],
+            reminder_preview_limit=row["reminder_preview_limit"],
+            roundchanges_max_lines=row["roundchanges_max_lines"],
+            voicehours_max_lines=row["voicehours_max_lines"],
+            voice_check_interval_seconds=row["voice_check_interval_seconds"],
+            voice_confirm_timeout_seconds=row["voice_confirm_timeout_seconds"],
+        )
+
+    async def upsert_guild_command_config(self, config: GuildCommandConfig) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO guild_command_config (
+                    guild_id,
+                    reminder_preview_limit,
+                    roundchanges_max_lines,
+                    voicehours_max_lines,
+                    voice_check_interval_seconds,
+                    voice_confirm_timeout_seconds
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT(guild_id)
+                DO UPDATE SET reminder_preview_limit = excluded.reminder_preview_limit,
+                              roundchanges_max_lines = excluded.roundchanges_max_lines,
+                              voicehours_max_lines = excluded.voicehours_max_lines,
+                              voice_check_interval_seconds = excluded.voice_check_interval_seconds,
+                              voice_confirm_timeout_seconds = excluded.voice_confirm_timeout_seconds
+                """,
+                config.guild_id,
+                config.reminder_preview_limit,
+                config.roundchanges_max_lines,
+                config.voicehours_max_lines,
+                config.voice_check_interval_seconds,
+                config.voice_confirm_timeout_seconds,
+            )
+
+    async def delete_guild_command_config(self, guild_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM guild_command_config
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        return result.endswith("1")

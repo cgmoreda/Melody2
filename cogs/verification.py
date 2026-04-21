@@ -14,13 +14,12 @@ from discord.ext import commands
 from db.repository import UserRepositoryBase, VerifiedUser
 from services.cf_client import CFContestChange, CFSubmission, CFUserInfo, CodeforcesClientBase
 from services.contest_reminder import ContestReminderService
+from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssignerBase
 
 logger = logging.getLogger(__name__)
 
-MAX_ROUNDCHANGES_LINES = 30
 MAX_RECENT_CONTEST_LINES = 5
-MAX_REMINDER_PREVIEW = 3
 
 
 def _generate_code(length: int = 6) -> str:
@@ -48,11 +47,13 @@ class VerificationCog(commands.Cog, name="Verification"):
         cf_client: CodeforcesClientBase,
         role_assigner: RoleAssignerBase,
         repo: UserRepositoryBase,
+        config_service: GuildConfigService,
         reminder_service: Optional[ContestReminderService],
     ) -> None:
         self._cf = cf_client
         self._roles = role_assigner
         self._repo = repo
+        self._config = config_service
         self._reminders = reminder_service
         self._pending: dict[tuple[int, int], tuple[str, str]] = {}
 
@@ -378,6 +379,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     async def roundchanges(self, ctx: commands.Context) -> None:
         assert ctx.guild is not None
 
+        config = await self._config.get(ctx.guild.id)
         users = await self._repo.get_all(ctx.guild.id)
         if not users:
             await ctx.send("No verified users found in this server.")
@@ -429,7 +431,7 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send("No rating updates found for the latest round.")
             return
 
-        displayed = lines[:MAX_ROUNDCHANGES_LINES]
+        displayed = lines[: config.roundchanges_max_lines]
         hidden_count = len(lines) - len(displayed)
 
         embed = discord.Embed(
@@ -521,11 +523,13 @@ class VerificationCog(commands.Cog, name="Verification"):
     @reminder.command(name="next")
     @commands.guild_only()
     async def reminder_next(self, ctx: commands.Context) -> None:
+        assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")
             return
 
-        contests = await self._reminders.get_upcoming_div_contests(limit=MAX_REMINDER_PREVIEW)
+        config = await self._config.get(ctx.guild.id)
+        contests = await self._reminders.get_upcoming_div_contests(limit=config.reminder_preview_limit)
         if not contests:
             await ctx.send("No upcoming Div contests found right now.")
             return
@@ -543,7 +547,7 @@ class VerificationCog(commands.Cog, name="Verification"):
             description="\n".join(lines),
             colour=discord.Colour.gold(),
         )
-        embed.set_footer(text=f"Showing up to {MAX_REMINDER_PREVIEW} upcoming Div contests")
+        embed.set_footer(text=f"Showing up to {config.reminder_preview_limit} upcoming Div contests")
         await ctx.send(embed=embed)
 
     @verify.error
@@ -581,6 +585,7 @@ async def setup(bot: commands.Bot) -> None:
             getattr(bot, "cf_client"),
             getattr(bot, "role_assigner"),
             getattr(bot, "user_repo"),
+            getattr(bot, "guild_config"),
             getattr(bot, "contest_reminder", None),
         )
     )
