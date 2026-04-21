@@ -331,7 +331,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.group(name="reminder", invoke_without_command=True)
     @commands.guild_only()
     async def reminder(self, ctx: commands.Context) -> None:
-        await ctx.send("Usage: **!reminder <enable|disable|status> [#channel]**")
+        await ctx.send("Usage: **!reminder <enable|disable|status|next> [#channel]**")
 
     @reminder.command(name="enable")
     @commands.guild_only()
@@ -401,6 +401,34 @@ class VerificationCog(commands.Cog, name="Verification"):
         enabled = await self._reminders.is_channel_enabled(ctx.guild.id, target.id)
         state = "enabled" if enabled else "disabled"
         await ctx.send(f"Contest reminders are **{state}** in {target.mention}.")
+
+    @reminder.command(name="next")
+    @commands.guild_only()
+    async def reminder_next(self, ctx: commands.Context) -> None:
+        if self._reminders is None:
+            await ctx.send("Reminder service is not available.")
+            return
+
+        contests = await self._reminders.get_upcoming_div_contests(limit=3)
+        if not contests:
+            await ctx.send("No upcoming Div contests found right now.")
+            return
+
+        lines = []
+        for idx, contest in enumerate(contests, start=1):
+            ts = contest.start_time_seconds
+            lines.append(
+                f"{idx}. [{contest.name}](https://codeforces.com/contest/{contest.contest_id}) - "
+                f"<t:{ts}:R> (<t:{ts}:f>)"
+            )
+
+        embed = discord.Embed(
+            title="Upcoming Div Contests",
+            description="\n".join(lines),
+            colour=discord.Colour.gold(),
+        )
+        embed.set_footer(text="Showing up to 3 upcoming Div contests")
+        await ctx.send(embed=embed)
 
     @verify.error
     async def verify_error(self, ctx: commands.Context, error: commands.CommandError) -> None:

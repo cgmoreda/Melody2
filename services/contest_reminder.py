@@ -139,6 +139,14 @@ class ContestReminderService:
         async with self._lock:
             return (guild_id, channel_id) in self._enabled_channels
 
+    async def get_upcoming_div_contests(self, limit: int = 3) -> list[CFContest]:
+        contests = await self._fetch_before_contests()
+        if contests is None:
+            return []
+        div_contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
+        div_contests.sort(key=lambda contest: contest.start_time_seconds)
+        return div_contests[: max(1, limit)]
+
     async def _maybe_send_reminder(
         self,
         *,
@@ -218,3 +226,8 @@ class ContestReminderService:
             return contests
 
         return None
+
+
+def _is_div_contest_name(name: str) -> bool:
+    lowered = name.lower()
+    return "div." in lowered or "div " in lowered
