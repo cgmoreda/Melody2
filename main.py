@@ -21,6 +21,7 @@ load_dotenv()
 
 EXTENSIONS = [
     "cogs.verification",
+    "cogs.voice_logging",
 ]
 
 
@@ -40,6 +41,7 @@ def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
+    intents.voice_states = True
 
     bot = MelodyBot(command_prefix="!", intents=intents)
 
