@@ -53,7 +53,7 @@ class CodeforcesClientBase(abc.ABC):
 
     @abc.abstractmethod
     async def get_user(self, handle: str) -> Optional[CFUserInfo]:
-        """Return user info or ``None`` if the handle does not exist."""
+        """Return user info or None if the handle does not exist."""
 
     @abc.abstractmethod
     async def get_rating_history(self, handle: str) -> list[CFContestChange]:
@@ -65,7 +65,7 @@ class CodeforcesClientBase(abc.ABC):
 
 
 class CodeforcesClient(CodeforcesClientBase):
-    """Concrete Codeforces API client backed by ``aiohttp``."""
+    """Concrete Codeforces API client backed by aiohttp."""
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
@@ -73,60 +73,79 @@ class CodeforcesClient(CodeforcesClientBase):
     async def _get(self, endpoint: str, params: dict[str, object]) -> Optional[dict]:
         url = f"{CF_API_BASE}/{endpoint}"
         full_params = {**params, "_": int(time.time())}
+
         try:
             async with self._session.get(
                 url,
                 params=full_params,
                 timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("CF API returned status %s for endpoint %s", resp.status, endpoint)
+            ) as response:
+                if response.status != 200:
+                    logger.warning("CF API returned status %s for endpoint %s", response.status, endpoint)
                     return None
-                data = await resp.json()
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            logger.error("CF API request failed: %s", exc)
+                payload = await response.json(content_type=None)
+        except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+            logger.warning("CF API request failed for endpoint %s: %s", endpoint, exc)
             return None
 
-        if data.get("status") != "OK":
+        if not isinstance(payload, dict):
             return None
-        return data
+        if payload.get("status") != "OK":
+            return None
+        return payload
 
     async def get_user(self, handle: str) -> Optional[CFUserInfo]:
         data = await self._get("user.info", {"handles": handle})
-        if data is None or not data.get("result"):
+        if data is None:
             return None
 
-        user = data["result"][0]
+        result = data.get("result")
+        if not isinstance(result, list) or not result:
+            return None
+
+        user = result[0]
+        if not isinstance(user, dict):
+            return None
+
+        current_rating = int(user.get("rating", 0) or 0)
+        max_rating = int(user.get("maxRating", current_rating) or current_rating)
+
         return CFUserInfo(
-            handle=user.get("handle", handle),
-            first_name=user.get("firstName"),
-            rating=user.get("rating", 0),
-            max_rating=user.get("maxRating", user.get("rating", 0)),
-            rank=user.get("rank"),
-            max_rank=user.get("maxRank"),
-            country=user.get("country"),
-            city=user.get("city"),
-            organization=user.get("organization"),
-            contribution=user.get("contribution", 0),
-            friend_of_count=user.get("friendOfCount", 0),
-            avatar_url=user.get("avatar"),
-            title_photo_url=user.get("titlePhoto"),
+            handle=str(user.get("handle", handle)),
+            first_name=user.get("firstName") if isinstance(user.get("firstName"), str) else None,
+            rating=current_rating,
+            max_rating=max_rating,
+            rank=user.get("rank") if isinstance(user.get("rank"), str) else None,
+            max_rank=user.get("maxRank") if isinstance(user.get("maxRank"), str) else None,
+            country=user.get("country") if isinstance(user.get("country"), str) else None,
+            city=user.get("city") if isinstance(user.get("city"), str) else None,
+            organization=user.get("organization") if isinstance(user.get("organization"), str) else None,
+            contribution=int(user.get("contribution", 0) or 0),
+            friend_of_count=int(user.get("friendOfCount", 0) or 0),
+            avatar_url=user.get("avatar") if isinstance(user.get("avatar"), str) else None,
+            title_photo_url=user.get("titlePhoto") if isinstance(user.get("titlePhoto"), str) else None,
         )
 
     async def get_rating_history(self, handle: str) -> list[CFContestChange]:
         data = await self._get("user.rating", {"handle": handle})
         if data is None:
             return []
-        result = data.get("result", [])
+
+        result = data.get("result")
+        if not isinstance(result, list):
+            return []
+
         history: list[CFContestChange] = []
         for row in result:
+            if not isinstance(row, dict):
+                continue
             history.append(
                 CFContestChange(
-                    contest_id=row.get("contestId", 0),
-                    contest_name=row.get("contestName", "Unknown"),
-                    rank=row.get("rank", 0),
-                    old_rating=row.get("oldRating", 0),
-                    new_rating=row.get("newRating", 0),
+                    contest_id=int(row.get("contestId", 0) or 0),
+                    contest_name=str(row.get("contestName", "Unknown")),
+                    rank=int(row.get("rank", 0) or 0),
+                    old_rating=int(row.get("oldRating", 0) or 0),
+                    new_rating=int(row.get("newRating", 0) or 0),
                 )
             )
         return history
@@ -136,25 +155,40 @@ class CodeforcesClient(CodeforcesClientBase):
         data = await self._get("user.status", {"handle": handle, "from": 1, "count": safe_count})
         if data is None:
             return []
-        result = data.get("result", [])
+
+        result = data.get("result")
+        if not isinstance(result, list):
+            return []
+
         submissions: list[CFSubmission] = []
         for row in result:
-            problem = row.get("problem", {}) or {}
-            tags = tuple(tag for tag in problem.get("tags", []) if isinstance(tag, str))
+            if not isinstance(row, dict):
+                continue
+
+            problem = row.get("problem")
+            if not isinstance(problem, dict):
+                problem = {}
+
+            raw_tags = problem.get("tags")
+            tags = tuple(tag for tag in raw_tags if isinstance(tag, str)) if isinstance(raw_tags, list) else ()
+
             contest_id = problem.get("contestId")
             index = problem.get("index")
             problemset_name = problem.get("problemsetName")
+
             problem_key: Optional[str] = None
-            if contest_id and index:
+            if isinstance(contest_id, int) and isinstance(index, str):
                 problem_key = f"{contest_id}{index}"
-            elif problemset_name and index:
+            elif isinstance(problemset_name, str) and isinstance(index, str):
                 problem_key = f"{problemset_name}:{index}"
 
+            verdict = row.get("verdict")
             submissions.append(
                 CFSubmission(
-                    verdict=row.get("verdict"),
+                    verdict=verdict if isinstance(verdict, str) else None,
                     tags=tags,
                     problem_key=problem_key,
                 )
             )
+
         return submissions

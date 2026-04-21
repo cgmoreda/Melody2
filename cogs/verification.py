@@ -44,7 +44,6 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     def __init__(
         self,
-        bot: commands.Bot,
         cf_client: CodeforcesClientBase,
         role_assigner: RoleAssignerBase,
         repo: UserRepositoryBase,
@@ -54,7 +53,11 @@ class VerificationCog(commands.Cog, name="Verification"):
         self._roles = role_assigner
         self._repo = repo
         self._reminders = reminder_service
-        self._pending: dict[int, tuple[str, str]] = {}
+        self._pending: dict[tuple[int, int], tuple[str, str]] = {}
+
+    @staticmethod
+    def _pending_key(guild_id: int, user_id: int) -> tuple[int, int]:
+        return guild_id, user_id
 
     @commands.command(name="verify")
     @commands.guild_only()
@@ -69,7 +72,7 @@ class VerificationCog(commands.Cog, name="Verification"):
             return
 
         code = _generate_code()
-        self._pending[ctx.author.id] = (handle, code)
+        self._pending[self._pending_key(ctx.guild.id, ctx.author.id)] = (handle, code)
 
         embed = discord.Embed(
             title="Verification Started",
@@ -90,7 +93,8 @@ class VerificationCog(commands.Cog, name="Verification"):
         """Confirm your Codeforces verification after setting the code."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
 
-        pending = self._pending.get(ctx.author.id)
+        key = self._pending_key(ctx.guild.id, ctx.author.id)
+        pending = self._pending.get(key)
         if pending is None:
             await ctx.send("You have no pending verification. Use **!verify <handle>** first.")
             return
@@ -110,7 +114,7 @@ class VerificationCog(commands.Cog, name="Verification"):
             )
             return
 
-        del self._pending[ctx.author.id]
+        del self._pending[key]
 
         user = VerifiedUser(
             discord_id=ctx.author.id,
@@ -155,9 +159,13 @@ class VerificationCog(commands.Cog, name="Verification"):
         old_role_rule = self._roles.role_for(old_rating)
         old_role_name = old_role_rule.name if old_role_rule else "none"
 
-        record.cf_handle = info.handle
-        record.rating = info.max_rating
-        await self._repo.upsert(record)
+        updated_record = VerifiedUser(
+            discord_id=record.discord_id,
+            cf_handle=info.handle,
+            rating=info.max_rating,
+            guild_id=record.guild_id,
+        )
+        await self._repo.upsert(updated_record)
 
         role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
         new_role_rule = self._roles.role_for(info.max_rating)
@@ -298,7 +306,6 @@ class VerificationCog(commands.Cog, name="Verification"):
                 row.problem_key for row in submissions if row.verdict == "OK" and row.problem_key is not None
             }
             unique_solved = len(solved_problem_keys)
-            verdicts = Counter(row.verdict or "UNKNOWN" for row in submissions)
             fail_count = total - solved
             retry_factor = (solved / unique_solved) if unique_solved else 0.0
 
@@ -546,7 +553,6 @@ async def setup(bot: commands.Bot) -> None:
     """Called by ``bot.load_extension("cogs.verification")``."""
     await bot.add_cog(
         VerificationCog(
-            bot,
             getattr(bot, "cf_client"),
             getattr(bot, "role_assigner"),
             getattr(bot, "user_repo"),

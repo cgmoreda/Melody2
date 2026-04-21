@@ -58,12 +58,43 @@ class ContestReminderService:
     async def stop(self) -> None:
         if self._task is None:
             return
+
         self._task.cancel()
         try:
             await self._task
         except asyncio.CancelledError:
             pass
         self._task = None
+
+    async def enable_channel(self, guild_id: int, channel_id: int) -> bool:
+        inserted = await self._repo.add_reminder_channel(guild_id, channel_id)
+        async with self._lock:
+            self._enabled_channels.add((guild_id, channel_id))
+        return inserted
+
+    async def disable_channel(self, guild_id: int, channel_id: int) -> bool:
+        removed = await self._repo.remove_reminder_channel(guild_id, channel_id)
+        async with self._lock:
+            self._enabled_channels.discard((guild_id, channel_id))
+            self._sent_cache = {
+                cache_key
+                for cache_key in self._sent_cache
+                if cache_key[0] != channel_id
+            }
+        return removed
+
+    async def is_channel_enabled(self, guild_id: int, channel_id: int) -> bool:
+        async with self._lock:
+            return (guild_id, channel_id) in self._enabled_channels
+
+    async def get_upcoming_div_contests(self, limit: int = 3) -> list[CFContest]:
+        contests = await self._fetch_before_contests()
+        if contests is None:
+            return []
+
+        div_contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
+        div_contests.sort(key=lambda contest: contest.start_time_seconds)
+        return div_contests[: max(1, limit)]
 
     async def _run_loop(self) -> None:
         logger.info("Contest reminder loop started (poll=%ss)", self._poll_seconds)
@@ -81,11 +112,14 @@ class ContestReminderService:
 
         now = datetime.now(tz=UTC)
         poll_window = timedelta(seconds=self._poll_seconds)
-        contest_ids = {c.contest_id for c in contests}
+        active_contest_ids = {contest.contest_id for contest in contests}
+
         async with self._lock:
             enabled_channels = list(self._enabled_channels)
             self._sent_cache = {
-                key for key in self._sent_cache if key[1] in contest_ids
+                cache_key
+                for cache_key in self._sent_cache
+                if cache_key[1] in active_contest_ids
             }
 
         for guild_id, channel_id in enabled_channels:
@@ -106,7 +140,7 @@ class ContestReminderService:
                     reminder_type="24h",
                     target=timedelta(hours=24),
                     window=poll_window,
-                    message=f"📢 {contest.name} starts in 24h",
+                    message=f"[Reminder] {contest.name} starts in 24h",
                     until_start=until_start,
                 )
                 await self._maybe_send_reminder(
@@ -116,36 +150,9 @@ class ContestReminderService:
                     reminder_type="1h",
                     target=timedelta(hours=1),
                     window=poll_window,
-                    message=f"⏰ {contest.name} starts in 1h",
+                    message=f"[Reminder] {contest.name} starts in 1h",
                     until_start=until_start,
                 )
-
-    async def enable_channel(self, guild_id: int, channel_id: int) -> bool:
-        inserted = await self._repo.add_reminder_channel(guild_id, channel_id)
-        async with self._lock:
-            self._enabled_channels.add((guild_id, channel_id))
-        return inserted
-
-    async def disable_channel(self, guild_id: int, channel_id: int) -> bool:
-        removed = await self._repo.remove_reminder_channel(guild_id, channel_id)
-        async with self._lock:
-            self._enabled_channels.discard((guild_id, channel_id))
-            self._sent_cache = {
-                key for key in self._sent_cache if not (key[0] == channel_id and key[2] in {"24h", "1h"})
-            }
-        return removed
-
-    async def is_channel_enabled(self, guild_id: int, channel_id: int) -> bool:
-        async with self._lock:
-            return (guild_id, channel_id) in self._enabled_channels
-
-    async def get_upcoming_div_contests(self, limit: int = 3) -> list[CFContest]:
-        contests = await self._fetch_before_contests()
-        if contests is None:
-            return []
-        div_contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
-        div_contests.sort(key=lambda contest: contest.start_time_seconds)
-        return div_contests[: max(1, limit)]
 
     async def _maybe_send_reminder(
         self,
@@ -163,12 +170,31 @@ class ContestReminderService:
         async with self._lock:
             if key in self._sent_cache:
                 return
+
         if not (target - window <= until_start <= target):
             return
 
-        await channel.send(message)
+        try:
+            await channel.send(message)
+        except discord.Forbidden:
+            logger.warning(
+                "Cannot send reminder to channel %s in guild %s due to missing permissions",
+                channel.id,
+                guild_id,
+            )
+            return
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Failed sending reminder to channel %s in guild %s: %s",
+                channel.id,
+                guild_id,
+                exc,
+            )
+            return
+
         async with self._lock:
             self._sent_cache.add(key)
+
         logger.info(
             "Sent %s reminder for contest %s (%s) in guild %s channel %s",
             reminder_type,
@@ -186,10 +212,10 @@ class ContestReminderService:
                     CF_CONTEST_LIST_API,
                     params={"_": int(datetime.now(tz=UTC).timestamp())},
                     timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"contest.list returned HTTP {resp.status}")
-                    payload = await resp.json()
+                ) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"contest.list returned HTTP {response.status}")
+                    payload = await response.json()
             except (aiohttp.ClientError, TimeoutError, RuntimeError) as exc:
                 logger.warning("contest.list attempt %d failed: %s", attempt, exc)
                 if attempt < 3:

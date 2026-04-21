@@ -8,31 +8,31 @@ from dotenv import load_dotenv
 
 from db.repository import UserRepository
 from services.cf_client import CodeforcesClient
+from services.coach_secretary import CoachSecretary
 from services.contest_reminder import ContestReminderService
 from services.role_assigner import RoleAssigner
-from services.coach_secretary import CoachSecretary
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-EXTENSIONS = [
+EXTENSIONS: tuple[str, ...] = (
     "cogs.verification",
     "cogs.coach_secretary",
     "cogs.voice_logging",
-]
+)
 
 
 class MelodyBot(commands.Bot):
     async def setup_hook(self) -> None:
         await _setup_services(self)
-        for ext in EXTENSIONS:
-            await self.load_extension(ext)
-            logging.info("Loaded extension %s", ext)
+        for extension in EXTENSIONS:
+            await self.load_extension(extension)
+            logger.info("Loaded extension %s", extension)
 
     async def close(self) -> None:
         await _teardown_services(self)
@@ -43,14 +43,14 @@ def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
-    intents.voice_states = True  # needed for coach secretary and voice logging
+    intents.voice_states = True
 
     bot = MelodyBot(command_prefix="!", intents=intents)
 
     @bot.event
     async def on_ready() -> None:
         if bot.user is not None:
-            logging.info("Bot is ready as %s", bot.user)
+            logger.info("Bot is ready as %s", bot.user)
 
     @bot.command(name="ping")
     async def ping(ctx: commands.Context) -> None:
@@ -60,11 +60,7 @@ def create_bot() -> MelodyBot:
 
 
 async def _setup_services(bot: commands.Bot) -> None:
-    """Instantiate shared services and attach them to the bot instance.
-
-    These are later picked up by each cog's ``setup()`` function so that
-    cogs depend on abstractions, not concrete construction (DIP).
-    """
+    """Instantiate shared services and attach them to the bot instance."""
     session = aiohttp.ClientSession()
     bot.http_session = session  # type: ignore[attr-defined]
 
@@ -94,26 +90,25 @@ async def _setup_services(bot: commands.Bot) -> None:
     await reminder.initialize()
     reminder.start()
     bot.contest_reminder = reminder  # type: ignore[attr-defined]
-    logging.info("Contest reminder service started")
+    logger.info("Contest reminder service started")
 
-    # ── Coach Secretary ────────────────────────────────────────
     secretary = CoachSecretary(repo)
     bot.coach_secretary = secretary  # type: ignore[attr-defined]
-    logging.info("Coach Secretary service ready")
+    logger.info("Coach secretary service ready")
 
 
 async def _teardown_services(bot: commands.Bot) -> None:
     """Gracefully close shared resources."""
     reminder: ContestReminderService | None = getattr(bot, "contest_reminder", None)
-    if reminder:
+    if reminder is not None:
         await reminder.stop()
 
     repo: UserRepository | None = getattr(bot, "user_repo", None)
-    if repo:
+    if repo is not None:
         await repo.close()
 
     session: aiohttp.ClientSession | None = getattr(bot, "http_session", None)
-    if session:
+    if session is not None:
         await session.close()
 
 
