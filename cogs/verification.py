@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import secrets
+from statistics import median
 import string
 
 import discord
@@ -191,6 +193,117 @@ class VerificationCog(commands.Cog, name="Verification"):
         embed.set_footer(text="Data fetched live from Codeforces")
         await ctx.send(embed=embed)
 
+    @commands.command(name="stats")
+    @commands.guild_only()
+    async def stats(self, ctx: commands.Context, handle: str) -> None:
+        """Show live contest and submission stats for a Codeforces handle."""
+        info = await self._cf.get_user(handle)
+        if info is None:
+            await ctx.send(f"Could not find Codeforces handle **{handle}**.")
+            return
+
+        history = await self._cf.get_rating_history(info.handle)
+        submissions = await self._cf.get_recent_submissions(info.handle, count=500)
+
+        embed = discord.Embed(
+            title=f"Stats: {info.handle}",
+            url=f"https://codeforces.com/profile/{info.handle}",
+            description="Live contest performance and solving quality",
+            colour=_whois_colour(info.max_rating),
+        )
+
+        if history:
+            ranks = [row.rank for row in history if row.rank > 0]
+            contest_count = len(history)
+            best_rank = min(ranks) if ranks else 0
+            median_rank = int(median(ranks)) if ranks else 0
+            current_rating = history[-1].new_rating
+
+            deltas = [row.new_rating - row.old_rating for row in history]
+            positive_rounds = sum(1 for delta in deltas if delta > 0)
+            negative_rounds = sum(1 for delta in deltas if delta < 0)
+            neutral_rounds = contest_count - positive_rounds - negative_rounds
+            deltas_after_first_five = deltas[5:]
+            best_gain = max(deltas_after_first_five) if deltas_after_first_five else 0
+            worst_drop = min(deltas) if deltas else 0
+            recent_window = deltas[-10:]
+            recent_delta = sum(recent_window)
+            recent_delta_sign = "+" if recent_delta >= 0 else ""
+            best_gain_sign = "+" if best_gain >= 0 else ""
+
+            recent_lines: list[str] = []
+            for row in history[-5:]:
+                change = row.new_rating - row.old_rating
+                sign = "+" if change >= 0 else ""
+                recent_lines.append(f"`{row.contest_name[:30]}`: {row.rank} ({sign}{change})")
+
+            embed.add_field(
+                name="Contest Quality",
+                value=(
+                    f"Contests: **{contest_count}**\n"
+                    f"Best Rank: **{best_rank}**\n"
+                    f"Median Rank: **{median_rank}**\n"
+                    f"Current / Max: **{current_rating} / {info.max_rating}**"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Momentum",
+                value=(
+                    f"Last 10 Delta: **{recent_delta_sign}{recent_delta}**\n"
+                    f"Best Gain: **{best_gain_sign}{best_gain}**\n"
+                    f"Worst Drop: **{worst_drop}**\n"
+                    f"+/-/0: **{positive_rounds}/{negative_rounds}/{neutral_rounds}**"
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Last 5 Contests",
+                value="\n".join(recent_lines) if recent_lines else "No recent contests.",
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Contest Stats", value="No rated contest history found.", inline=False)
+
+        if submissions:
+            solved = sum(1 for row in submissions if row.verdict == "OK")
+            total = len(submissions)
+            accepted_rate = (solved / total) * 100
+            solved_problem_keys = {
+                row.problem_key for row in submissions if row.verdict == "OK" and row.problem_key is not None
+            }
+            unique_solved = len(solved_problem_keys)
+            verdicts = Counter(row.verdict or "UNKNOWN" for row in submissions)
+            fail_count = total - solved
+            retry_factor = (solved / unique_solved) if unique_solved else 0.0
+
+            solved_tag_counter: Counter[str] = Counter()
+            for row in submissions:
+                if row.verdict == "OK":
+                    solved_tag_counter.update(row.tags)
+            top_tags = ", ".join(
+                f"{tag}({count})" for tag, count in solved_tag_counter.most_common(5)
+            ) or "N/A"
+
+            embed.add_field(
+                name="Solving Stats (last 500 submissions)",
+                value=(
+                    f"Accepted: **{solved}/{total}** ({accepted_rate:.1f}%)\n"
+                    f"Unique Solved: **{unique_solved}**\n"
+                    f"Failed Attempts: **{fail_count}**\n"
+                    f"Avg Accepted/Subproblem: **{retry_factor:.2f}**\n"
+                    f"Top Solved Tags: {top_tags}"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Submission Activity", value="No recent submissions found.", inline=False)
+
+        if info.avatar_url:
+            embed.set_thumbnail(url=info.avatar_url)
+        embed.set_footer(text="Data fetched live from Codeforces")
+        await ctx.send(embed=embed)
+
     @verify.error
     async def verify_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
@@ -202,6 +315,13 @@ class VerificationCog(commands.Cog, name="Verification"):
     async def whois_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("Usage: **!whois <codeforces_handle>**")
+            return
+        raise error
+
+    @stats.error
+    async def stats_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: **!stats <codeforces_handle>**")
             return
         raise error
 
