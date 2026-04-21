@@ -20,6 +20,16 @@ class VerifiedUser:
     guild_id: int
 
 
+@dataclass(slots=True)
+class CoachConfig:
+    """Row representation for the coach_config table."""
+
+    guild_id: int
+    coach_id: int
+    waiting_room_id: int
+    coach_channel_id: int
+
+
 class UserRepositoryBase(abc.ABC):
     """Abstraction over persistent user storage."""
 
@@ -51,6 +61,18 @@ class UserRepositoryBase(abc.ABC):
     async def get_reminder_channels(self) -> list[tuple[int, int]]:
         """Return all enabled reminder channels as (guild_id, channel_id)."""
 
+    @abc.abstractmethod
+    async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
+        """Return coach config for a guild, or None."""
+
+    @abc.abstractmethod
+    async def upsert_coach_config(self, config: CoachConfig) -> None:
+        """Insert or update coach config for a guild."""
+
+    @abc.abstractmethod
+    async def delete_coach_config(self, guild_id: int) -> bool:
+        """Remove coach config for a guild. Returns True if a row was deleted."""
+
 
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
@@ -79,6 +101,16 @@ class UserRepository(UserRepositoryBase):
                     guild_id BIGINT NOT NULL,
                     channel_id BIGINT NOT NULL,
                     PRIMARY KEY (guild_id, channel_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coach_config (
+                    guild_id         BIGINT NOT NULL PRIMARY KEY,
+                    coach_id         BIGINT NOT NULL,
+                    waiting_room_id  BIGINT NOT NULL,
+                    coach_channel_id BIGINT NOT NULL
                 )
                 """
             )
@@ -184,3 +216,53 @@ class UserRepository(UserRepositoryBase):
                 """
             )
         return [(row["guild_id"], row["channel_id"]) for row in rows]
+
+    async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id, coach_id, waiting_room_id, coach_channel_id
+                FROM coach_config
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        if row is None:
+            return None
+        return CoachConfig(
+            guild_id=row["guild_id"],
+            coach_id=row["coach_id"],
+            waiting_room_id=row["waiting_room_id"],
+            coach_channel_id=row["coach_channel_id"],
+        )
+
+    async def upsert_coach_config(self, config: CoachConfig) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO coach_config (guild_id, coach_id, waiting_room_id, coach_channel_id)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT(guild_id)
+                DO UPDATE SET coach_id         = excluded.coach_id,
+                              waiting_room_id  = excluded.waiting_room_id,
+                              coach_channel_id = excluded.coach_channel_id
+                """,
+                config.guild_id,
+                config.coach_id,
+                config.waiting_room_id,
+                config.coach_channel_id,
+            )
+
+    async def delete_coach_config(self, guild_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM coach_config
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        return result.endswith("1")

@@ -10,6 +10,7 @@ from db.repository import UserRepository
 from services.cf_client import CodeforcesClient
 from services.contest_reminder import ContestReminderService
 from services.role_assigner import RoleAssigner
+from services.coach_secretary import CoachSecretary
 
 
 logging.basicConfig(
@@ -21,6 +22,7 @@ load_dotenv()
 
 EXTENSIONS = [
     "cogs.verification",
+    "cogs.coach_secretary",
 ]
 
 
@@ -40,6 +42,7 @@ def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
+    intents.voice_states = True  # needed for coach secretary
 
     bot = MelodyBot(command_prefix="!", intents=intents)
 
@@ -91,6 +94,11 @@ async def _setup_services(bot: commands.Bot) -> None:
     reminder.start()
     bot.contest_reminder = reminder  # type: ignore[attr-defined]
     logging.info("Contest reminder service started")
+
+    # ── Coach Secretary ────────────────────────────────────────
+    secretary = CoachSecretary(repo)
+    bot.coach_secretary = secretary  # type: ignore[attr-defined]
+    logging.info("Coach Secretary service ready")
 
 
 async def _teardown_services(bot: commands.Bot) -> None:
