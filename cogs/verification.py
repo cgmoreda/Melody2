@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import secrets
 import string
-from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -95,24 +94,24 @@ class VerificationCog(commands.Cog, name="Verification"):
         user = VerifiedUser(
             discord_id=ctx.author.id,
             cf_handle=info.handle,
-            rating=info.rating,
+            rating=info.max_rating,
             guild_id=ctx.guild.id,
         )
         await self._repo.upsert(user)
 
-        role = await self._roles.apply(ctx.author, ctx.guild, info.rating)
+        role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
         role_text = f" and assigned role **{role.name}**" if role else ""
 
         embed = discord.Embed(
             title="Verification Successful",
             description=(
-                f"**{info.handle}** (rating **{info.rating}**) is now linked "
+                f"**{info.handle}** (max rating **{info.max_rating}**) is now linked "
                 f"to {ctx.author.mention}{role_text}."
             ),
             colour=discord.Colour.green(),
         )
         await ctx.send(embed=embed)
-        logger.info("Verified %s as %s (rating %d)", ctx.author, info.handle, info.rating)
+        logger.info("Verified %s as %s (max rating %d)", ctx.author, info.handle, info.max_rating)
 
     @commands.command(name="update")
     @commands.guild_only()
@@ -130,38 +129,34 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send("Could not reach the Codeforces API. Please try again later.")
             return
 
-        record.rating = info.rating
+        record.rating = info.max_rating
         await self._repo.upsert(record)
 
-        role = await self._roles.apply(ctx.author, ctx.guild, info.rating)
+        role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
         role_text = f"**{role.name}**" if role else "*(none)*"
 
         embed = discord.Embed(
             title="Rating Updated",
-            description=f"**{info.handle}** - rating **{info.rating}** - role {role_text}.",
+            description=f"**{info.handle}** - max rating **{info.max_rating}** - role {role_text}.",
             colour=discord.Colour.blurple(),
         )
         await ctx.send(embed=embed)
 
     @commands.command(name="whois")
     @commands.guild_only()
-    async def whois(self, ctx: commands.Context, member: Optional[discord.Member] = None) -> None:
-        """Look up the Codeforces handle linked to a Discord user."""
-        assert ctx.guild is not None
-
-        target = member or ctx.author
-        assert isinstance(target, discord.Member)
-
-        record = await self._repo.get_by_discord_id(target.id, ctx.guild.id)
-        if record is None:
-            await ctx.send(f"{target.mention} is not verified.")
+    async def whois(self, ctx: commands.Context, handle: str) -> None:
+        """Look up a Codeforces user live by handle."""
+        info = await self._cf.get_user(handle)
+        if info is None:
+            await ctx.send(f"Could not find Codeforces handle **{handle}**.")
             return
 
         embed = discord.Embed(
-            title=target.display_name,
+            title=info.handle,
             description=(
-                f"**CF Handle:** [{record.cf_handle}](https://codeforces.com/profile/{record.cf_handle})\n"
-                f"**Rating:** {record.rating}"
+                f"**CF Handle:** [{info.handle}](https://codeforces.com/profile/{info.handle})\n"
+                f"**Current Rating:** {info.rating}\n"
+                f"**Max Rating:** {info.max_rating}"
             ),
             colour=discord.Colour.blurple(),
         )
@@ -171,6 +166,13 @@ class VerificationCog(commands.Cog, name="Verification"):
     async def verify_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("Usage: **!verify <codeforces_handle>**")
+            return
+        raise error
+
+    @whois.error
+    async def whois_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: **!whois <codeforces_handle>**")
             return
         raise error
 

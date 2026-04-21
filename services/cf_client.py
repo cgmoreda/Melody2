@@ -20,6 +20,7 @@ class CFUserInfo:
     handle: str
     first_name: Optional[str]
     rating: int
+    max_rating: int
 
 
 class CodeforcesClientBase(abc.ABC):
@@ -63,4 +64,5 @@ class CodeforcesClient(CodeforcesClientBase):
             handle=user.get("handle", handle),
             first_name=user.get("firstName"),
             rating=user.get("rating", 0),
+            max_rating=user.get("maxRating", user.get("rating", 0)),
         )
