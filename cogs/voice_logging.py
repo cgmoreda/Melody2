@@ -8,10 +8,7 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase
-
-CHECK_INTERVAL_SECONDS = 15 * 60
-CONFIRM_TIMEOUT_SECONDS = 3 * 60
-MAX_VOICEHOURS_LINES = 35
+from services.guild_config import GuildConfigService
 
 
 def _hours(seconds: float) -> str:
@@ -23,8 +20,8 @@ def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
 
 
 class WorkConfirmationView(discord.ui.View):
-    def __init__(self, member_id: int) -> None:
-        super().__init__(timeout=CONFIRM_TIMEOUT_SECONDS)
+    def __init__(self, member_id: int, timeout_seconds: int) -> None:
+        super().__init__(timeout=timeout_seconds)
         self.member_id = member_id
         self.confirmed = False
 
@@ -42,9 +39,10 @@ class WorkConfirmationView(discord.ui.View):
 
 
 class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
-    def __init__(self, bot: commands.Bot, repo: UserRepositoryBase) -> None:
+    def __init__(self, bot: commands.Bot, repo: UserRepositoryBase, config_service: GuildConfigService) -> None:
         self.bot = bot
         self._repo = repo
+        self._config = config_service
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
 
     def cog_unload(self) -> None:
@@ -132,7 +130,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
         try:
             while True:
-                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                config = await self._config.get(guild_id)
+                await asyncio.sleep(config.voice_check_interval_seconds)
 
                 guild = self.bot.get_guild(guild_id)
                 if guild is None:
@@ -146,7 +145,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if not _is_solo_channel(voice_channel):
                     break
 
-                confirmed = await self._ask_still_working(member)
+                confirmed = await self._ask_still_working(member, config.voice_confirm_timeout_seconds)
                 if confirmed is True or confirmed is None:
                     continue
 
@@ -169,7 +168,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 await self._repo.close_open_voice_sessions(guild.id, member.id, datetime.now(tz=UTC))
                 try:
-                    await member.send("You were disconnected because you did not confirm within 3 minutes.")
+                    await member.send("You were disconnected because you did not confirm in time.")
                 except discord.Forbidden:
                     pass
                 break
@@ -178,11 +177,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         finally:
             self._watchdogs.pop(member_id, None)
 
-    async def _ask_still_working(self, member: discord.Member) -> Optional[bool]:
-        view = WorkConfirmationView(member.id)
+    async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> Optional[bool]:
+        view = WorkConfirmationView(member.id, timeout_seconds)
+        timeout_minutes = max(1, timeout_seconds // 60)
         prompt = (
             "Are you still working in the solo channel?\n"
-            "Click **Yes, still working** within 3 minutes to keep your session."
+            f"Click **Yes, still working** within {timeout_minutes} minutes to keep your session."
         )
         try:
             message = await member.send(prompt, view=view)
@@ -206,6 +206,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def voicehours(self, ctx: commands.Context) -> None:
         assert ctx.guild is not None
 
+        config = await self._config.get(ctx.guild.id)
         now = datetime.now(tz=UTC)
         week_since = now - timedelta(days=7)
         month_since = now - timedelta(days=30)
@@ -236,12 +237,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             )
 
         header = "**Handle | Last Week | Last Month | All Time**\n"
-        body = "\n".join(lines[:MAX_VOICEHOURS_LINES])
-        extra = len(lines) - min(len(lines), MAX_VOICEHOURS_LINES)
+        body = "\n".join(lines[: config.voicehours_max_lines])
+        extra = len(lines) - min(len(lines), config.voicehours_max_lines)
         if extra > 0:
             body += f"\n... and {extra} more users"
         await ctx.send(header + body)
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(VoiceLoggingCog(bot, getattr(bot, "user_repo")))
+    await bot.add_cog(VoiceLoggingCog(bot, getattr(bot, "user_repo"), getattr(bot, "guild_config")))

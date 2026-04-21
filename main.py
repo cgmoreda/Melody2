@@ -10,6 +10,7 @@ from db.repository import UserRepository
 from services.cf_client import CodeforcesClient
 from services.coach_secretary import CoachSecretary
 from services.contest_reminder import ContestReminderService
+from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssigner
 
 logging.basicConfig(
@@ -22,6 +23,7 @@ load_dotenv()
 
 EXTENSIONS: tuple[str, ...] = (
     "cogs.verification",
+    "cogs.config",
     "cogs.coach_secretary",
     "cogs.voice_logging",
 )
@@ -95,6 +97,10 @@ async def _setup_services(bot: commands.Bot) -> None:
     secretary = CoachSecretary(repo)
     bot.coach_secretary = secretary  # type: ignore[attr-defined]
     logger.info("Coach secretary service ready")
+
+    guild_config = GuildConfigService(repo)
+    bot.guild_config = guild_config  # type: ignore[attr-defined]
+    logger.info("Guild config service ready")
 
 
 async def _teardown_services(bot: commands.Bot) -> None:
