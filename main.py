@@ -57,6 +57,7 @@ def create_bot() -> MelodyBot:
 
     @bot.command(name="ping")
     async def ping(ctx: commands.Context) -> None:
+        """Check whether the bot is responsive."""
         await ctx.send("pong")
 
     return bot

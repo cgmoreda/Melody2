@@ -50,6 +50,7 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
     @commands.group(name="coach", invoke_without_command=True)
     @commands.guild_only()
     async def coach(self, ctx: commands.Context) -> None:
+        """Manage coach secretary routing settings."""
         await ctx.send("Usage: !coach <setup|reset|config>")
 
     @coach.command(name="setup")
@@ -104,6 +105,7 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
     async def coach_reset(self, ctx: commands.Context) -> None:
+        """Remove coach secretary configuration for this server."""
         assert ctx.guild is not None
 
         removed = await self._secretary.remove_config(ctx.guild.id)
@@ -115,6 +117,7 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
     @coach.command(name="config")
     @commands.guild_only()
     async def coach_config(self, ctx: commands.Context) -> None:
+        """Show the current coach secretary configuration."""
         assert ctx.guild is not None
 
         config = await self._secretary.get_config(ctx.guild.id)

@@ -13,11 +13,13 @@ class ConfigCog(commands.Cog, name="Config"):
     @commands.group(name="config", invoke_without_command=True)
     @commands.guild_only()
     async def config(self, ctx: commands.Context) -> None:
+        """Show or modify per-server bot configuration keys."""
         await ctx.send("Usage: **!config <show|keys|set|reset>**")
 
     @config.command(name="show")
     @commands.guild_only()
     async def config_show(self, ctx: commands.Context) -> None:
+        """Display current config values for this server."""
         assert ctx.guild is not None
         cfg = await self._config.get(ctx.guild.id)
 
@@ -36,6 +38,7 @@ class ConfigCog(commands.Cog, name="Config"):
     @config.command(name="keys")
     @commands.guild_only()
     async def config_keys(self, ctx: commands.Context) -> None:
+        """List configurable keys with allowed ranges."""
         lines: list[str] = []
         for key, (_, minimum, maximum, description) in CONFIG_SPECS.items():
             lines.append(f"`{key}` [{minimum}..{maximum}] - {description}")
@@ -45,6 +48,7 @@ class ConfigCog(commands.Cog, name="Config"):
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def config_set(self, ctx: commands.Context, key: str, value: int) -> None:
+        """Set one config key to an integer value."""
         assert ctx.guild is not None
         normalized_key = key.lower()
         try:
@@ -60,6 +64,7 @@ class ConfigCog(commands.Cog, name="Config"):
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def config_reset(self, ctx: commands.Context, key: str = "all") -> None:
+        """Reset one key, or all keys, back to defaults."""
         assert ctx.guild is not None
 
         normalized_key = key.lower()

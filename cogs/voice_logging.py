@@ -204,6 +204,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
     async def voicehours(self, ctx: commands.Context) -> None:
+        """Show solo voice-channel hours for last week, month, and all time."""
         assert ctx.guild is not None
 
         config = await self._config.get(ctx.guild.id)

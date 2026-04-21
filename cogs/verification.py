@@ -225,6 +225,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="verify")
     @commands.guild_only()
     async def verify(self, ctx: commands.Context, handle: str) -> None:
+        """Start Codeforces handle verification for your Discord account."""
         if ctx.guild is None:
             return
 
@@ -240,6 +241,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="confirm")
     @commands.guild_only()
     async def confirm(self, ctx: commands.Context) -> None:
+        """Confirm verification after setting your temporary code on Codeforces."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
 
         key = self._pending_key(ctx.guild.id, ctx.author.id)
@@ -290,6 +292,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="updaterating", aliases=["update"])
     @commands.guild_only()
     async def updaterating(self, ctx: commands.Context) -> None:
+        """Refresh your linked Codeforces rating and update your role."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
 
         record = await self._repo.get_by_discord_id(ctx.author.id, ctx.guild.id)
@@ -342,6 +345,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="whois")
     @commands.guild_only()
     async def whois(self, ctx: commands.Context, handle: str) -> None:
+        """Show live Codeforces profile details for a handle."""
         info = await self._cf.get_user(handle)
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
@@ -352,6 +356,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="stats")
     @commands.guild_only()
     async def stats(self, ctx: commands.Context, handle: str) -> None:
+        """Show contest and submission statistics for a Codeforces handle."""
         info = await self._cf.get_user(handle)
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
@@ -377,6 +382,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.command(name="roundchanges", aliases=["lastround"])
     @commands.guild_only()
     async def roundchanges(self, ctx: commands.Context) -> None:
+        """Show latest round rating changes for verified server members."""
         assert ctx.guild is not None
 
         config = await self._config.get(ctx.guild.id)
@@ -452,6 +458,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.group(name="reminder", invoke_without_command=True)
     @commands.guild_only()
     async def reminder(self, ctx: commands.Context) -> None:
+        """Manage Codeforces contest reminders for channels."""
         await ctx.send("Usage: **!reminder <enable|disable|status|next> [#channel]**")
 
     @reminder.command(name="enable")
@@ -462,6 +469,7 @@ class VerificationCog(commands.Cog, name="Verification"):
         ctx: commands.Context,
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
+        """Enable contest reminders in a channel."""
         assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")
@@ -485,6 +493,7 @@ class VerificationCog(commands.Cog, name="Verification"):
         ctx: commands.Context,
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
+        """Disable contest reminders in a channel."""
         assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")
@@ -507,6 +516,7 @@ class VerificationCog(commands.Cog, name="Verification"):
         ctx: commands.Context,
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
+        """Check whether reminders are enabled in a channel."""
         assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")
@@ -523,6 +533,7 @@ class VerificationCog(commands.Cog, name="Verification"):
     @reminder.command(name="next")
     @commands.guild_only()
     async def reminder_next(self, ctx: commands.Context) -> None:
+        """Show upcoming Div contests currently visible on Codeforces."""
         assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")

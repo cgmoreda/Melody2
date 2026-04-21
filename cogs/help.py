@@ -10,6 +10,7 @@ class HelpCog(commands.Cog, name="Help"):
 
     @commands.command(name="help")
     async def help_command(self, ctx: commands.Context, *, query: str | None = None) -> None:
+        """Show all commands, or detailed help for one command."""
         if query is None:
             await self._send_general_help(ctx)
             return
