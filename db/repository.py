@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import asyncpg
@@ -73,6 +74,36 @@ class UserRepositoryBase(abc.ABC):
     async def delete_coach_config(self, guild_id: int) -> bool:
         """Remove coach config for a guild. Returns True if a row was deleted."""
 
+    @abc.abstractmethod
+    async def start_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        channel_id: int,
+        channel_name: str,
+        is_solo: bool,
+        started_at: datetime,
+    ) -> None:
+        """Insert a new voice session entry."""
+
+    @abc.abstractmethod
+    async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
+        """Close all open voice sessions for a user in a guild."""
+
+    @abc.abstractmethod
+    async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
+        """Return whether the user currently has an open voice session row."""
+
+    @abc.abstractmethod
+    async def get_solo_voice_totals(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        since: Optional[datetime] = None,
+    ) -> dict[int, float]:
+        """Return total solo-channel voice time in seconds per user."""
+
 
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
@@ -112,6 +143,26 @@ class UserRepository(UserRepositoryBase):
                     waiting_room_id  BIGINT NOT NULL,
                     coach_channel_id BIGINT NOT NULL
                 )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS voice_sessions (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    channel_name TEXT NOT NULL,
+                    is_solo BOOLEAN NOT NULL DEFAULT FALSE,
+                    started_at TIMESTAMPTZ NOT NULL,
+                    ended_at TIMESTAMPTZ
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
+                ON voice_sessions (guild_id, discord_id, started_at)
                 """
             )
         logger.info("Database initialised")
@@ -266,3 +317,129 @@ class UserRepository(UserRepositoryBase):
                 guild_id,
             )
         return result.endswith("1")
+
+    async def start_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        channel_id: int,
+        channel_name: str,
+        is_solo: bool,
+        started_at: datetime,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO voice_sessions (
+                    guild_id, discord_id, channel_id, channel_name, is_solo, started_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                guild_id,
+                discord_id,
+                channel_id,
+                channel_name,
+                is_solo,
+                started_at,
+            )
+
+    async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE voice_sessions
+                SET ended_at = $3
+                WHERE guild_id = $1
+                  AND discord_id = $2
+                  AND ended_at IS NULL
+                """,
+                guild_id,
+                discord_id,
+                ended_at,
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+    async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND discord_id = $2
+                  AND ended_at IS NULL
+                LIMIT 1
+                """,
+                guild_id,
+                discord_id,
+            )
+        return row is not None
+
+    async def get_solo_voice_totals(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        since: Optional[datetime] = None,
+    ) -> dict[int, float]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            if since is None:
+                rows = await conn.fetch(
+                    """
+                    SELECT discord_id,
+                           SUM(
+                               EXTRACT(
+                                   EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
+                               )
+                           ) AS seconds
+                    FROM voice_sessions
+                    WHERE guild_id = $1
+                      AND is_solo = TRUE
+                      AND started_at < $2
+                    GROUP BY discord_id
+                    HAVING SUM(
+                               EXTRACT(
+                                   EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
+                               )
+                           ) > 0
+                    """,
+                    guild_id,
+                    now,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT discord_id,
+                           SUM(
+                               EXTRACT(
+                                   EPOCH FROM (
+                                       LEAST(COALESCE(ended_at, $3), $3) - GREATEST(started_at, $2)
+                                   )
+                               )
+                           ) AS seconds
+                    FROM voice_sessions
+                    WHERE guild_id = $1
+                      AND is_solo = TRUE
+                      AND started_at < $3
+                      AND COALESCE(ended_at, $3) > $2
+                    GROUP BY discord_id
+                    HAVING SUM(
+                               EXTRACT(
+                                   EPOCH FROM (
+                                       LEAST(COALESCE(ended_at, $3), $3) - GREATEST(started_at, $2)
+                                   )
+                               )
+                           ) > 0
+                    """,
+                    guild_id,
+                    since,
+                    now,
+                )
+        return {row["discord_id"]: float(row["seconds"]) for row in rows}

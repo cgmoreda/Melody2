@@ -23,6 +23,7 @@ load_dotenv()
 EXTENSIONS = [
     "cogs.verification",
     "cogs.coach_secretary",
+    "cogs.voice_logging",
 ]
 
 
@@ -42,7 +43,7 @@ def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.members = True
-    intents.voice_states = True  # needed for coach secretary
+    intents.voice_states = True  # needed for coach secretary and voice logging
 
     bot = MelodyBot(command_prefix="!", intents=intents)
 
