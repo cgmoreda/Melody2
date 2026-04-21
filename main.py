@@ -23,6 +23,7 @@ load_dotenv()
 
 EXTENSIONS: tuple[str, ...] = (
     "cogs.help",
+    "cogs.cf_predictor",
     "cogs.verification",
     "cogs.config",
     "cogs.coach_secretary",
@@ -31,11 +32,26 @@ EXTENSIONS: tuple[str, ...] = (
 
 
 class MelodyBot(commands.Bot):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._tree_synced = False
+
     async def setup_hook(self) -> None:
         await _setup_services(self)
         for extension in EXTENSIONS:
             await self.load_extension(extension)
             logger.info("Loaded extension %s", extension)
+
+    async def on_ready(self) -> None:
+        if self.user is not None:
+            logger.info("Bot is ready as %s", self.user)
+        if not self._tree_synced:
+            try:
+                await self.tree.sync()
+                logger.info("Synced app command tree")
+            except Exception:
+                logger.exception("Failed to sync app command tree")
+            self._tree_synced = True
 
     async def close(self) -> None:
         await _teardown_services(self)
@@ -49,11 +65,6 @@ def create_bot() -> MelodyBot:
     intents.voice_states = True
 
     bot = MelodyBot(command_prefix="!", intents=intents, help_command=None)
-
-    @bot.event
-    async def on_ready() -> None:
-        if bot.user is not None:
-            logger.info("Bot is ready as %s", bot.user)
 
     @bot.command(name="ping")
     async def ping(ctx: commands.Context) -> None:

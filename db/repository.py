@@ -43,6 +43,29 @@ class GuildCommandConfig:
     voice_confirm_timeout_seconds: int
 
 
+@dataclass(slots=True)
+class LinkedAccount:
+    guild_id: int
+    discord_user_id: int
+    cf_handle: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class WatchJob:
+    guild_id: int
+    channel_id: int
+    contest_id: int
+    interval_minutes: int
+    message_id: Optional[int]
+    server_only: bool
+    show_unofficial: bool
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
 class UserRepositoryBase(abc.ABC):
     """Abstraction over persistent user storage."""
 
@@ -128,6 +151,42 @@ class UserRepositoryBase(abc.ABC):
     async def delete_guild_command_config(self, guild_id: int) -> bool:
         """Delete command config for a guild. Returns True if a row was deleted."""
 
+    @abc.abstractmethod
+    async def upsert_linked_account(self, guild_id: int, discord_user_id: int, cf_handle: str) -> None:
+        """Create or update a linked Discord user to Codeforces handle mapping."""
+
+    @abc.abstractmethod
+    async def get_linked_account(self, guild_id: int, discord_user_id: int) -> Optional[LinkedAccount]:
+        """Fetch one linked account for a guild Discord user."""
+
+    @abc.abstractmethod
+    async def remove_linked_account(self, guild_id: int, discord_user_id: int) -> bool:
+        """Remove one linked account mapping."""
+
+    @abc.abstractmethod
+    async def get_linked_accounts_for_guild(self, guild_id: int) -> list[LinkedAccount]:
+        """List all linked accounts for a guild."""
+
+    @abc.abstractmethod
+    async def upsert_watch_job(self, job: WatchJob) -> None:
+        """Create or update one watch job."""
+
+    @abc.abstractmethod
+    async def disable_watch_job(self, guild_id: int, channel_id: int, contest_id: int) -> bool:
+        """Disable one watch job. Returns True if any row was changed."""
+
+    @abc.abstractmethod
+    async def set_watch_job_message_id(self, guild_id: int, channel_id: int, contest_id: int, message_id: int) -> None:
+        """Set the latest message id for a watch job."""
+
+    @abc.abstractmethod
+    async def get_watch_job(self, guild_id: int, channel_id: int, contest_id: int) -> Optional[WatchJob]:
+        """Get one watch job by guild/channel/contest key."""
+
+    @abc.abstractmethod
+    async def get_enabled_watch_jobs(self) -> list[WatchJob]:
+        """Return all enabled watch jobs across guilds."""
+
 
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
@@ -198,6 +257,36 @@ class UserRepository(UserRepositoryBase):
                     voicehours_max_lines INTEGER NOT NULL DEFAULT 35 CHECK (voicehours_max_lines BETWEEN 5 AND 100),
                     voice_check_interval_seconds INTEGER NOT NULL DEFAULT 900 CHECK (voice_check_interval_seconds BETWEEN 60 AND 7200),
                     voice_confirm_timeout_seconds INTEGER NOT NULL DEFAULT 180 CHECK (voice_confirm_timeout_seconds BETWEEN 60 AND 900)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS linked_accounts (
+                    guild_id BIGINT NOT NULL,
+                    discord_user_id BIGINT NOT NULL,
+                    cf_handle TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, discord_user_id),
+                    UNIQUE (guild_id, cf_handle)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watch_jobs (
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    interval_minutes INTEGER NOT NULL,
+                    message_id BIGINT,
+                    server_only BOOLEAN NOT NULL DEFAULT TRUE,
+                    show_unofficial BOOLEAN NOT NULL DEFAULT FALSE,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, channel_id, contest_id)
                 )
                 """
             )
@@ -547,3 +636,190 @@ class UserRepository(UserRepositoryBase):
                 guild_id,
             )
         return result.endswith("1")
+
+    async def upsert_linked_account(self, guild_id: int, discord_user_id: int, cf_handle: str) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO linked_accounts (guild_id, discord_user_id, cf_handle)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, discord_user_id)
+                DO UPDATE SET cf_handle = EXCLUDED.cf_handle,
+                              updated_at = NOW()
+                """,
+                guild_id,
+                discord_user_id,
+                cf_handle,
+            )
+
+    async def get_linked_account(self, guild_id: int, discord_user_id: int) -> Optional[LinkedAccount]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id, discord_user_id, cf_handle, created_at, updated_at
+                FROM linked_accounts
+                WHERE guild_id = $1 AND discord_user_id = $2
+                """,
+                guild_id,
+                discord_user_id,
+            )
+        if row is None:
+            return None
+        return LinkedAccount(
+            guild_id=row["guild_id"],
+            discord_user_id=row["discord_user_id"],
+            cf_handle=row["cf_handle"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def remove_linked_account(self, guild_id: int, discord_user_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM linked_accounts
+                WHERE guild_id = $1 AND discord_user_id = $2
+                """,
+                guild_id,
+                discord_user_id,
+            )
+        return result.endswith("1")
+
+    async def get_linked_accounts_for_guild(self, guild_id: int) -> list[LinkedAccount]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, discord_user_id, cf_handle, created_at, updated_at
+                FROM linked_accounts
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        return [
+            LinkedAccount(
+                guild_id=row["guild_id"],
+                discord_user_id=row["discord_user_id"],
+                cf_handle=row["cf_handle"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    async def upsert_watch_job(self, job: WatchJob) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO watch_jobs (
+                    guild_id, channel_id, contest_id, interval_minutes, message_id,
+                    server_only, show_unofficial, enabled
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (guild_id, channel_id, contest_id)
+                DO UPDATE SET interval_minutes = EXCLUDED.interval_minutes,
+                              message_id = EXCLUDED.message_id,
+                              server_only = EXCLUDED.server_only,
+                              show_unofficial = EXCLUDED.show_unofficial,
+                              enabled = EXCLUDED.enabled,
+                              updated_at = NOW()
+                """,
+                job.guild_id,
+                job.channel_id,
+                job.contest_id,
+                job.interval_minutes,
+                job.message_id,
+                job.server_only,
+                job.show_unofficial,
+                job.enabled,
+            )
+
+    async def disable_watch_job(self, guild_id: int, channel_id: int, contest_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE watch_jobs
+                SET enabled = FALSE, updated_at = NOW()
+                WHERE guild_id = $1 AND channel_id = $2 AND contest_id = $3
+                """,
+                guild_id,
+                channel_id,
+                contest_id,
+            )
+        return result.endswith("1")
+
+    async def set_watch_job_message_id(self, guild_id: int, channel_id: int, contest_id: int, message_id: int) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE watch_jobs
+                SET message_id = $4, updated_at = NOW()
+                WHERE guild_id = $1 AND channel_id = $2 AND contest_id = $3
+                """,
+                guild_id,
+                channel_id,
+                contest_id,
+                message_id,
+            )
+
+    async def get_watch_job(self, guild_id: int, channel_id: int, contest_id: int) -> Optional[WatchJob]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id, channel_id, contest_id, interval_minutes, message_id,
+                       server_only, show_unofficial, enabled, created_at, updated_at
+                FROM watch_jobs
+                WHERE guild_id = $1 AND channel_id = $2 AND contest_id = $3
+                """,
+                guild_id,
+                channel_id,
+                contest_id,
+            )
+        if row is None:
+            return None
+        return WatchJob(
+            guild_id=row["guild_id"],
+            channel_id=row["channel_id"],
+            contest_id=row["contest_id"],
+            interval_minutes=row["interval_minutes"],
+            message_id=row["message_id"],
+            server_only=row["server_only"],
+            show_unofficial=row["show_unofficial"],
+            enabled=row["enabled"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    async def get_enabled_watch_jobs(self) -> list[WatchJob]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, channel_id, contest_id, interval_minutes, message_id,
+                       server_only, show_unofficial, enabled, created_at, updated_at
+                FROM watch_jobs
+                WHERE enabled = TRUE
+                """
+            )
+        return [
+            WatchJob(
+                guild_id=row["guild_id"],
+                channel_id=row["channel_id"],
+                contest_id=row["contest_id"],
+                interval_minutes=row["interval_minutes"],
+                message_id=row["message_id"],
+                server_only=row["server_only"],
+                show_unofficial=row["show_unofficial"],
+                enabled=row["enabled"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
