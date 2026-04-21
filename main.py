@@ -23,12 +23,24 @@ EXTENSIONS = [
 ]
 
 
-def create_bot() -> commands.Bot:
+class MelodyBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await _setup_services(self)
+        for ext in EXTENSIONS:
+            await self.load_extension(ext)
+            logging.info("Loaded extension %s", ext)
+
+    async def close(self) -> None:
+        await _teardown_services(self)
+        await super().close()
+
+
+def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
-    intents.members = True  # needed for role management
+    intents.members = True
 
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot = MelodyBot(command_prefix="!", intents=intents)
 
     @bot.event
     async def on_ready() -> None:
@@ -80,18 +92,6 @@ def main() -> None:
         raise RuntimeError("DISCORD_TOKEN is not set")
 
     bot = create_bot()
-
-    @bot.event
-    async def setup_hook() -> None:
-        await _setup_services(bot)
-        for ext in EXTENSIONS:
-            await bot.load_extension(ext)
-            logging.info("Loaded extension %s", ext)
-
-    @bot.event
-    async def on_close() -> None:
-        await _teardown_services(bot)
-
     bot.run(token, log_handler=None)
 
 
