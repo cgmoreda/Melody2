@@ -54,7 +54,11 @@ async def _setup_services(bot: commands.Bot) -> None:
     bot.cf_client = CodeforcesClient(session)  # type: ignore[attr-defined]
     bot.role_assigner = RoleAssigner()  # type: ignore[attr-defined]
 
-    repo = UserRepository()
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    repo = UserRepository(database_url)
     await repo.init()
     bot.user_repo = repo  # type: ignore[attr-defined]
 
