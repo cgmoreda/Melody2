@@ -1,9 +1,14 @@
 import logging
 import os
 
+import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+from db.repository import UserRepository
+from services.cf_client import CodeforcesClient
+from services.role_assigner import RoleAssigner
 
 
 logging.basicConfig(
@@ -13,12 +18,29 @@ logging.basicConfig(
 
 load_dotenv()
 
+EXTENSIONS = [
+    "cogs.verification",
+]
 
-def create_bot() -> commands.Bot:
+
+class MelodyBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await _setup_services(self)
+        for ext in EXTENSIONS:
+            await self.load_extension(ext)
+            logging.info("Loaded extension %s", ext)
+
+    async def close(self) -> None:
+        await _teardown_services(self)
+        await super().close()
+
+
+def create_bot() -> MelodyBot:
     intents = discord.Intents.default()
     intents.message_content = True
+    intents.members = True
 
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    bot = MelodyBot(command_prefix="!", intents=intents)
 
     @bot.event
     async def on_ready() -> None:
@@ -30,6 +52,38 @@ def create_bot() -> commands.Bot:
         await ctx.send("pong")
 
     return bot
+
+
+async def _setup_services(bot: commands.Bot) -> None:
+    """Instantiate shared services and attach them to the bot instance.
+
+    These are later picked up by each cog's ``setup()`` function so that
+    cogs depend on abstractions, not concrete construction (DIP).
+    """
+    session = aiohttp.ClientSession()
+    bot.http_session = session  # type: ignore[attr-defined]
+
+    bot.cf_client = CodeforcesClient(session)  # type: ignore[attr-defined]
+    bot.role_assigner = RoleAssigner()  # type: ignore[attr-defined]
+
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is not set")
+
+    repo = UserRepository(database_url)
+    await repo.init()
+    bot.user_repo = repo  # type: ignore[attr-defined]
+
+
+async def _teardown_services(bot: commands.Bot) -> None:
+    """Gracefully close shared resources."""
+    repo: UserRepository | None = getattr(bot, "user_repo", None)
+    if repo:
+        await repo.close()
+
+    session: aiohttp.ClientSession | None = getattr(bot, "http_session", None)
+    if session:
+        await session.close()
 
 
 def main() -> None:
