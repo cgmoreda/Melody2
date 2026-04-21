@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from db.repository import LinkedAccount, UserRepositoryBase
+from db.repository import UserRepositoryBase
 from services.cf_client import CFContestChange, CFStandingRow, CFStandingsPage, CodeforcesClient
 from services.rating_predictor import ParticipantPrediction, RatingPredictor
 
@@ -40,22 +40,21 @@ class ContestPredictionService:
             lowered = {h.lower() for h in handles_filter}
             rows = [row for row in rows if row.handles and row.handles[0].lower() in lowered]
 
-        linked_accounts: list[LinkedAccount] = []
-        linked_handle_set: set[str] = set()
+        verified_handle_set: set[str] = set()
         if guild_id is not None:
-            linked_accounts = await self._repo.get_linked_accounts_for_guild(guild_id)
-            linked_handle_set = {entry.cf_handle.lower() for entry in linked_accounts}
+            verified_users = await self._repo.get_all(guild_id)
+            verified_handle_set = {entry.cf_handle.lower() for entry in verified_users}
 
         if server_only:
-            rows = [row for row in rows if row.handles and row.handles[0].lower() in linked_handle_set]
+            rows = [row for row in rows if row.handles and row.handles[0].lower() in verified_handle_set]
 
         standings_handles = [row.handles[0] for row in rows if row.handles]
         users = await self._cf.get_users(standings_handles)
         ratings = {handle: info.rating for handle, info in users.items()}
 
         predictions = self._predictor.predict(rows, ratings, include_unofficial=show_unofficial)
-        if server_only and linked_handle_set:
-            predictions = [row for row in predictions if row.handle.lower() in linked_handle_set]
+        if server_only and verified_handle_set:
+            predictions = [row for row in predictions if row.handle.lower() in verified_handle_set]
 
         predictions.sort(key=lambda row: (row.rank, row.handle.lower()))
 

@@ -60,7 +60,8 @@ All commands are available as prefix and slash (hybrid command registration).
 - `!cf-unlink`
 - `!cf-linked`
 
-Linking is per guild (`guild_id + discord_user_id`) and duplicate handles in the same guild are rejected.
+Prediction commands use the existing verification flow (`!verify` + `!confirm`) and verified users in the server.
+`cf-link/cf-unlink` are compatibility helpers that point users to the verify flow.
 
 ### Prediction
 - `!cf-predict <contest_id> [server_only=True] [show_unofficial=False]`

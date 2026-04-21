@@ -5,7 +5,6 @@ import logging
 import os
 from typing import Optional
 
-import asyncpg
 import discord
 from discord.ext import commands
 
@@ -98,6 +97,16 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
             embed.set_footer(text="Approximate deltas; official Codeforces changes can differ")
         await ctx.send(embed=embed)
 
+    def _cf_failure_message(self, fallback: str) -> str:
+        err = self._cf.last_error
+        if err is None:
+            return fallback
+        return (
+            f"{fallback}\n"
+            f"`urlrequested: {err.requested_url}`\n"
+            f"`detail: {err.detail}`"
+        )
+
     def _start_watch_task(self, job: WatchJob) -> None:
         key = (job.guild_id, job.channel_id, job.contest_id)
         existing = self._watch_tasks.get(key)
@@ -163,42 +172,28 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
     @commands.hybrid_command(name="cf-link")
     @commands.guild_only()
     async def cf_link(self, ctx: commands.Context, handle: str) -> None:
-        """Link your Discord account to a Codeforces handle."""
-        assert ctx.guild is not None
-        info = await self._cf.get_user(handle)
-        if info is None:
-            await ctx.send(f"Could not find Codeforces handle **{handle}**.")
-            return
-
-        try:
-            await self._repo.upsert_linked_account(ctx.guild.id, ctx.author.id, info.handle)
-        except asyncpg.UniqueViolationError:
-            await ctx.send("That handle is already linked to another user in this server.")
-            return
-
-        await ctx.send(f"Linked {ctx.author.mention} to **{info.handle}**.")
+        """Use verify flow instead of separate linking for predictions."""
+        await ctx.send(
+            "Predictions use verified handles from `!verify`.\n"
+            "Run `!verify <handle>` then `!confirm`."
+        )
 
     @commands.hybrid_command(name="cf-unlink")
     @commands.guild_only()
     async def cf_unlink(self, ctx: commands.Context) -> None:
-        """Remove your linked Codeforces handle."""
-        assert ctx.guild is not None
-        removed = await self._repo.remove_linked_account(ctx.guild.id, ctx.author.id)
-        if removed:
-            await ctx.send("Your Codeforces handle was unlinked.")
-        else:
-            await ctx.send("No linked handle found for your account.")
+        """Link management is handled by verification commands."""
+        await ctx.send("Use `!verify` to set or update your handle for predictions.")
 
     @commands.hybrid_command(name="cf-linked")
     @commands.guild_only()
     async def cf_linked(self, ctx: commands.Context) -> None:
-        """Show your currently linked Codeforces handle."""
+        """Show your verified handle used by prediction commands."""
         assert ctx.guild is not None
-        link = await self._repo.get_linked_account(ctx.guild.id, ctx.author.id)
-        if link is None:
-            await ctx.send("You have no linked Codeforces handle in this server.")
+        verified = await self._repo.get_by_discord_id(ctx.author.id, ctx.guild.id)
+        if verified is None:
+            await ctx.send("You are not verified in this server. Use `!verify <handle>` first.")
             return
-        await ctx.send(f"Your linked handle is **{link.cf_handle}**.")
+        await ctx.send(f"Your verified handle is **{verified.cf_handle}**.")
 
     @commands.hybrid_command(name="cf-predict")
     @commands.guild_only()
@@ -219,7 +214,7 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
             handles_filter=None,
         )
         if result is None:
-            await ctx.send("Could not fetch standings for that contest right now.")
+            await ctx.send(self._cf_failure_message("Could not fetch standings for that contest right now."))
             return
 
         await self._send_prediction_embed(ctx, result, title="Contest Rating Prediction")
@@ -242,7 +237,7 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
             handles_filter=set(parsed),
         )
         if result is None:
-            await ctx.send("Could not fetch standings for that contest right now.")
+            await ctx.send(self._cf_failure_message("Could not fetch standings for that contest right now."))
             return
 
         await self._send_prediction_embed(ctx, result, title="Handle Rating Prediction")
@@ -250,11 +245,11 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
     @commands.hybrid_command(name="cf-predict-me")
     @commands.guild_only()
     async def cf_predict_me(self, ctx: commands.Context, contest_id: int) -> None:
-        """Predict your rating change using your linked handle."""
+        """Predict your rating change using your verified handle."""
         assert ctx.guild is not None
-        link = await self._repo.get_linked_account(ctx.guild.id, ctx.author.id)
-        if link is None:
-            await ctx.send("Link a handle first with `!cf-link <handle>`.")
+        verified = await self._repo.get_by_discord_id(ctx.author.id, ctx.guild.id)
+        if verified is None:
+            await ctx.send("Verify first with `!verify <handle>` then `!confirm`.")
             return
 
         result = await self._build_prediction_result(
@@ -262,10 +257,10 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
             contest_id=contest_id,
             server_only=False,
             show_unofficial=False,
-            handles_filter={link.cf_handle},
+            handles_filter={verified.cf_handle},
         )
         if result is None or not result.predictions:
-            await ctx.send("Could not build prediction for your handle in that contest.")
+            await ctx.send(self._cf_failure_message("Could not build prediction for your handle in that contest."))
             return
 
         row = result.predictions[0]
@@ -357,7 +352,7 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
             handles_filter=None,
         )
         if result is None:
-            await ctx.send("Could not fetch standings for that contest.")
+            await ctx.send(self._cf_failure_message("Could not fetch standings for that contest."))
             return
 
         metrics = await self._service.compare_with_official(contest_id=contest_id, predictions=result.predictions)
