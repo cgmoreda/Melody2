@@ -39,6 +39,18 @@ class UserRepositoryBase(abc.ABC):
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
         """Return every verified user in a guild."""
 
+    @abc.abstractmethod
+    async def add_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        """Enable contest reminders for a guild channel."""
+
+    @abc.abstractmethod
+    async def remove_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        """Disable contest reminders for a guild channel."""
+
+    @abc.abstractmethod
+    async def get_reminder_channels(self) -> list[tuple[int, int]]:
+        """Return all enabled reminder channels as (guild_id, channel_id)."""
+
 
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
@@ -58,6 +70,15 @@ class UserRepository(UserRepositoryBase):
                     cf_handle TEXT NOT NULL,
                     rating INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (discord_id, guild_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reminder_channels (
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id)
                 )
                 """
             )
@@ -125,3 +146,41 @@ class UserRepository(UserRepositoryBase):
             )
             for row in rows
         ]
+
+    async def add_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO reminder_channels (guild_id, channel_id)
+                VALUES ($1, $2)
+                ON CONFLICT(guild_id, channel_id) DO NOTHING
+                """,
+                guild_id,
+                channel_id,
+            )
+        return result.endswith("1")
+
+    async def remove_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM reminder_channels
+                WHERE guild_id = $1 AND channel_id = $2
+                """,
+                guild_id,
+                channel_id,
+            )
+        return result.endswith("1")
+
+    async def get_reminder_channels(self) -> list[tuple[int, int]]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, channel_id
+                FROM reminder_channels
+                """
+            )
+        return [(row["guild_id"], row["channel_id"]) for row in rows]

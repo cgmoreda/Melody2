@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from db.repository import UserRepository
 from services.cf_client import CodeforcesClient
+from services.contest_reminder import ContestReminderService
 from services.role_assigner import RoleAssigner
 
 
@@ -74,9 +75,30 @@ async def _setup_services(bot: commands.Bot) -> None:
     await repo.init()
     bot.user_repo = repo  # type: ignore[attr-defined]
 
+    poll_raw = os.getenv("CF_REMINDER_POLL_SECONDS", "300")
+    try:
+        poll_seconds = int(poll_raw)
+    except ValueError:
+        poll_seconds = 300
+
+    reminder = ContestReminderService(
+        session=session,
+        bot=bot,
+        repo=repo,
+        poll_seconds=poll_seconds,
+    )
+    await reminder.initialize()
+    reminder.start()
+    bot.contest_reminder = reminder  # type: ignore[attr-defined]
+    logging.info("Contest reminder service started")
+
 
 async def _teardown_services(bot: commands.Bot) -> None:
     """Gracefully close shared resources."""
+    reminder: ContestReminderService | None = getattr(bot, "contest_reminder", None)
+    if reminder:
+        await reminder.stop()
+
     repo: UserRepository | None = getattr(bot, "user_repo", None)
     if repo:
         await repo.close()

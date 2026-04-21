@@ -5,12 +5,14 @@ import logging
 import secrets
 from statistics import median
 import string
+from typing import Optional
 
 import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase, VerifiedUser
 from services.cf_client import CodeforcesClientBase
+from services.contest_reminder import ContestReminderService
 from services.role_assigner import RoleAssignerBase
 
 logger = logging.getLogger(__name__)
@@ -45,10 +47,12 @@ class VerificationCog(commands.Cog, name="Verification"):
         cf_client: CodeforcesClientBase,
         role_assigner: RoleAssignerBase,
         repo: UserRepositoryBase,
+        reminder_service: Optional[ContestReminderService],
     ) -> None:
         self._cf = cf_client
         self._roles = role_assigner
         self._repo = repo
+        self._reminders = reminder_service
         self._pending: dict[int, tuple[str, str]] = {}
 
     @commands.command(name="verify")
@@ -324,6 +328,80 @@ class VerificationCog(commands.Cog, name="Verification"):
         embed.set_footer(text="Data fetched live from Codeforces")
         await ctx.send(embed=embed)
 
+    @commands.group(name="reminder", invoke_without_command=True)
+    @commands.guild_only()
+    async def reminder(self, ctx: commands.Context) -> None:
+        await ctx.send("Usage: **!reminder <enable|disable|status> [#channel]**")
+
+    @reminder.command(name="enable")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def reminder_enable(
+        self,
+        ctx: commands.Context,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        assert ctx.guild is not None
+        if self._reminders is None:
+            await ctx.send("Reminder service is not available.")
+            return
+
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.send("This command must target a text channel.")
+            return
+
+        created = await self._reminders.enable_channel(ctx.guild.id, target.id)
+        if created:
+            await ctx.send(f"Contest reminders enabled in {target.mention}.")
+        else:
+            await ctx.send(f"Contest reminders are already enabled in {target.mention}.")
+
+    @reminder.command(name="disable")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def reminder_disable(
+        self,
+        ctx: commands.Context,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        assert ctx.guild is not None
+        if self._reminders is None:
+            await ctx.send("Reminder service is not available.")
+            return
+
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.send("This command must target a text channel.")
+            return
+
+        removed = await self._reminders.disable_channel(ctx.guild.id, target.id)
+        if removed:
+            await ctx.send(f"Contest reminders disabled in {target.mention}.")
+        else:
+            await ctx.send(f"Contest reminders were not enabled in {target.mention}.")
+
+    @reminder.command(name="status")
+    @commands.guild_only()
+    async def reminder_status(
+        self,
+        ctx: commands.Context,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        assert ctx.guild is not None
+        if self._reminders is None:
+            await ctx.send("Reminder service is not available.")
+            return
+
+        target = channel or ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.send("This command must target a text channel.")
+            return
+
+        enabled = await self._reminders.is_channel_enabled(ctx.guild.id, target.id)
+        state = "enabled" if enabled else "disabled"
+        await ctx.send(f"Contest reminders are **{state}** in {target.mention}.")
+
     @verify.error
     async def verify_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
@@ -345,6 +423,13 @@ class VerificationCog(commands.Cog, name="Verification"):
             return
         raise error
 
+    @reminder.error
+    async def reminder_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need the **Manage Server** permission for this reminder action.")
+            return
+        raise error
+
 
 async def setup(bot: commands.Bot) -> None:
     """Called by ``bot.load_extension("cogs.verification")``."""
@@ -354,6 +439,7 @@ async def setup(bot: commands.Bot) -> None:
             getattr(bot, "cf_client"),
             getattr(bot, "role_assigner"),
             getattr(bot, "user_repo"),
+            getattr(bot, "contest_reminder", None),
         )
     )
     logger.info("Verification cog loaded")
