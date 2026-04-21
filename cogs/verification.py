@@ -62,7 +62,8 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.guild_only()
     async def verify(self, ctx: commands.Context, handle: str) -> None:
         """Start verification for a Codeforces handle."""
-        assert ctx.guild is not None  # guild_only guard
+        if ctx.guild is None:
+            return
 
         # Quick sanity check: does the handle exist?
         info = await self._cf.get_user(handle)
