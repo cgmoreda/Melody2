@@ -129,9 +129,9 @@ class VerificationCog(commands.Cog, name="Verification"):
         await ctx.send(embed=embed)
         logger.info("Verified %s as %s (max rating %d)", ctx.author, info.handle, info.max_rating)
 
-    @commands.command(name="update")
+    @commands.command(name="updaterating", aliases=["update"])
     @commands.guild_only()
-    async def update(self, ctx: commands.Context) -> None:
+    async def updaterating(self, ctx: commands.Context) -> None:
         """Re-fetch your Codeforces rating and update your Discord role."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
 
@@ -145,15 +145,35 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send("Could not reach the Codeforces API. Please try again later.")
             return
 
+        old_rating = record.rating
+        old_handle = record.cf_handle
+        old_role_rule = self._roles.role_for(old_rating)
+        old_role_name = old_role_rule.name if old_role_rule else "none"
+
+        record.cf_handle = info.handle
         record.rating = info.max_rating
         await self._repo.upsert(record)
 
         role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
-        role_text = f"**{role.name}**" if role else "*(none)*"
+        new_role_rule = self._roles.role_for(info.max_rating)
+        new_role_name = new_role_rule.name if new_role_rule else "none"
+        role_text = f"**{new_role_name}**" if role else f"**{new_role_name}** (not applied)"
+        rating_delta = info.max_rating - old_rating
+        delta_sign = "+" if rating_delta >= 0 else ""
+
+        if old_rating == info.max_rating and old_handle == info.handle:
+            summary = "No change detected."
+        else:
+            summary = f"Max rating changed by **{delta_sign}{rating_delta}**."
 
         embed = discord.Embed(
             title="Rating Updated",
-            description=f"**{info.handle}** - max rating **{info.max_rating}** - role {role_text}.",
+            description=(
+                f"**Handle:** {old_handle} -> {info.handle}\n"
+                f"**Max Rating:** {old_rating} -> {info.max_rating}\n"
+                f"**Role:** {old_role_name} -> {role_text}\n"
+                f"{summary}"
+            ),
             colour=discord.Colour.blurple(),
         )
         await ctx.send(embed=embed)
