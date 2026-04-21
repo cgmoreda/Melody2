@@ -46,14 +46,15 @@ class ConfigCog(commands.Cog, name="Config"):
     @commands.has_permissions(manage_guild=True)
     async def config_set(self, ctx: commands.Context, key: str, value: int) -> None:
         assert ctx.guild is not None
+        normalized_key = key.lower()
         try:
-            cfg = await self._config.set_value(ctx.guild.id, key, value)
+            cfg = await self._config.set_value(ctx.guild.id, normalized_key, value)
         except ValueError as exc:
             await ctx.send(str(exc))
             return
 
-        updated_value = getattr(cfg, key)
-        await ctx.send(f"Set `{key}` to `{updated_value}`.")
+        updated_value = getattr(cfg, normalized_key)
+        await ctx.send(f"Set `{normalized_key}` to `{updated_value}`.")
 
     @config.command(name="reset")
     @commands.guild_only()
@@ -61,19 +62,20 @@ class ConfigCog(commands.Cog, name="Config"):
     async def config_reset(self, ctx: commands.Context, key: str = "all") -> None:
         assert ctx.guild is not None
 
-        if key == "all":
+        normalized_key = key.lower()
+        if normalized_key == "all":
             await self._config.reset_all(ctx.guild.id)
             await ctx.send("Reset all config keys to defaults.")
             return
 
         try:
-            cfg = await self._config.reset_key(ctx.guild.id, key)
+            cfg = await self._config.reset_key(ctx.guild.id, normalized_key)
         except ValueError as exc:
             await ctx.send(str(exc))
             return
 
-        updated_value = getattr(cfg, key)
-        await ctx.send(f"Reset `{key}` to default (`{updated_value}`).")
+        updated_value = getattr(cfg, normalized_key)
+        await ctx.send(f"Reset `{normalized_key}` to default (`{updated_value}`).")
 
     @config_set.error
     async def config_set_error(self, ctx: commands.Context, error: commands.CommandError) -> None:

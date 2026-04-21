@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 EXTENSIONS: tuple[str, ...] = (
+    "cogs.help",
     "cogs.verification",
     "cogs.config",
     "cogs.coach_secretary",
@@ -47,7 +48,7 @@ def create_bot() -> MelodyBot:
     intents.members = True
     intents.voice_states = True
 
-    bot = MelodyBot(command_prefix="!", intents=intents)
+    bot = MelodyBot(command_prefix="!", intents=intents, help_command=None)
 
     @bot.event
     async def on_ready() -> None:
