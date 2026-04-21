@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 import logging
 import secrets
@@ -326,6 +327,88 @@ class VerificationCog(commands.Cog, name="Verification"):
         if info.avatar_url:
             embed.set_thumbnail(url=info.avatar_url)
         embed.set_footer(text="Data fetched live from Codeforces")
+        await ctx.send(embed=embed)
+
+    @commands.command(name="roundchanges", aliases=["lastround"])
+    @commands.guild_only()
+    async def roundchanges(self, ctx: commands.Context) -> None:
+        """Show rating changes for verified users in the latest recent round."""
+        assert ctx.guild is not None
+
+        users = await self._repo.get_all(ctx.guild.id)
+        if not users:
+            await ctx.send("No verified users found in this server.")
+            return
+
+        unique_handles = sorted({user.cf_handle for user in users})
+
+        sem = asyncio.Semaphore(8)
+
+        async def _fetch(handle: str) -> tuple[str, list]:
+            async with sem:
+                history = await self._cf.get_rating_history(handle)
+                return handle, history
+
+        history_rows = await asyncio.gather(*[_fetch(handle) for handle in unique_handles])
+        history_by_handle = {handle: history for handle, history in history_rows}
+
+        latest_entries = [history[-1] for history in history_by_handle.values() if history]
+        if not latest_entries:
+            await ctx.send("Could not fetch rating history for verified users right now.")
+            return
+
+        target_contest_id = max(entry.contest_id for entry in latest_entries)
+        target_contest_name = next(
+            (entry.contest_name for entry in latest_entries if entry.contest_id == target_contest_id),
+            f"Contest {target_contest_id}",
+        )
+
+        participants: list[tuple[int, str]] = []
+        non_participants: list[str] = []
+
+        for user in users:
+            history = history_by_handle.get(user.cf_handle, [])
+            row = next((item for item in reversed(history) if item.contest_id == target_contest_id), None)
+            member = ctx.guild.get_member(user.discord_id)
+            identity = member.mention if member else f"<@{user.discord_id}>"
+            if row is None:
+                non_participants.append(f"{identity} (`{user.cf_handle}`): did not participate")
+                continue
+
+            delta = row.new_rating - row.old_rating
+            sign = "+" if delta >= 0 else ""
+            participants.append(
+                (
+                    delta,
+                    f"{identity} (`{user.cf_handle}`): **{sign}{delta}** "
+                    f"({row.old_rating} -> {row.new_rating}, rank {row.rank})",
+                )
+            )
+
+        participants.sort(key=lambda item: item[0], reverse=True)
+
+        lines: list[str] = [line for _, line in participants]
+        lines.extend(non_participants)
+        if not lines:
+            await ctx.send("No rating updates found for the latest round.")
+            return
+
+        max_lines = 30
+        displayed = lines[:max_lines]
+        hidden_count = len(lines) - len(displayed)
+
+        embed = discord.Embed(
+            title="Server Round Changes",
+            description="\n".join(displayed),
+            colour=discord.Colour.gold(),
+        )
+        embed.add_field(name="Round", value=target_contest_name, inline=False)
+        embed.add_field(name="Contest ID", value=str(target_contest_id), inline=True)
+        embed.add_field(name="Verified Users", value=str(len(users)), inline=True)
+        if hidden_count > 0:
+            embed.set_footer(text=f"{hidden_count} more users not shown due to message length.")
+        else:
+            embed.set_footer(text="Data fetched live from Codeforces.")
         await ctx.send(embed=embed)
 
     @commands.group(name="reminder", invoke_without_command=True)
