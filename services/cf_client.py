@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import hashlib
 import logging
 import os
-import random
-import string
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -17,14 +14,6 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 CF_API_BASE = "https://codeforces.com/api"
-
-
-def build_api_sig(rand_prefix: str, method: str, params: dict[str, object], api_secret: str) -> str:
-    """Build Codeforces apiSig value using SHA-512."""
-    serialized = urlencode(sorted((key, str(value)) for key, value in params.items()))
-    payload = f"{rand_prefix}/{method}?{serialized}#{api_secret}"
-    digest = hashlib.sha512(payload.encode("utf-8")).hexdigest()
-    return f"{rand_prefix}{digest}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,31 +50,6 @@ class CFSubmission:
     problem_key: Optional[str]
 
 
-@dataclass(frozen=True, slots=True)
-class CFStandingRow:
-    rank: int
-    points: float
-    penalty: int
-    participant_type: str
-    handles: tuple[str, ...]
-    is_official: bool
-
-
-@dataclass(frozen=True, slots=True)
-class CFStandingsPage:
-    contest_id: int
-    contest_name: str
-    phase: str
-    rows: list[CFStandingRow]
-
-
-@dataclass(frozen=True, slots=True)
-class CFRequestError:
-    endpoint: str
-    requested_url: str
-    detail: str
-
-
 class CodeforcesClientBase(abc.ABC):
     @abc.abstractmethod
     async def get_user(self, handle: str) -> Optional[CFUserInfo]:
@@ -99,38 +63,13 @@ class CodeforcesClientBase(abc.ABC):
     async def get_recent_submissions(self, handle: str, count: int = 500) -> list[CFSubmission]:
         ...
 
-    @abc.abstractmethod
-    async def get_contest_standings_page(
-        self,
-        contest_id: int,
-        start_from: int,
-        count: int,
-        *,
-        show_unofficial: bool,
-        handles: Optional[list[str]] = None,
-    ) -> Optional[CFStandingsPage]:
-        ...
-
-    @abc.abstractmethod
-    async def get_contest_rating_changes(self, contest_id: int) -> list[CFContestChange]:
-        ...
-
-
 class CodeforcesClient(CodeforcesClientBase):
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
-        self._api_key = os.getenv("CF_API_KEY", "").strip()
-        self._api_secret = os.getenv("CF_API_SECRET", "").strip()
         self._cache_ttl_seconds = max(0, int(os.getenv("CACHE_TTL_SECONDS", "60")))
         self._timeout_seconds = max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")))
         self._max_retries = max(1, int(os.getenv("CF_MAX_RETRIES", "3")))
-        self.standings_page_size = max(10, min(5000, int(os.getenv("CF_STANDINGS_PAGE_SIZE", "500"))))
         self._cache: dict[str, tuple[float, dict]] = {}
-        self._last_error: Optional[CFRequestError] = None
-
-    @property
-    def last_error(self) -> Optional[CFRequestError]:
-        return self._last_error
 
     def _cache_get(self, cache_key: str) -> Optional[dict]:
         if self._cache_ttl_seconds <= 0:
@@ -149,32 +88,8 @@ class CodeforcesClient(CodeforcesClientBase):
             return
         self._cache[cache_key] = (time.time() + self._cache_ttl_seconds, payload)
 
-    def _signed_params(self, endpoint: str, params: dict[str, object]) -> dict[str, object]:
-        if not self._api_key or not self._api_secret:
-            raise RuntimeError("CF_API_KEY and CF_API_SECRET must be set for signed requests")
-
-        signed = dict(params)
-        signed["apiKey"] = self._api_key
-        signed["time"] = int(time.time())
-        rand_prefix = "".join(random.choice(string.digits) for _ in range(6))
-        signed["apiSig"] = build_api_sig(rand_prefix, endpoint, signed, self._api_secret)
-        return signed
-
-    async def _get(self, endpoint: str, params: dict[str, object], *, require_auth: bool = False) -> Optional[dict]:
-        self._last_error = None
+    async def _get(self, endpoint: str, params: dict[str, object]) -> Optional[dict]:
         request_params = dict(params)
-        if require_auth:
-            try:
-                request_params = self._signed_params(endpoint, request_params)
-            except RuntimeError as exc:
-                logger.warning("Signed request for %s failed: %s", endpoint, exc)
-                self._last_error = CFRequestError(
-                    endpoint=endpoint,
-                    requested_url=f"{CF_API_BASE}/{endpoint}",
-                    detail=str(exc),
-                )
-                return None
-
         cache_key = f"{endpoint}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}"
         cached = self._cache_get(cache_key)
         if cached is not None:
@@ -197,11 +112,6 @@ class CodeforcesClient(CodeforcesClientBase):
                             delay *= 2
                             continue
                         logger.warning("CF API status %s for %s", response.status, endpoint)
-                        self._last_error = CFRequestError(
-                            endpoint=endpoint,
-                            requested_url=str(response.url),
-                            detail=last_error_detail,
-                        )
                         return None
                     payload = await response.json(content_type=None)
             except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
@@ -211,19 +121,9 @@ class CodeforcesClient(CodeforcesClientBase):
                     delay *= 2
                     continue
                 logger.warning("CF API request failed for %s: %s", endpoint, exc)
-                self._last_error = CFRequestError(
-                    endpoint=endpoint,
-                    requested_url=f"{url}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}",
-                    detail=last_error_detail,
-                )
                 return None
 
             if not isinstance(payload, dict):
-                self._last_error = CFRequestError(
-                    endpoint=endpoint,
-                    requested_url=f"{url}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}",
-                    detail="Response was not JSON object",
-                )
                 return None
             if payload.get("status") != "OK":
                 comment = payload.get("comment")
@@ -232,21 +132,11 @@ class CodeforcesClient(CodeforcesClientBase):
                     await asyncio.sleep(delay)
                     delay *= 2
                     continue
-                self._last_error = CFRequestError(
-                    endpoint=endpoint,
-                    requested_url=f"{url}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}",
-                    detail=last_error_detail,
-                )
                 return None
 
             self._cache_set(cache_key, payload)
             return payload
 
-        self._last_error = CFRequestError(
-            endpoint=endpoint,
-            requested_url=f"{url}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}",
-            detail=last_error_detail,
-        )
         return None
 
     async def get_user(self, handle: str) -> Optional[CFUserInfo]:
@@ -371,101 +261,3 @@ class CodeforcesClient(CodeforcesClientBase):
                 )
             )
         return submissions
-
-    async def get_contest_standings_page(
-        self,
-        contest_id: int,
-        start_from: int,
-        count: int,
-        *,
-        show_unofficial: bool,
-        handles: Optional[list[str]] = None,
-    ) -> Optional[CFStandingsPage]:
-        params: dict[str, object] = {
-            "contestId": contest_id,
-            "from": max(1, start_from),
-            "count": max(1, count),
-            "showUnofficial": str(show_unofficial).lower(),
-        }
-        if handles:
-            params["handles"] = ";".join(handles)
-
-        data = await self._get("contest.standings", params, require_auth=True)
-        if data is None:
-            return None
-
-        result = data.get("result")
-        if not isinstance(result, dict):
-            return None
-
-        contest = result.get("contest") if isinstance(result.get("contest"), dict) else {}
-        contest_name = str(contest.get("name", f"Contest {contest_id}"))
-        phase = str(contest.get("phase", "UNKNOWN"))
-
-        raw_rows = result.get("rows")
-        if not isinstance(raw_rows, list):
-            raw_rows = []
-
-        rows: list[CFStandingRow] = []
-        for row in raw_rows:
-            if not isinstance(row, dict):
-                continue
-
-            party = row.get("party") if isinstance(row.get("party"), dict) else {}
-            members = party.get("members") if isinstance(party.get("members"), list) else []
-            parsed_handles = tuple(
-                member["handle"]
-                for member in members
-                if isinstance(member, dict) and isinstance(member.get("handle"), str)
-            )
-            if not parsed_handles:
-                continue
-
-            participant_type = str(party.get("participantType", "UNKNOWN"))
-            rank = int(row.get("rank", 0) or 0)
-            points = float(row.get("points", 0.0) or 0.0)
-            penalty = int(row.get("penalty", 0) or 0)
-            is_official = participant_type == "CONTESTANT"
-
-            rows.append(
-                CFStandingRow(
-                    rank=rank,
-                    points=points,
-                    penalty=penalty,
-                    participant_type=participant_type,
-                    handles=parsed_handles,
-                    is_official=is_official,
-                )
-            )
-
-        return CFStandingsPage(
-            contest_id=contest_id,
-            contest_name=contest_name,
-            phase=phase,
-            rows=rows,
-        )
-
-    async def get_contest_rating_changes(self, contest_id: int) -> list[CFContestChange]:
-        data = await self._get("contest.ratingChanges", {"contestId": contest_id}, require_auth=True)
-        if data is None:
-            return []
-
-        rows = data.get("result")
-        if not isinstance(rows, list):
-            return []
-
-        changes: list[CFContestChange] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            changes.append(
-                CFContestChange(
-                    contest_id=int(row.get("contestId", 0) or 0),
-                    contest_name=str(row.get("contestName", f"Contest {contest_id}")),
-                    rank=int(row.get("rank", 0) or 0),
-                    old_rating=int(row.get("oldRating", 0) or 0),
-                    new_rating=int(row.get("newRating", 0) or 0),
-                    handle=row.get("handle") if isinstance(row.get("handle"), str) else None,
-                )
-            )
-        return changes

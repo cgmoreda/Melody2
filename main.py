@@ -23,7 +23,6 @@ load_dotenv()
 
 EXTENSIONS: tuple[str, ...] = (
     "cogs.help",
-    "cogs.cf_predictor",
     "cogs.verification",
     "cogs.config",
     "cogs.coach_secretary",
