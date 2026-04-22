@@ -16,12 +16,6 @@ def _hours(seconds: float) -> str:
 
 
 def _rank_prefix(rank: int) -> str:
-    if rank == 1:
-        return "🥇"
-    if rank == 2:
-        return "🥈"
-    if rank == 3:
-        return "🥉"
     return f"#{rank}"
 
 
@@ -218,7 +212,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     def _sorted_totals(totals: dict[int, float]) -> list[tuple[int, float]]:
         return sorted(totals.items(), key=lambda item: item[1], reverse=True)
 
-    async def _leaderboard_lines(
+    def _leaderboard_lines(
         self,
         *,
         guild: discord.Guild,
@@ -233,6 +227,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 handle = member.display_name if member else str(discord_id)
             lines.append(f"{_rank_prefix(index):<4} {handle:<18.18} {_hours(seconds)}")
         return lines
+
+    @staticmethod
+    def _render_ranked_message(*, title: str, lines: list[str], max_lines: int, overflow_label: str) -> str:
+        shown = lines[: max_lines + 1]
+        parts = [title, "```text", *shown, "```"]
+        remaining_count = max(0, len(lines) - len(shown))
+        if remaining_count > 0:
+            parts.append(f"... and {remaining_count} more {overflow_label}")
+        return "\n".join(parts)
 
     @staticmethod
     def _find_rank(totals: dict[int, float], discord_id: int) -> Optional[tuple[int, float]]:
@@ -359,17 +362,18 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("No solo-channel voice logs found for that period.")
                     return
 
-                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                shown = lines[: limit + 1]
-                content = [f"**Top Solo Voice Hours ({label})**", "```text", *shown, "```"]
+                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                content = self._render_ranked_message(
+                    title=f"**Top Solo Voice Hours ({label})**",
+                    lines=lines,
+                    max_lines=limit,
+                    overflow_label="users",
+                )
                 rank_data = self._find_rank(totals, ctx.author.id)
                 if rank_data is not None:
                     rank, seconds = rank_data
-                    content.append(f"Your rank: **#{rank}** with **{_hours(seconds)}**")
-                remaining_count = max(0, len(lines) - len(shown))
-                if remaining_count > 0:
-                    content.append(f"... and {remaining_count} more users")
-                await ctx.send("\n".join(content))
+                    content = f"{content}\nYour rank: **#{rank}** with **{_hours(seconds)}**"
+                await ctx.send(content)
                 return
 
             if mode == "me":
@@ -432,13 +436,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(f"No solo voice logs found for role {target_role.mention} in {label}.")
                     return
 
-                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                shown = lines[: config.voicehours_max_lines + 1]
-                content = [f"**Solo Voice Hours for {target_role.name} ({label})**", "```text", *shown, "```"]
-                remaining_count = max(0, len(lines) - len(shown))
-                if remaining_count > 0:
-                    content.append(f"... and {remaining_count} more users")
-                await ctx.send("\n".join(content))
+                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                await ctx.send(
+                    self._render_ranked_message(
+                        title=f"**Solo Voice Hours for {target_role.name} ({label})**",
+                        lines=lines,
+                        max_lines=config.voicehours_max_lines,
+                        overflow_label="users",
+                    )
+                )
                 return
 
             if mode in {"roles", "teams"}:
@@ -454,31 +460,32 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     for role in ctx.guild.roles
                     if "team" in role.name.lower() and role.name != "@everyone"
                 ]
-                role_totals: list[tuple[str, float]] = []
-                for role in team_roles:
-                    seconds_sum = 0.0
-                    for member in role.members:
-                        if member.bot:
-                            continue
-                        seconds_sum += totals.get(member.id, 0.0)
-                    role_totals.append((role.name, seconds_sum))
-
-                role_totals = [item for item in role_totals if item[1] > 0]
-                role_totals.sort(key=lambda item: item[1], reverse=True)
-                if not role_totals:
-                    await ctx.send(f"No team-role solo voice logs found for {label}.")
+                if not team_roles:
+                    await ctx.send("No roles containing `team` were found in this server.")
                     return
 
-                lines = ["rk   role               total"]
-                for index, (role_name, seconds) in enumerate(role_totals, start=1):
-                    lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds)}")
+                role_totals: list[tuple[str, float, int]] = []
+                for role in team_roles:
+                    non_bot_members = [member for member in role.members if not member.bot]
+                    seconds_sum = 0.0
+                    for member in non_bot_members:
+                        seconds_sum += totals.get(member.id, 0.0)
+                    role_totals.append((role.name, seconds_sum, len(non_bot_members)))
 
-                shown = lines[: config.voicehours_max_lines + 1]
-                content = [f"**Team Role Solo Voice Standings ({label})**", "```text", *shown, "```"]
-                remaining_count = max(0, len(lines) - len(shown))
-                if remaining_count > 0:
-                    content.append(f"... and {remaining_count} more roles")
-                await ctx.send("\n".join(content))
+                role_totals.sort(key=lambda item: (-item[1], item[0].lower()))
+
+                lines = ["rk   role               total    members"]
+                for index, (role_name, seconds, member_count) in enumerate(role_totals, start=1):
+                    lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds):<8} {member_count}")
+
+                await ctx.send(
+                    self._render_ranked_message(
+                        title=f"**Team Role Solo Voice Standings ({label})**",
+                        lines=lines,
+                        max_lines=config.voicehours_max_lines,
+                        overflow_label="roles",
+                    )
+                )
                 return
 
             if mode == "last":
@@ -491,13 +498,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if not totals:
                     await ctx.send("No solo-channel voice logs found for that period.")
                     return
-                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                shown = lines[: config.voicehours_max_lines + 1]
-                content = [f"**Solo Voice Hours ({label})**", "```text", *shown, "```"]
-                remaining_count = max(0, len(lines) - len(shown))
-                if remaining_count > 0:
-                    content.append(f"... and {remaining_count} more users")
-                await ctx.send("\n".join(content))
+                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                await ctx.send(
+                    self._render_ranked_message(
+                        title=f"**Solo Voice Hours ({label})**",
+                        lines=lines,
+                        max_lines=config.voicehours_max_lines,
+                        overflow_label="users",
+                    )
+                )
                 return
 
             await ctx.send(

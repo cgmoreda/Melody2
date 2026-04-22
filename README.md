@@ -53,7 +53,7 @@ python main.py
 - `!voicehours me [last <x> <hour|day|week|month>]`
 - `!voicehours user <@member> [last <x> <hour|day|week|month>]`
 - `!voicehours role <@role> [last <x> <hour|day|week|month>]`
-- `!voicehours roles [last <x> <hour|day|week|month>]` (team roles only)
+- `!voicehours roles [last <x> <hour|day|week|month>]` (all roles containing `team`)
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
 - `!config <show|keys|set|reset>`
 - `!help [command]`

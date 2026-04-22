@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from difflib import get_close_matches
+
 import discord
 from discord.ext import commands
 
@@ -15,9 +17,11 @@ class HelpCog(commands.Cog, name="Help"):
             await self._send_general_help(ctx)
             return
 
-        command = self.bot.get_command(query)
+        command = self._resolve_command(query)
         if command is None:
-            await ctx.send(f"No command named `{query}` was found.")
+            suggestions = self._suggestions(query)
+            suggestion_text = f" Did you mean: {', '.join(f'`{name}`' for name in suggestions)}?" if suggestions else ""
+            await ctx.send(f"No command named `{query}` was found.{suggestion_text}")
             return
 
         await self._send_command_help(ctx, command)
@@ -32,7 +36,7 @@ class HelpCog(commands.Cog, name="Help"):
 
         embed = discord.Embed(
             title="Bot Commands",
-            description="Use `!help <command>` for details on one command.",
+            description="Use `!help <command>` for details on one command. Prefix commands are shown as `!`.",
             colour=discord.Colour.blurple(),
         )
 
@@ -52,6 +56,11 @@ class HelpCog(commands.Cog, name="Help"):
             description=command.help or "No detailed description.",
         )
         embed.add_field(name="Usage", value=f"`!{self._signature(command)}`", inline=False)
+        embed.add_field(
+            name="Slash",
+            value="Yes" if isinstance(command, commands.HybridCommand) else "No",
+            inline=True,
+        )
 
         aliases = ", ".join(f"`{alias}`" for alias in command.aliases) if command.aliases else "None"
         embed.add_field(name="Aliases", value=aliases, inline=True)
@@ -63,6 +72,31 @@ class HelpCog(commands.Cog, name="Help"):
                 embed.add_field(name="Subcommands", value="\n".join(lines), inline=False)
 
         await ctx.send(embed=embed)
+
+    def _resolve_command(self, raw: str) -> commands.Command | None:
+        token = raw.strip().lstrip("!/").lower()
+        if not token:
+            return None
+
+        direct = self.bot.get_command(token)
+        if direct is not None:
+            return direct
+
+        for command in self.bot.commands:
+            if command.qualified_name.lower() == token:
+                return command
+            if any(alias.lower() == token for alias in command.aliases):
+                return command
+        return None
+
+    def _suggestions(self, raw: str) -> list[str]:
+        token = raw.strip().lstrip("!/").lower()
+        if not token:
+            return []
+        names = sorted({command.qualified_name for command in self.bot.commands if not command.hidden})
+        lower_map = {name.lower(): name for name in names}
+        matches = get_close_matches(token, list(lower_map.keys()), n=3, cutoff=0.45)
+        return [lower_map[match] for match in matches]
 
     @staticmethod
     def _signature(command: commands.Command) -> str:
