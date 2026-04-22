@@ -329,6 +329,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours me [last <x> <hour/day/week/month>]`
         - `!voicehours user <@member> [last <x> <hour/day/week/month>]`
         - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
+        - `!voicehours roles [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
         """
         assert ctx.guild is not None
@@ -440,6 +441,46 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await ctx.send("\n".join(content))
                 return
 
+            if mode in {"roles", "teams"}:
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                team_roles = [
+                    role
+                    for role in ctx.guild.roles
+                    if "team" in role.name.lower() and role.name != "@everyone"
+                ]
+                role_totals: list[tuple[str, float]] = []
+                for role in team_roles:
+                    seconds_sum = 0.0
+                    for member in role.members:
+                        if member.bot:
+                            continue
+                        seconds_sum += totals.get(member.id, 0.0)
+                    role_totals.append((role.name, seconds_sum))
+
+                role_totals = [item for item in role_totals if item[1] > 0]
+                role_totals.sort(key=lambda item: item[1], reverse=True)
+                if not role_totals:
+                    await ctx.send(f"No team-role solo voice logs found for {label}.")
+                    return
+
+                lines = ["rk   role               total"]
+                for index, (role_name, seconds) in enumerate(role_totals, start=1):
+                    lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds)}")
+
+                shown = lines[: config.voicehours_max_lines + 1]
+                content = [f"**Team Role Solo Voice Standings ({label})**", "```text", *shown, "```"]
+                remaining_count = max(0, len(lines) - len(shown))
+                if remaining_count > 0:
+                    content.append(f"... and {remaining_count} more roles")
+                await ctx.send("\n".join(content))
+                return
+
             if mode == "last":
                 try:
                     since, label = self._parse_window_tokens(now=now, tokens=tuple(args))
@@ -461,7 +502,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             await ctx.send(
                 "Unknown mode.\n"
-                "Use one of: `last`, `me`, `user`, `role`, `top`.\n"
+                "Use one of: `last`, `me`, `user`, `role`, `roles`, `top`.\n"
                 "Example: `!voicehours top 20 last 2 weeks`"
             )
             return
@@ -511,3 +552,4 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(VoiceLoggingCog(bot, getattr(bot, "user_repo"), getattr(bot, "guild_config")))
+
