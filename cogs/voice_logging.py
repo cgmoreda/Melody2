@@ -15,6 +15,52 @@ def _hours(seconds: float) -> str:
     return f"{seconds / 3600:.2f}h"
 
 
+def _rank_prefix(rank: int) -> str:
+    if rank == 1:
+        return "🥇"
+    if rank == 2:
+        return "🥈"
+    if rank == 3:
+        return "🥉"
+    return f"#{rank}"
+
+
+def _normalize_window_unit(raw: str) -> Optional[str]:
+    unit = raw.strip().lower()
+    mapping = {
+        "h": "hour",
+        "hr": "hour",
+        "hrs": "hour",
+        "hour": "hour",
+        "hours": "hour",
+        "d": "day",
+        "day": "day",
+        "days": "day",
+        "w": "week",
+        "wk": "week",
+        "wks": "week",
+        "week": "week",
+        "weeks": "week",
+        "m": "month",
+        "mo": "month",
+        "month": "month",
+        "months": "month",
+    }
+    return mapping.get(unit)
+
+
+def _window_delta(amount: int, unit: str) -> timedelta:
+    if unit == "hour":
+        return timedelta(hours=amount)
+    if unit == "day":
+        return timedelta(days=amount)
+    if unit == "week":
+        return timedelta(weeks=amount)
+    if unit == "month":
+        return timedelta(days=30 * amount)
+    raise ValueError(f"unsupported window unit: {unit}")
+
+
 def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
     return channel is not None and "solo" in channel.name.lower()
 
@@ -127,6 +173,77 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         if task is not None:
             task.cancel()
 
+    async def _resolve_handles(self, guild: discord.Guild) -> dict[int, str]:
+        verified = await self._repo.get_all(guild.id)
+        handle_by_discord_id = {row.discord_id: row.cf_handle for row in verified}
+        return handle_by_discord_id
+
+    def _parse_window_tokens(
+        self,
+        *,
+        now: datetime,
+        tokens: tuple[str, ...],
+    ) -> tuple[Optional[datetime], str]:
+        if not tokens:
+            return None, "all time"
+
+        if len(tokens) == 1:
+            short = tokens[0].strip().lower()
+            if short in {"all", "alltime", "all-time"}:
+                return None, "all time"
+            normalized = _normalize_window_unit(short)
+            if normalized is not None:
+                return now - _window_delta(1, normalized), f"last 1 {normalized}"
+            raise ValueError("Usage: `... [last <x> <hour/day/week/month>]`")
+
+        if len(tokens) == 3 and tokens[0].strip().lower() == "last":
+            try:
+                amount = int(tokens[1])
+            except ValueError as exc:
+                raise ValueError("`x` must be a positive integer.") from exc
+            if amount <= 0:
+                raise ValueError("`x` must be greater than 0.")
+
+            normalized_unit = _normalize_window_unit(tokens[2])
+            if normalized_unit is None:
+                raise ValueError("Unit must be one of: `hour`, `day`, `week`, `month`.")
+            return (
+                now - _window_delta(amount, normalized_unit),
+                f"last {amount} {normalized_unit}{'' if amount == 1 else 's'}",
+            )
+
+        raise ValueError("Usage: `... [last <x> <hour/day/week/month>]`")
+
+    @staticmethod
+    def _sorted_totals(totals: dict[int, float]) -> list[tuple[int, float]]:
+        return sorted(totals.items(), key=lambda item: item[1], reverse=True)
+
+    async def _leaderboard_lines(
+        self,
+        *,
+        guild: discord.Guild,
+        totals: dict[int, float],
+        handle_by_discord_id: dict[int, str],
+    ) -> list[str]:
+        lines: list[str] = ["rk   handle             hours"]
+        for index, (discord_id, seconds) in enumerate(self._sorted_totals(totals), start=1):
+            handle = handle_by_discord_id.get(discord_id)
+            if handle is None:
+                member = guild.get_member(discord_id)
+                handle = member.display_name if member else str(discord_id)
+            lines.append(f"{_rank_prefix(index):<4} {handle:<18.18} {_hours(seconds)}")
+        return lines
+
+    @staticmethod
+    def _find_rank(totals: dict[int, float], discord_id: int) -> Optional[tuple[int, float]]:
+        if discord_id not in totals:
+            return None
+        ordered = sorted(totals.items(), key=lambda item: item[1], reverse=True)
+        for rank, (candidate_id, seconds) in enumerate(ordered, start=1):
+            if candidate_id == discord_id:
+                return rank, seconds
+        return None
+
     async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
         try:
             while True:
@@ -203,46 +320,193 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
-    async def voicehours(self, ctx: commands.Context) -> None:
-        """Show solo voice-channel hours for last week, month, and all time."""
+    async def voicehours(self, ctx: commands.Context, *args: str) -> None:
+        """Show solo voice-channel hours.
+
+        Usage:
+        - `!voicehours`
+        - `!voicehours last <x> <hour/day/week/month>`
+        - `!voicehours me [last <x> <hour/day/week/month>]`
+        - `!voicehours user <@member> [last <x> <hour/day/week/month>]`
+        - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
+        - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
+        """
         assert ctx.guild is not None
 
         config = await self._config.get(ctx.guild.id)
         now = datetime.now(tz=UTC)
+        handle_by_discord_id = await self._resolve_handles(ctx.guild)
+
+        if args:
+            mode = args[0].lower()
+
+            if mode == "top":
+                limit = config.voicehours_max_lines
+                remaining = args[1:]
+                if remaining and remaining[0].isdigit():
+                    limit = max(1, min(int(remaining[0]), 100))
+                    remaining = remaining[1:]
+
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(remaining))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                if not totals:
+                    await ctx.send("No solo-channel voice logs found for that period.")
+                    return
+
+                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                shown = lines[: limit + 1]
+                content = [f"**Top Solo Voice Hours ({label})**", "```text", *shown, "```"]
+                rank_data = self._find_rank(totals, ctx.author.id)
+                if rank_data is not None:
+                    rank, seconds = rank_data
+                    content.append(f"Your rank: **#{rank}** with **{_hours(seconds)}**")
+                remaining_count = max(0, len(lines) - len(shown))
+                if remaining_count > 0:
+                    content.append(f"... and {remaining_count} more users")
+                await ctx.send("\n".join(content))
+                return
+
+            if mode == "me":
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                rank_data = self._find_rank(totals, ctx.author.id)
+                if rank_data is None:
+                    await ctx.send(f"You have no solo voice logs for {label}.")
+                    return
+                rank, seconds = rank_data
+                await ctx.send(f"**{ctx.author.display_name}** in {label}: **{_hours(seconds)}** (rank **#{rank}**)")
+                return
+
+            if mode == "user":
+                if len(args) < 2:
+                    await ctx.send("Usage: `!voicehours user <@member> [last <x> <hour/day/week/month>]`")
+                    return
+                try:
+                    target_member = await commands.MemberConverter().convert(ctx, args[1])
+                except commands.BadArgument:
+                    await ctx.send("Could not resolve that member.")
+                    return
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                seconds = totals.get(target_member.id, 0.0)
+                rank_data = self._find_rank(totals, target_member.id)
+                rank_text = f" (rank **#{rank_data[0]}**)" if rank_data is not None else ""
+                await ctx.send(f"**{target_member.display_name}** in {label}: **{_hours(seconds)}**{rank_text}")
+                return
+
+            if mode == "role":
+                if len(args) < 2:
+                    await ctx.send("Usage: `!voicehours role <@role> [last <x> <hour/day/week/month>]`")
+                    return
+                try:
+                    target_role = await commands.RoleConverter().convert(ctx, args[1])
+                except commands.BadArgument:
+                    await ctx.send("Could not resolve that role.")
+                    return
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                all_totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                member_ids = {member.id for member in target_role.members if not member.bot}
+                totals = {discord_id: value for discord_id, value in all_totals.items() if discord_id in member_ids}
+                if not totals:
+                    await ctx.send(f"No solo voice logs found for role {target_role.mention} in {label}.")
+                    return
+
+                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                shown = lines[: config.voicehours_max_lines + 1]
+                content = [f"**Solo Voice Hours for {target_role.name} ({label})**", "```text", *shown, "```"]
+                remaining_count = max(0, len(lines) - len(shown))
+                if remaining_count > 0:
+                    content.append(f"... and {remaining_count} more users")
+                await ctx.send("\n".join(content))
+                return
+
+            if mode == "last":
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                if not totals:
+                    await ctx.send("No solo-channel voice logs found for that period.")
+                    return
+                lines = await self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                shown = lines[: config.voicehours_max_lines + 1]
+                content = [f"**Solo Voice Hours ({label})**", "```text", *shown, "```"]
+                remaining_count = max(0, len(lines) - len(shown))
+                if remaining_count > 0:
+                    content.append(f"... and {remaining_count} more users")
+                await ctx.send("\n".join(content))
+                return
+
+            await ctx.send(
+                "Unknown mode.\n"
+                "Use one of: `last`, `me`, `user`, `role`, `top`.\n"
+                "Example: `!voicehours top 20 last 2 weeks`"
+            )
+            return
+
         week_since = now - timedelta(days=7)
         month_since = now - timedelta(days=30)
-
-        week = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=week_since)
-        month = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=month_since)
-        all_time = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=None)
+        summary = await self._repo.get_solo_voice_summary(
+            ctx.guild.id,
+            now=now,
+            week_since=week_since,
+            month_since=month_since,
+        )
+        week = {discord_id: row["week"] for discord_id, row in summary.items()}
+        month = {discord_id: row["month"] for discord_id, row in summary.items()}
+        all_time = {discord_id: row["all_time"] for discord_id, row in summary.items()}
 
         if not all_time and not week and not month:
             await ctx.send("No solo-channel voice logs found yet.")
             return
 
-        verified = await self._repo.get_all(ctx.guild.id)
-        handle_by_discord_id = {row.discord_id: row.cf_handle for row in verified}
-
         all_ids = set(week) | set(month) | set(all_time)
         ordered_ids = sorted(all_ids, key=lambda user_id: all_time.get(user_id, 0.0), reverse=True)
-
         lines: list[str] = []
         for discord_id in ordered_ids:
             handle = handle_by_discord_id.get(discord_id)
             if handle is None:
                 member = ctx.guild.get_member(discord_id)
                 handle = member.display_name if member else str(discord_id)
+            rank = _rank_prefix(len(lines) + 1)
             lines.append(
-                f"`{handle}` | {_hours(week.get(discord_id, 0.0))} | "
+                f"{rank:<4} `{handle}` | {_hours(week.get(discord_id, 0.0))} | "
                 f"{_hours(month.get(discord_id, 0.0))} | {_hours(all_time.get(discord_id, 0.0))}"
             )
 
-        header = "**Handle | Last Week | Last Month | All Time**\n"
+        header = "**Rank | Handle | Last Week | Last Month | All Time**\n"
         body = "\n".join(lines[: config.voicehours_max_lines])
         extra = len(lines) - min(len(lines), config.voicehours_max_lines)
         if extra > 0:
             body += f"\n... and {extra} more users"
-        await ctx.send(header + body)
+        rank_data = self._find_rank(all_time, ctx.author.id)
+        footer = ""
+        if rank_data is not None:
+            rank, seconds = rank_data
+            footer = f"\nYour all-time rank: **#{rank}** with **{_hours(seconds)}**"
+        await ctx.send(header + body + footer)
 
 
 async def setup(bot: commands.Bot) -> None:

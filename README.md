@@ -49,19 +49,18 @@ python main.py
 - `!reminder <enable|disable|status|next> [#channel]`
 - `!coach <setup|reset|config>`
 - `!voicehours`
+- `!voicehours last <x> <hour|day|week|month>`
+- `!voicehours me [last <x> <hour|day|week|month>]`
+- `!voicehours user <@member> [last <x> <hour|day|week|month>]`
+- `!voicehours role <@role> [last <x> <hour|day|week|month>]`
+- `!voicehours top [limit] [last <x> <hour|day|week|month>]`
 - `!config <show|keys|set|reset>`
 - `!help [command]`
 
 ## Rating Prediction Commands
 All commands are available as prefix and slash (hybrid command registration).
 
-### Account Linking
-- `!cf-link <handle>`
-- `!cf-unlink`
-- `!cf-linked`
-
 Prediction commands use the existing verification flow (`!verify` + `!confirm`) and verified users in the server.
-`cf-link/cf-unlink` are compatibility helpers that point users to the verify flow.
 
 ### Prediction
 - `!cf-predict <contest_id> [server_only=True] [show_unofficial=False]`

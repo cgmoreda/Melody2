@@ -169,32 +169,6 @@ class CFPredictorCog(commands.Cog, name="CFPredictor"):
         finally:
             self._watch_tasks.pop(key, None)
 
-    @commands.hybrid_command(name="cf-link")
-    @commands.guild_only()
-    async def cf_link(self, ctx: commands.Context, handle: str) -> None:
-        """Use verify flow instead of separate linking for predictions."""
-        await ctx.send(
-            "Predictions use verified handles from `!verify`.\n"
-            "Run `!verify <handle>` then `!confirm`."
-        )
-
-    @commands.hybrid_command(name="cf-unlink")
-    @commands.guild_only()
-    async def cf_unlink(self, ctx: commands.Context) -> None:
-        """Link management is handled by verification commands."""
-        await ctx.send("Use `!verify` to set or update your handle for predictions.")
-
-    @commands.hybrid_command(name="cf-linked")
-    @commands.guild_only()
-    async def cf_linked(self, ctx: commands.Context) -> None:
-        """Show your verified handle used by prediction commands."""
-        assert ctx.guild is not None
-        verified = await self._repo.get_by_discord_id(ctx.author.id, ctx.guild.id)
-        if verified is None:
-            await ctx.send("You are not verified in this server. Use `!verify <handle>` first.")
-            return
-        await ctx.send(f"Your verified handle is **{verified.cf_handle}**.")
-
     @commands.hybrid_command(name="cf-predict")
     @commands.guild_only()
     async def cf_predict(

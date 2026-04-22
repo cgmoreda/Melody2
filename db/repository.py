@@ -140,6 +140,17 @@ class UserRepositoryBase(abc.ABC):
         """Return total solo-channel voice time in seconds per user."""
 
     @abc.abstractmethod
+    async def get_solo_voice_summary(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        week_since: datetime,
+        month_since: datetime,
+    ) -> dict[int, dict[str, float]]:
+        """Return per-user solo totals for week, month, and all time in one query."""
+
+    @abc.abstractmethod
     async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
         """Return persisted command config for a guild if one exists."""
 
@@ -568,6 +579,73 @@ class UserRepository(UserRepositoryBase):
                     now,
                 )
         return {row["discord_id"]: float(row["seconds"]) for row in rows}
+
+    async def get_solo_voice_summary(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        week_since: datetime,
+        month_since: datetime,
+    ) -> dict[int, dict[str, float]]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    discord_id,
+                    SUM(
+                        EXTRACT(
+                            EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
+                        )
+                    ) AS all_time_seconds,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(ended_at, $2) > $3 THEN
+                                EXTRACT(
+                                    EPOCH FROM (
+                                        LEAST(COALESCE(ended_at, $2), $2) - GREATEST(started_at, $3)
+                                    )
+                                )
+                            ELSE 0
+                        END
+                    ) AS week_seconds,
+                    SUM(
+                        CASE
+                            WHEN COALESCE(ended_at, $2) > $4 THEN
+                                EXTRACT(
+                                    EPOCH FROM (
+                                        LEAST(COALESCE(ended_at, $2), $2) - GREATEST(started_at, $4)
+                                    )
+                                )
+                            ELSE 0
+                        END
+                    ) AS month_seconds
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND is_solo = TRUE
+                  AND started_at < $2
+                GROUP BY discord_id
+                HAVING SUM(
+                           EXTRACT(
+                               EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
+                           )
+                       ) > 0
+                """,
+                guild_id,
+                now,
+                week_since,
+                month_since,
+            )
+
+        summary: dict[int, dict[str, float]] = {}
+        for row in rows:
+            summary[row["discord_id"]] = {
+                "week": float(row["week_seconds"] or 0.0),
+                "month": float(row["month_seconds"] or 0.0),
+                "all_time": float(row["all_time_seconds"] or 0.0),
+            }
+        return summary
 
     async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
         assert self._pool is not None, "Call init() first"
