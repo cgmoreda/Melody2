@@ -9,7 +9,7 @@ from typing import Awaitable, Callable, Optional
 import discord
 from discord.ext import commands
 
-from db.repository import GymProblemTag, UserRepositoryBase, VerifiedUser
+from db.repository import UserRepositoryBase, VerifiedUser
 from services.cf_client import CFSubmission, CodeforcesClientBase
 from services.guild_config import GuildConfigService
 
@@ -48,6 +48,10 @@ def _normalize_problem_index(raw: str) -> str:
 
 def _normalize_tag(raw: str) -> str:
     return " ".join(raw.strip().lower().split())
+
+
+def _problem_ref(contest_id: int, problem_index: str) -> str:
+    return f"{contest_id}/{_normalize_problem_index(problem_index)}"
 
 
 def _weight_for_rating(rating: int) -> float:
@@ -159,6 +163,30 @@ class RateProblemModal(discord.ui.Modal):
             await interaction.response.send_message("Problem index cannot be empty.", ephemeral=True)
             return
         await self._callback(interaction, contest_id, problem_index, rating)
+
+
+class RateGymQualityModal(discord.ui.Modal):
+    contest_id = discord.ui.TextInput(label="Contest ID", placeholder="e.g. 2062", required=True, max_length=16)
+    quality = discord.ui.TextInput(label="Quality (1-5)", placeholder="e.g. 4", required=True, max_length=2)
+
+    def __init__(
+        self,
+        callback: Callable[[discord.Interaction, int, int], Awaitable[None]],
+    ) -> None:
+        super().__init__(title="Rate Gym Quality")
+        self._callback = callback
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            contest_id = int(str(self.contest_id).strip())
+            quality = int(str(self.quality).strip())
+        except ValueError:
+            await interaction.response.send_message("Contest ID and quality must be integers.", ephemeral=True)
+            return
+        if quality < 1 or quality > 5:
+            await interaction.response.send_message("Quality must be from 1 to 5.", ephemeral=True)
+            return
+        await self._callback(interaction, contest_id, quality)
 
 
 class OtherTagModal(discord.ui.Modal):
@@ -299,31 +327,39 @@ class GymMainView(discord.ui.View):
     async def list_gyms(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._cog._show_gyms(interaction, self._guild_id)
 
-    @discord.ui.button(label="Add Tag", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Tag Add", style=discord.ButtonStyle.secondary, row=1)
     async def add_tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestProblemModal("Add Gym Tag", self._cog._open_add_tag))
 
-    @discord.ui.button(label="Delete Tag", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Tag Delete", style=discord.ButtonStyle.secondary, row=1)
     async def delete_tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestProblemModal("Delete Gym Tag", self._cog._open_delete_tag))
 
-    @discord.ui.button(label="Show Tags", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Tag List", style=discord.ButtonStyle.secondary, row=1)
     async def show_tags(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestProblemOptionalModal("Show Gym Tags", self._cog._show_tags))
 
-    @discord.ui.button(label="Rate Problem", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Problem Rate", style=discord.ButtonStyle.primary, row=2)
     async def rate_problem(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(RateProblemModal(self._cog._rate_problem))
 
-    @discord.ui.button(label="Show Problem", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Problem Show", style=discord.ButtonStyle.primary, row=2)
     async def show_problem(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestProblemModal("Show Gym Problem", self._cog._show_problem))
 
-    @discord.ui.button(label="Reset Gym", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="Quality Rate", style=discord.ButtonStyle.primary, row=2)
+    async def rate_gym_quality(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(RateGymQualityModal(self._cog._rate_gym_quality))
+
+    @discord.ui.button(label="Quality Show", style=discord.ButtonStyle.primary, row=2)
+    async def show_gym_quality(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ContestIdModal("Show Gym Quality", self._cog._show_gym_quality))
+
+    @discord.ui.button(label="Gym Reset", style=discord.ButtonStyle.danger, row=3)
     async def reset_gym(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestIdModal("Reset Gym Data", self._cog._reset_gym))
 
-    @discord.ui.button(label="Delete Gym", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="Gym Delete", style=discord.ButtonStyle.danger, row=3)
     async def delete_gym(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ContestIdModal("Delete Gym", self._cog._delete_gym))
 
@@ -360,6 +396,44 @@ class GymCog(commands.Cog, name="Gyms"):
         if current:
             chunks.append("\n".join(current))
         return chunks
+
+    @staticmethod
+    def _sorted_members(members: list[discord.Member]) -> list[discord.Member]:
+        return sorted(members, key=lambda member: member.display_name.casefold())
+
+    @staticmethod
+    def _guild_id_from_interaction(interaction: discord.Interaction) -> Optional[int]:
+        if interaction.guild_id is not None:
+            return interaction.guild_id
+        if interaction.guild is not None:
+            return interaction.guild.id
+        return None
+
+    @staticmethod
+    def _member_from_interaction(interaction: discord.Interaction) -> Optional[discord.Member]:
+        if isinstance(interaction.user, discord.Member):
+            return interaction.user
+        if interaction.guild is None:
+            return None
+        return interaction.guild.get_member(interaction.user.id)
+
+    async def _ensure_gym_exists(
+        self,
+        interaction: discord.Interaction,
+        contest_id: int,
+        *,
+        guild_id: Optional[int] = None,
+        not_found_message: str = "Gym not found. Add it first.",
+    ) -> bool:
+        resolved_guild_id = guild_id if guild_id is not None else self._guild_id_from_interaction(interaction)
+        if resolved_guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return False
+        gym = await self._repo.get_gym_contest(resolved_guild_id, contest_id)
+        if gym is not None:
+            return True
+        await interaction.response.send_message(not_found_message, ephemeral=True)
+        return False
 
     async def _is_coach(self, member: discord.Member, guild_id: int) -> bool:
         coach_substring = await self._config.get_text(guild_id, "coach_role_substring")
@@ -437,7 +511,7 @@ class GymCog(commands.Cog, name="Gyms"):
 
     async def _can_modify_tags(
         self,
-        member: discord.Member,
+        member: discord.abc.User,
         guild_id: int,
         contest_id: int,
         problem_index: str,
@@ -470,7 +544,7 @@ class GymCog(commands.Cog, name="Gyms"):
 
         solved_by_discord: dict[int, int] = {}
         unverified_ids: set[int] = set()
-        pending: list[tuple[int, str]] = []
+        pending: list[tuple[int, str, int]] = []
 
         for member in training_members:
             verified = verified_by_id.get(member.id)
@@ -483,14 +557,16 @@ class GymCog(commands.Cog, name="Gyms"):
                 if age < refresh_age_seconds:
                     solved_by_discord[member.id] = cached.solved_count
                     continue
-            pending.append((member.id, verified.cf_handle))
+            previous_solved_count = cached.solved_count if cached is not None else 0
+            pending.append((member.id, verified.cf_handle, previous_solved_count))
 
-        async def _refresh_one(discord_id: int, handle: str) -> tuple[int, int]:
-            solved_count = await self._solved_count_for_contest(
+        async def _refresh_one(discord_id: int, handle: str, previous_solved_count: int) -> tuple[int, int]:
+            fetched_solved_count = await self._solved_count_for_contest(
                 handle,
                 contest_id,
                 refresh_after_seconds=submission_refresh_seconds,
             )
+            solved_count = max(previous_solved_count, fetched_solved_count)
             await self._repo.upsert_gym_participation_cache(
                 guild_id,
                 contest_id,
@@ -501,7 +577,12 @@ class GymCog(commands.Cog, name="Gyms"):
             return discord_id, solved_count
 
         if pending:
-            refreshed = await asyncio.gather(*[_refresh_one(discord_id, handle) for discord_id, handle in pending])
+            refreshed = await asyncio.gather(
+                *[
+                    _refresh_one(discord_id, handle, previous_solved_count)
+                    for discord_id, handle, previous_solved_count in pending
+                ]
+            )
             for discord_id, solved_count in refreshed:
                 solved_by_discord[discord_id] = solved_count
 
@@ -530,25 +611,93 @@ class GymCog(commands.Cog, name="Gyms"):
             "weighted_avg": weighted_avg,
         }
 
-    @commands.command(name="gym")
+    async def _gym_quality_summary(self, guild_id: int, contest_id: int) -> dict[str, float]:
+        votes = await self._repo.list_gym_quality_votes(guild_id, contest_id)
+        verified = await self._verified_map(guild_id)
+
+        included = []
+        for vote in votes:
+            verifier = verified.get(vote.discord_id)
+            if verifier is None:
+                continue
+            included.append((vote.quality, _weight_for_rating(verifier.rating)))
+
+        if not included:
+            return {"count": 0.0, "avg": 0.0, "weighted_avg": 0.0}
+
+        avg = sum(v for v, _ in included) / len(included)
+        weight_sum = sum(w for _, w in included)
+        weighted_avg = sum(v * w for v, w in included) / weight_sum if weight_sum > 0 else avg
+        return {
+            "count": float(len(included)),
+            "avg": avg,
+            "weighted_avg": weighted_avg,
+        }
+
+    @commands.command(
+        name="gym",
+        brief="Open gym panel for contest management, tags, and ratings.",
+        help=(
+            "Open the interactive gym panel.\n\n"
+            "Coach-only actions:\n"
+            "- Add gym contest (individual/team)\n"
+            "- Reset gym data\n"
+            "- Delete gym contest\n\n"
+            "Verified-user actions:\n"
+            "- Rate problem difficulty\n"
+            "- Rate overall gym quality (1-5)\n\n"
+            "Tag edits require either solving that problem or being Expert+.\n"
+            "If buttons expire, run `!gym` again."
+        ),
+    )
     @commands.guild_only()
     async def gym(self, ctx: commands.Context) -> None:
-        """Open the gym management panel (buttons)."""
+        """Open gym panel for contest management, tags, and ratings."""
         assert ctx.guild is not None
         view = GymMainView(self, ctx.author.id, ctx.guild.id)
-        await ctx.send(
-            "Gym panel:\n"
-            "- Add/List gyms\n"
-            "- Add/Delete/List problem tags\n"
-            "- Rate/show problem ratings\n"
-            "- Reset/Delete gym data",
-            view=view,
+        embed = discord.Embed(
+            title="Gym Control Panel",
+            description=(
+                "Use the buttons below to manage gym contests, tags, and ratings.\n"
+                "If this panel times out, run `!gym` again."
+            ),
+            colour=discord.Colour.blurple(),
         )
+        embed.add_field(
+            name="Coach Actions",
+            value="Add gyms, reset gym data, delete gyms.",
+            inline=False,
+        )
+        embed.add_field(
+            name="Verified User Actions",
+            value=(
+                "Rate problem difficulty and gym quality.\n"
+                "Tag edits require solving the problem or being Expert+."
+            ),
+            inline=False,
+        )
+        await ctx.send(embed=embed, view=view)
 
-    @commands.command(name="gald")
+    @commands.command(
+        name="gald",
+        usage="[contest_id] [teams] [force]",
+        brief="List trainees with zero solved gym problems.",
+        help=(
+            "Check training members who did not solve at least one problem in gyms.\n\n"
+            "Usage: `!gald [contest_id] [teams] [force]`\n"
+            "- `contest_id`: optional; check one contest only.\n"
+            "- `teams`: include team gyms (default is individual gyms only).\n"
+            "- `force`: use 10-minute freshness instead of 1-hour cache.\n\n"
+            "Examples:\n"
+            "- `!gald`\n"
+            "- `!gald 2062`\n"
+            "- `!gald teams`\n"
+            "- `!gald 2062 teams force`"
+        ),
+    )
     @commands.guild_only()
     async def gald(self, ctx: commands.Context, *args: str) -> None:
-        """Check who in Training Arc has not solved at least one gym problem."""
+        """List trainees with zero solved gym problems."""
         assert ctx.guild is not None
 
         contest_id: Optional[int] = None
@@ -597,12 +746,16 @@ class GymCog(commands.Cog, name="Gyms"):
                 force=force,
             )
 
-            not_participated = [
-                member
-                for member in training_members
-                if member.id in verified_by_id and solved_by_discord.get(member.id, 0) <= 0
-            ]
-            unverified_members = [member for member in training_members if member.id in unverified_ids]
+            not_participated = self._sorted_members(
+                [
+                    member
+                    for member in training_members
+                    if member.id in verified_by_id and solved_by_discord.get(member.id, 0) <= 0
+                ]
+            )
+            unverified_members = self._sorted_members(
+                [member for member in training_members if member.id in unverified_ids]
+            )
 
             lines = [
                 f"**GALD - Contest `{gym.contest_id}` ({gym.gym_type})**",
@@ -613,28 +766,32 @@ class GymCog(commands.Cog, name="Gyms"):
                 lines.append("All trainees have solved at least one problem.")
             else:
                 if not_participated:
-                    lines.append("Did not solve any problem yet:")
+                    lines.append(f"Did not solve any problem yet ({len(not_participated)}):")
                     lines.extend(member.mention for member in not_participated)
                     lines.append("")
                 if unverified_members:
-                    lines.append("Unverified trainees (cannot track CF handle):")
+                    lines.append(f"Unverified trainees (cannot track CF handle) ({len(unverified_members)}):")
                     lines.extend(member.mention for member in unverified_members)
 
             for chunk in self._chunk_lines(lines):
                 await ctx.send(chunk)
 
     async def _start_add_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
-        assert interaction.guild is not None
-        if not isinstance(interaction.user, discord.Member):
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        member = self._member_from_interaction(interaction)
+        if member is None:
             await interaction.response.send_message("Could not validate your permissions.", ephemeral=True)
             return
-        if not await self._is_coach(interaction.user, interaction.guild.id):
-            await interaction.response.send_message("Only coach-role users can add gyms.", ephemeral=True)
+        if not await self._is_coach(member, guild_id):
+            await interaction.response.send_message("Only users with a coach role can add gyms.", ephemeral=True)
             return
 
         await interaction.response.send_message(
             f"Choose type for contest `{contest_id}`:",
-            view=GymTypeView(self, interaction.user.id, interaction.guild.id, contest_id),
+            view=GymTypeView(self, interaction.user.id, guild_id, contest_id),
             ephemeral=True,
         )
 
@@ -645,13 +802,16 @@ class GymCog(commands.Cog, name="Gyms"):
         contest_id: int,
         gym_type: str,
     ) -> None:
-        assert isinstance(interaction.user, discord.Member)
-        if not await self._is_coach(interaction.user, guild_id):
-            await interaction.response.send_message("Only coach-role users can add gyms.", ephemeral=True)
+        member = self._member_from_interaction(interaction)
+        if member is None:
+            await interaction.response.send_message("Could not validate your permissions.", ephemeral=True)
+            return
+        if not await self._is_coach(member, guild_id):
+            await interaction.response.send_message("Only users with a coach role can add gyms.", ephemeral=True)
             return
         await self._repo.upsert_gym_contest(guild_id, contest_id, gym_type, interaction.user.id)
         await interaction.response.send_message(
-            f"Gym `{contest_id}` saved as **{gym_type}** (upserted, no duplicates).",
+            f"Gym `{contest_id}` saved as **{gym_type}** (upserted; no duplicates).",
             ephemeral=True,
         )
 
@@ -661,21 +821,28 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.send_message("No gyms configured yet.", ephemeral=True)
             return
 
-        lines = ["contest_id | type | created_by"]
+        lines = [f"Configured gyms: **{len(gyms)}**", ""]
+        guild = interaction.guild
         for gym in gyms:
-            lines.append(f"{gym.contest_id:<10} | {gym.gym_type:<10} | {gym.created_by}")
-        message = "```text\n" + "\n".join(lines[:60]) + "\n```"
-        await interaction.response.send_message(message, ephemeral=True)
+            owner = guild.get_member(gym.created_by) if guild is not None else None
+            owner_text = owner.mention if owner is not None else f"`{gym.created_by}`"
+            created_text = gym.created_at.strftime("%Y-%m-%d")
+            lines.append(f"- `{gym.contest_id}` | `{gym.gym_type}` | by {owner_text} | {created_text}")
+        chunks = self._chunk_lines(lines)
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
 
     async def _open_add_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
-        assert interaction.guild is not None
-        gym = await self._repo.get_gym_contest(interaction.guild.id, contest_id)
-        if gym is None:
-            await interaction.response.send_message("Gym not found. Add it first.", ephemeral=True)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
         await interaction.response.send_message(
-            f"Choose a tag for `{contest_id}{problem_index}`:",
-            view=TagAddView(self, interaction.user.id, interaction.guild.id, contest_id, problem_index),
+            f"Choose a tag for `{_problem_ref(contest_id, problem_index)}`:",
+            view=TagAddView(self, interaction.user.id, guild_id, contest_id, problem_index),
             ephemeral=True,
         )
 
@@ -687,7 +854,8 @@ class GymCog(commands.Cog, name="Gyms"):
         problem_index: str,
         tag: str,
     ) -> None:
-        assert isinstance(interaction.user, discord.Member)
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
         allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
         if not allowed:
             await interaction.response.send_message(reason, ephemeral=True)
@@ -705,28 +873,33 @@ class GymCog(commands.Cog, name="Gyms"):
         )
         if inserted:
             await interaction.response.send_message(
-                f"Added tag `{normalized_tag}` to `{contest_id}{problem_index}`.",
+                f"Added tag `{normalized_tag}` to `{_problem_ref(contest_id, problem_index)}`.",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            f"Tag `{normalized_tag}` already exists for `{contest_id}{problem_index}`.",
+            f"Tag `{normalized_tag}` already exists for `{_problem_ref(contest_id, problem_index)}`.",
             ephemeral=True,
         )
 
     async def _open_delete_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
-        assert interaction.guild is not None
-        tags = await self._repo.list_gym_problem_tags(interaction.guild.id, contest_id)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
+        tags = await self._repo.list_gym_problem_tags(guild_id, contest_id)
         candidates = sorted({row.tag for row in tags if row.problem_index == problem_index})
         if not candidates:
             await interaction.response.send_message("No tags found for that problem.", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"Select tag to remove from `{contest_id}{problem_index}`:",
+            f"Select tag to remove from `{_problem_ref(contest_id, problem_index)}`:",
             view=TagDeleteView(
                 self,
                 interaction.user.id,
-                interaction.guild.id,
+                guild_id,
                 contest_id,
                 problem_index,
                 candidates,
@@ -742,7 +915,8 @@ class GymCog(commands.Cog, name="Gyms"):
         problem_index: str,
         tag: str,
     ) -> None:
-        assert isinstance(interaction.user, discord.Member)
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
         allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
         if not allowed:
             await interaction.response.send_message(reason, ephemeral=True)
@@ -750,15 +924,20 @@ class GymCog(commands.Cog, name="Gyms"):
         removed = await self._repo.remove_gym_problem_tag(guild_id, contest_id, problem_index, tag)
         if removed:
             await interaction.response.send_message(
-                f"Removed tag `{tag}` from `{contest_id}{problem_index}`.",
+                f"Removed tag `{tag}` from `{_problem_ref(contest_id, problem_index)}`.",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message("Tag not found.", ephemeral=True)
 
     async def _show_tags(self, interaction: discord.Interaction, contest_id: int, problem_index: Optional[str]) -> None:
-        assert interaction.guild is not None
-        tags = await self._repo.list_gym_problem_tags(interaction.guild.id, contest_id)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
+        tags = await self._repo.list_gym_problem_tags(guild_id, contest_id)
         if problem_index is not None:
             tags = [row for row in tags if row.problem_index == problem_index]
         if not tags:
@@ -775,32 +954,45 @@ class GymCog(commands.Cog, name="Gyms"):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     async def _rate_problem(self, interaction: discord.Interaction, contest_id: int, problem_index: str, rating: int) -> None:
-        assert interaction.guild is not None
-        verified = await self._repo.get_by_discord_id(interaction.user.id, interaction.guild.id)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
+        if rating < 300 or rating > 5000:
+            await interaction.response.send_message("Estimated rating must be between 300 and 5000.", ephemeral=True)
+            return
+        verified = await self._repo.get_by_discord_id(interaction.user.id, guild_id)
         if verified is None:
             await interaction.response.send_message("You must be verified to rate problems.", ephemeral=True)
             return
 
         await self._repo.upsert_gym_problem_rating_vote(
-            interaction.guild.id,
+            guild_id,
             contest_id,
             problem_index,
             interaction.user.id,
             rating,
         )
-        summary = await self._problem_rating_summary(interaction.guild.id, contest_id, problem_index)
+        summary = await self._problem_rating_summary(guild_id, contest_id, problem_index)
         await interaction.response.send_message(
-            f"Saved vote for `{contest_id}{problem_index}`.\n"
+            f"Saved vote for `{_problem_ref(contest_id, problem_index)}`.\n"
             f"Votes: **{int(summary['count'])}** | Avg: **{summary['avg']:.1f}** | "
             f"Weighted Avg: **{summary['weighted_avg']:.1f}**",
             ephemeral=True,
         )
 
     async def _show_problem(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
-        assert interaction.guild is not None
-        tags = await self._repo.list_gym_problem_tags(interaction.guild.id, contest_id)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
+        tags = await self._repo.list_gym_problem_tags(guild_id, contest_id)
         tags_for_problem = sorted({row.tag for row in tags if row.problem_index == problem_index})
-        summary = await self._problem_rating_summary(interaction.guild.id, contest_id, problem_index)
+        summary = await self._problem_rating_summary(guild_id, contest_id, problem_index)
 
         tags_text = ", ".join(tags_for_problem) if tags_for_problem else "No tags"
         if summary["count"] <= 0:
@@ -812,33 +1004,98 @@ class GymCog(commands.Cog, name="Gyms"):
                 f"Weighted Avg: {summary['weighted_avg']:.1f}"
             )
         await interaction.response.send_message(
-            f"**{contest_id}{problem_index}**\nTags: {tags_text}\nRatings: {rating_text}",
+            f"**{_problem_ref(contest_id, problem_index)}**\nTags: {tags_text}\nRatings: {rating_text}",
+            ephemeral=True,
+        )
+
+    async def _rate_gym_quality(self, interaction: discord.Interaction, contest_id: int, quality: int) -> None:
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if quality < 1 or quality > 5:
+            await interaction.response.send_message("Quality must be from 1 to 5.", ephemeral=True)
+            return
+
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
+            return
+
+        verified = await self._repo.get_by_discord_id(interaction.user.id, guild_id)
+        if verified is None:
+            await interaction.response.send_message("You must be verified to rate gym quality.", ephemeral=True)
+            return
+
+        await self._repo.upsert_gym_quality_vote(
+            guild_id,
+            contest_id,
+            interaction.user.id,
+            quality,
+        )
+        summary = await self._gym_quality_summary(guild_id, contest_id)
+        await interaction.response.send_message(
+            f"Saved quality vote for gym `{contest_id}`.\n"
+            f"Votes: **{int(summary['count'])}** | Avg: **{summary['avg']:.2f}/5** | "
+            f"Weighted Avg: **{summary['weighted_avg']:.2f}/5**",
+            ephemeral=True,
+        )
+
+    async def _show_gym_quality(self, interaction: discord.Interaction, contest_id: int) -> None:
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id, not_found_message="Gym not found."):
+            return
+
+        summary = await self._gym_quality_summary(guild_id, contest_id)
+        if summary["count"] <= 0:
+            await interaction.response.send_message(
+                f"No verified quality votes yet for gym `{contest_id}`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Gym `{contest_id}` quality\n"
+            f"Votes: **{int(summary['count'])}**\n"
+            f"Average: **{summary['avg']:.2f}/5**\n"
+            f"Weighted average: **{summary['weighted_avg']:.2f}/5**",
             ephemeral=True,
         )
 
     async def _reset_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
-        assert interaction.guild is not None
-        assert isinstance(interaction.user, discord.Member)
-        if not await self._is_coach(interaction.user, interaction.guild.id):
-            await interaction.response.send_message("Only coach-role users can reset gyms.", ephemeral=True)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
             return
-        gym = await self._repo.get_gym_contest(interaction.guild.id, contest_id)
-        if gym is None:
-            await interaction.response.send_message("Gym not found.", ephemeral=True)
+        member = self._member_from_interaction(interaction)
+        if member is None:
+            await interaction.response.send_message("Could not validate your permissions.", ephemeral=True)
             return
-        await self._repo.reset_gym_contest_data(interaction.guild.id, contest_id)
+        if not await self._is_coach(member, guild_id):
+            await interaction.response.send_message("Only users with a coach role can reset gyms.", ephemeral=True)
+            return
+        if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id, not_found_message="Gym not found."):
+            return
+        await self._repo.reset_gym_contest_data(guild_id, contest_id)
         await interaction.response.send_message(
-            f"Reset tags, ratings, and cache for gym `{contest_id}`.",
+            f"Reset tags, problem ratings, quality votes, and cache for gym `{contest_id}`.",
             ephemeral=True,
         )
 
     async def _delete_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
-        assert interaction.guild is not None
-        assert isinstance(interaction.user, discord.Member)
-        if not await self._is_coach(interaction.user, interaction.guild.id):
-            await interaction.response.send_message("Only coach-role users can delete gyms.", ephemeral=True)
+        guild_id = self._guild_id_from_interaction(interaction)
+        if guild_id is None:
+            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
             return
-        deleted = await self._repo.delete_gym_contest(interaction.guild.id, contest_id)
+        member = self._member_from_interaction(interaction)
+        if member is None:
+            await interaction.response.send_message("Could not validate your permissions.", ephemeral=True)
+            return
+        if not await self._is_coach(member, guild_id):
+            await interaction.response.send_message("Only users with a coach role can delete gyms.", ephemeral=True)
+            return
+        deleted = await self._repo.delete_gym_contest(guild_id, contest_id)
         if deleted:
             await interaction.response.send_message(f"Deleted gym `{contest_id}`.", ephemeral=True)
             return

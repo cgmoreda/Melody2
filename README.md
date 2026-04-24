@@ -49,18 +49,37 @@ python main.py
 - `!voicehours role <@role> [last <x> <hour|day|week|month>]`
 - `!voicehours roles [last <x> <hour|day|week|month>]` (all roles containing `team`)
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
-- `!gym` (button panel for adding/listing gyms, tags, ratings, reset/delete)
+- `!gym` (opens gym control panel with buttons)
 - `!gald [contest_id] [teams] [force]`
   - default checks all `individual` gyms
   - `teams` includes team gyms
   - `force` refreshes stale participation newer than 10m instead of 1h cache
 - `!config <show|keys|set|reset|text>`
 - `!config text <show|keys|set|reset>`
+- `!help [command]`
 
 Text config keys:
 - `training_role_substring` (default: `training arc`)
 - `coach_role_substring` (default: `coach`)
-- `!help [command]`
+
+## Gym Panel
+Run `!gym` to open the panel. Current buttons:
+
+- `Add Gym` / `List Gyms`
+- `Tag Add` / `Tag Delete` / `Tag List`
+- `Problem Rate` / `Problem Show`
+- `Quality Rate` / `Quality Show`
+- `Gym Reset` / `Gym Delete`
+
+Rules:
+- Coach-role users (substring match from `coach_role_substring`) can add/reset/delete gyms.
+- Verified users can rate problem difficulty and gym quality.
+- Tag edits are allowed for users who solved that problem or have rating `>= 1600`.
+- Duplicate gym add is handled as upsert (no duplicate rows).
+- GALD uses caching (1h default, 10m when using `force`).
+
+Weighted ratings:
+- Problem rating and gym quality use weighted averaging by verifier Codeforces rating tier.
 
 ## Database Schema Integration
 The bot uses raw SQL initialization in `UserRepository.init()`.
@@ -69,7 +88,7 @@ No separate migration framework is currently used in this repo.
 ## Tests
 Run:
 ```bash
-pytest
+python -m pytest
 ```
 
-Automated tests were removed with the `cf-predict` feature cleanup. Add/update tests as new features are introduced.
+Current tests include core gym quality rating weighting behavior.

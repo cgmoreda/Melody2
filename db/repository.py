@@ -74,6 +74,16 @@ class GymProblemRatingVote:
 
 
 @dataclass(slots=True)
+class GymQualityVote:
+    guild_id: int
+    contest_id: int
+    discord_id: int
+    quality: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
 class GymParticipationCache:
     guild_id: int
     contest_id: int
@@ -236,6 +246,20 @@ class UserRepositoryBase(abc.ABC):
         """List all rating votes for one gym problem."""
 
     @abc.abstractmethod
+    async def upsert_gym_quality_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        quality: int,
+    ) -> None:
+        """Create or update one user's quality vote for a gym contest."""
+
+    @abc.abstractmethod
+    async def list_gym_quality_votes(self, guild_id: int, contest_id: int) -> list[GymQualityVote]:
+        """List all quality votes for one gym contest."""
+
+    @abc.abstractmethod
     async def delete_gym_contest(self, guild_id: int, contest_id: int) -> bool:
         """Delete a gym contest and all related data."""
 
@@ -386,6 +410,19 @@ class UserRepository(UserRepositoryBase):
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (guild_id, contest_id, problem_index, discord_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gym_quality_ratings (
+                    guild_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    quality INTEGER NOT NULL CHECK (quality BETWEEN 1 AND 5),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, contest_id, discord_id)
                 )
                 """
             )
@@ -1021,6 +1058,57 @@ class UserRepository(UserRepositoryBase):
             for row in rows
         ]
 
+    async def upsert_gym_quality_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        quality: int,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO gym_quality_ratings (
+                    guild_id, contest_id, discord_id, quality
+                )
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (guild_id, contest_id, discord_id)
+                DO UPDATE SET quality = EXCLUDED.quality,
+                              updated_at = NOW()
+                """,
+                guild_id,
+                contest_id,
+                discord_id,
+                quality,
+            )
+
+    async def list_gym_quality_votes(self, guild_id: int, contest_id: int) -> list[GymQualityVote]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, contest_id, discord_id, quality, created_at, updated_at
+                FROM gym_quality_ratings
+                WHERE guild_id = $1
+                  AND contest_id = $2
+                ORDER BY updated_at DESC
+                """,
+                guild_id,
+                contest_id,
+            )
+        return [
+            GymQualityVote(
+                guild_id=row["guild_id"],
+                contest_id=row["contest_id"],
+                discord_id=row["discord_id"],
+                quality=row["quality"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
     async def delete_gym_contest(self, guild_id: int, contest_id: int) -> bool:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
@@ -1036,6 +1124,14 @@ class UserRepository(UserRepositoryBase):
                 await conn.execute(
                     """
                     DELETE FROM gym_problem_ratings
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_quality_ratings
                     WHERE guild_id = $1 AND contest_id = $2
                     """,
                     guild_id,
@@ -1074,6 +1170,14 @@ class UserRepository(UserRepositoryBase):
                 await conn.execute(
                     """
                     DELETE FROM gym_problem_ratings
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_quality_ratings
                     WHERE guild_id = $1 AND contest_id = $2
                     """,
                     guild_id,
