@@ -462,19 +462,32 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                training_arc_role = next(
-                    (role for role in ctx.guild.roles if role.name.lower() == "training arc"),
-                    None,
-                )
-                if training_arc_role is None:
-                    await ctx.send("Role `Training Arc` was not found in this server.")
+                training_substring = await self._config.get_text(ctx.guild.id, "training_role_substring")
+                matching_roles = [
+                    role for role in ctx.guild.roles
+                    if training_substring.lower().strip() in role.name.lower()
+                    and role.name != "@everyone"
+                ]
+                if not matching_roles:
+                    await ctx.send(
+                        f"No role found matching training substring `{training_substring}`.\n"
+                        "Use `!config text set training_role_substring <value>` to adjust it."
+                    )
                     return
 
                 totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
                 threshold_seconds = minimum_hours * 3600.0
-                members = [member for member in training_arc_role.members if not member.bot]
+                members_by_id: dict[int, discord.Member] = {}
+                for role in matching_roles:
+                    for member in role.members:
+                        if member.bot:
+                            continue
+                        members_by_id[member.id] = member
+                members = list(members_by_id.values())
                 if not members:
-                    await ctx.send("No non-bot members found in role `Training Arc`.")
+                    await ctx.send(
+                        f"No non-bot members found in roles matching `{training_substring}`."
+                    )
                     return
 
                 below: list[tuple[discord.Member, float]] = []
@@ -485,14 +498,16 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 if not below:
                     await ctx.send(
-                        f"Everyone in `Training Arc` met the target: **{minimum_hours:.2f}h** in {label}."
+                        f"Everyone in `{training_substring}` roles met the target: "
+                        f"**{minimum_hours:.2f}h** in {label}."
                     )
                     return
 
                 below.sort(key=lambda item: item[1])
                 lines = [
                     f"**Tahzeeq Report ({label})**",
-                    f"Target: **{minimum_hours:.2f}h** | Role: {training_arc_role.mention}",
+                    f"Target: **{minimum_hours:.2f}h** | "
+                    f"Training substring: `{training_substring}` | Matching roles: {len(matching_roles)}",
                     "",
                 ]
                 for member, worked in below:

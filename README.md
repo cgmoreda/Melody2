@@ -43,13 +43,23 @@ python main.py
 - `!coach <setup|reset|config>`
 - `!voicehours`
 - `!voicehours last <x> <hour|day|week|month>`
-- `!voicehours tahzeeq <x> [last <x> <hour|day|week|month>]` (mentions `Training Arc` members below target)
+- `!voicehours tahzeeq <x> [last <x> <hour|day|week|month>]` (mentions trainees below target)
 - `!voicehours me [last <x> <hour|day|week|month>]`
 - `!voicehours user <@member> [last <x> <hour|day|week|month>]`
 - `!voicehours role <@role> [last <x> <hour|day|week|month>]`
 - `!voicehours roles [last <x> <hour|day|week|month>]` (all roles containing `team`)
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
-- `!config <show|keys|set|reset>`
+- `!gym` (button panel for adding/listing gyms, tags, ratings, reset/delete)
+- `!gald [contest_id] [teams] [force]`
+  - default checks all `individual` gyms
+  - `teams` includes team gyms
+  - `force` refreshes stale participation newer than 10m instead of 1h cache
+- `!config <show|keys|set|reset|text>`
+- `!config text <show|keys|set|reset>`
+
+Text config keys:
+- `training_role_substring` (default: `training arc`)
+- `coach_role_substring` (default: `coach`)
 - `!help [command]`
 
 ## Database Schema Integration

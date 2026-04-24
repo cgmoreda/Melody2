@@ -3,7 +3,7 @@ from __future__ import annotations
 import discord
 from discord.ext import commands
 
-from services.guild_config import CONFIG_SPECS, GuildConfigService
+from services.guild_config import CONFIG_SPECS, TEXT_CONFIG_SPECS, GuildConfigService
 
 
 class ConfigCog(commands.Cog, name="Config"):
@@ -14,7 +14,7 @@ class ConfigCog(commands.Cog, name="Config"):
     @commands.guild_only()
     async def config(self, ctx: commands.Context) -> None:
         """Show or modify per-server bot configuration keys."""
-        await ctx.send("Usage: **!config <show|keys|set|reset>**")
+        await ctx.send("Usage: **!config <show|keys|set|reset|text>**")
 
     @config.command(name="show")
     @commands.guild_only()
@@ -33,6 +33,9 @@ class ConfigCog(commands.Cog, name="Config"):
         embed.add_field(name="voicehours_max_lines", value=str(cfg.voicehours_max_lines), inline=True)
         embed.add_field(name="voice_check_interval_seconds", value=str(cfg.voice_check_interval_seconds), inline=True)
         embed.add_field(name="voice_confirm_timeout_seconds", value=str(cfg.voice_confirm_timeout_seconds), inline=True)
+        text_cfg = await self._config.get_text_all(ctx.guild.id)
+        embed.add_field(name="training_role_substring", value=text_cfg["training_role_substring"], inline=False)
+        embed.add_field(name="coach_role_substring", value=text_cfg["coach_role_substring"], inline=False)
         await ctx.send(embed=embed)
 
     @config.command(name="keys")
@@ -42,6 +45,10 @@ class ConfigCog(commands.Cog, name="Config"):
         lines: list[str] = []
         for key, (_, minimum, maximum, description) in CONFIG_SPECS.items():
             lines.append(f"`{key}` [{minimum}..{maximum}] - {description}")
+        lines.append("")
+        lines.append("Text keys:")
+        for key, (_, description) in TEXT_CONFIG_SPECS.items():
+            lines.append(f"`{key}` - {description}")
         await ctx.send("\n".join(lines))
 
     @config.command(name="set")
@@ -82,6 +89,61 @@ class ConfigCog(commands.Cog, name="Config"):
         updated_value = getattr(cfg, normalized_key)
         await ctx.send(f"Reset `{normalized_key}` to default (`{updated_value}`).")
 
+    @config.group(name="text", invoke_without_command=True)
+    @commands.guild_only()
+    async def config_text(self, ctx: commands.Context) -> None:
+        """Show or modify text config keys."""
+        await ctx.send("Usage: **!config text <show|keys|set|reset>**")
+
+    @config_text.command(name="show")
+    @commands.guild_only()
+    async def config_text_show(self, ctx: commands.Context) -> None:
+        """Display text config values for this server."""
+        assert ctx.guild is not None
+        values = await self._config.get_text_all(ctx.guild.id)
+        lines = [f"`{key}` = `{value}`" for key, value in values.items()]
+        await ctx.send("\n".join(lines))
+
+    @config_text.command(name="keys")
+    @commands.guild_only()
+    async def config_text_keys(self, ctx: commands.Context) -> None:
+        """List configurable text keys."""
+        lines = [f"`{key}` - {description}" for key, (_, description) in TEXT_CONFIG_SPECS.items()]
+        await ctx.send("\n".join(lines))
+
+    @config_text.command(name="set")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def config_text_set(self, ctx: commands.Context, key: str, *, value: str) -> None:
+        """Set one text config key."""
+        assert ctx.guild is not None
+        try:
+            updated = await self._config.set_text(ctx.guild.id, key.lower(), value)
+        except ValueError as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(f"Set `{key.lower()}` to `{updated}`.")
+
+    @config_text.command(name="reset")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def config_text_reset(self, ctx: commands.Context, key: str = "all") -> None:
+        """Reset one text key, or all text keys, to defaults."""
+        assert ctx.guild is not None
+        normalized = key.lower()
+        if normalized == "all":
+            values = await self._config.reset_text_all(ctx.guild.id)
+            lines = [f"`{k}` = `{v}`" for k, v in values.items()]
+            await ctx.send("Reset all text config keys.\n" + "\n".join(lines))
+            return
+
+        try:
+            reset_value = await self._config.reset_text(ctx.guild.id, normalized)
+        except ValueError as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(f"Reset `{normalized}` to default (`{reset_value}`).")
+
     @config_set.error
     async def config_set_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingPermissions):
@@ -99,6 +161,23 @@ class ConfigCog(commands.Cog, name="Config"):
     async def config_reset_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You need the **Manage Server** permission to reset config values.")
+            return
+        raise error
+
+    @config_text_set.error
+    async def config_text_set_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need the **Manage Server** permission to change text config values.")
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: **!config text set <key> <value>**")
+            return
+        raise error
+
+    @config_text_reset.error
+    async def config_text_reset_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need the **Manage Server** permission to reset text config values.")
             return
         raise error
 

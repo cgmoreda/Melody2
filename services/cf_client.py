@@ -48,6 +48,8 @@ class CFSubmission:
     verdict: Optional[str]
     tags: tuple[str, ...]
     problem_key: Optional[str]
+    contest_id: Optional[int]
+    problem_index: Optional[str]
 
 
 class CodeforcesClientBase(abc.ABC):
@@ -229,7 +231,7 @@ class CodeforcesClient(CodeforcesClientBase):
         return result
 
     async def get_recent_submissions(self, handle: str, count: int = 500) -> list[CFSubmission]:
-        safe_count = max(1, min(count, 1000))
+        safe_count = max(1, min(count, 5000))
         data = await self._get("user.status", {"handle": handle, "from": 1, "count": safe_count})
         if data is None:
             return []
@@ -258,6 +260,8 @@ class CodeforcesClient(CodeforcesClientBase):
                     verdict=verdict if isinstance(verdict, str) else None,
                     tags=tags,
                     problem_key=problem_key,
+                    contest_id=contest_id if isinstance(contest_id, int) else None,
+                    problem_index=index if isinstance(index, str) else None,
                 )
             )
         return submissions

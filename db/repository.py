@@ -43,6 +43,45 @@ class GuildCommandConfig:
     voice_confirm_timeout_seconds: int
 
 
+@dataclass(slots=True)
+class GymContest:
+    guild_id: int
+    contest_id: int
+    gym_type: str
+    created_by: int
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class GymProblemTag:
+    guild_id: int
+    contest_id: int
+    problem_index: str
+    tag: str
+    created_by: int
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class GymProblemRatingVote:
+    guild_id: int
+    contest_id: int
+    problem_index: str
+    discord_id: int
+    estimated_rating: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class GymParticipationCache:
+    guild_id: int
+    contest_id: int
+    discord_id: int
+    solved_count: int
+    checked_at: datetime
+
+
 class UserRepositoryBase(abc.ABC):
     """Abstraction over persistent user storage."""
 
@@ -139,6 +178,106 @@ class UserRepositoryBase(abc.ABC):
     async def delete_guild_command_config(self, guild_id: int) -> bool:
         """Delete command config for a guild. Returns True if a row was deleted."""
 
+    @abc.abstractmethod
+    async def upsert_gym_contest(self, guild_id: int, contest_id: int, gym_type: str, created_by: int) -> None:
+        """Create or update a gym contest in a guild."""
+
+    @abc.abstractmethod
+    async def get_gym_contest(self, guild_id: int, contest_id: int) -> Optional[GymContest]:
+        """Get one gym contest row."""
+
+    @abc.abstractmethod
+    async def list_gym_contests(self, guild_id: int) -> list[GymContest]:
+        """List all gym contests in a guild."""
+
+    @abc.abstractmethod
+    async def add_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+        created_by: int,
+    ) -> bool:
+        """Add one tag to a gym problem. Returns True when inserted."""
+
+    @abc.abstractmethod
+    async def remove_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+    ) -> bool:
+        """Remove one tag from a gym problem. Returns True when removed."""
+
+    @abc.abstractmethod
+    async def list_gym_problem_tags(self, guild_id: int, contest_id: int) -> list[GymProblemTag]:
+        """List tags for all problems in a gym contest."""
+
+    @abc.abstractmethod
+    async def upsert_gym_problem_rating_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        discord_id: int,
+        estimated_rating: int,
+    ) -> None:
+        """Create or update one user's estimated rating for a gym problem."""
+
+    @abc.abstractmethod
+    async def list_gym_problem_rating_votes(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+    ) -> list[GymProblemRatingVote]:
+        """List all rating votes for one gym problem."""
+
+    @abc.abstractmethod
+    async def delete_gym_contest(self, guild_id: int, contest_id: int) -> bool:
+        """Delete a gym contest and all related data."""
+
+    @abc.abstractmethod
+    async def reset_gym_contest_data(self, guild_id: int, contest_id: int) -> None:
+        """Reset tags, ratings, and participation cache for one gym contest."""
+
+    @abc.abstractmethod
+    async def get_gym_participation_cache(self, guild_id: int, contest_id: int) -> list[GymParticipationCache]:
+        """Return cached participation rows for one gym contest."""
+
+    @abc.abstractmethod
+    async def upsert_gym_participation_cache(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        solved_count: int,
+        checked_at: datetime,
+    ) -> None:
+        """Create or update one participation cache row."""
+
+    @abc.abstractmethod
+    async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:
+        """Clear participation cache for one gym contest."""
+
+    @abc.abstractmethod
+    async def get_guild_text_config(self, guild_id: int, key: str) -> Optional[str]:
+        """Return one string setting value for a guild."""
+
+    @abc.abstractmethod
+    async def list_guild_text_configs(self, guild_id: int) -> dict[str, str]:
+        """List all string settings for a guild."""
+
+    @abc.abstractmethod
+    async def upsert_guild_text_config(self, guild_id: int, key: str, value: str) -> None:
+        """Create or update one string setting."""
+
+    @abc.abstractmethod
+    async def delete_guild_text_config(self, guild_id: int, key: str) -> bool:
+        """Delete one string setting. Returns True if it existed."""
+
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
@@ -208,6 +347,67 @@ class UserRepository(UserRepositoryBase):
                     voicehours_max_lines INTEGER NOT NULL DEFAULT 35 CHECK (voicehours_max_lines BETWEEN 5 AND 100),
                     voice_check_interval_seconds INTEGER NOT NULL DEFAULT 900 CHECK (voice_check_interval_seconds BETWEEN 60 AND 7200),
                     voice_confirm_timeout_seconds INTEGER NOT NULL DEFAULT 180 CHECK (voice_confirm_timeout_seconds BETWEEN 60 AND 900)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gym_contests (
+                    guild_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    gym_type TEXT NOT NULL CHECK (gym_type IN ('individual', 'team')),
+                    created_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, contest_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gym_problem_tags (
+                    guild_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    problem_index TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, contest_id, problem_index, tag)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gym_problem_ratings (
+                    guild_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    problem_index TEXT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    estimated_rating INTEGER NOT NULL CHECK (estimated_rating BETWEEN 300 AND 5000),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, contest_id, problem_index, discord_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gym_participation_cache (
+                    guild_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    solved_count INTEGER NOT NULL DEFAULT 0,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (guild_id, contest_id, discord_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_text_config (
+                    guild_id BIGINT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, key)
                 )
                 """
             )
@@ -622,5 +822,387 @@ class UserRepository(UserRepositoryBase):
                 WHERE guild_id = $1
                 """,
                 guild_id,
+            )
+        return result.endswith("1")
+
+    async def upsert_gym_contest(self, guild_id: int, contest_id: int, gym_type: str, created_by: int) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO gym_contests (guild_id, contest_id, gym_type, created_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (guild_id, contest_id)
+                DO UPDATE SET gym_type = EXCLUDED.gym_type,
+                              created_by = EXCLUDED.created_by
+                """,
+                guild_id,
+                contest_id,
+                gym_type,
+                created_by,
+            )
+
+    async def get_gym_contest(self, guild_id: int, contest_id: int) -> Optional[GymContest]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id, contest_id, gym_type, created_by, created_at
+                FROM gym_contests
+                WHERE guild_id = $1 AND contest_id = $2
+                """,
+                guild_id,
+                contest_id,
+            )
+        if row is None:
+            return None
+        return GymContest(
+            guild_id=row["guild_id"],
+            contest_id=row["contest_id"],
+            gym_type=row["gym_type"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+        )
+
+    async def list_gym_contests(self, guild_id: int) -> list[GymContest]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, contest_id, gym_type, created_by, created_at
+                FROM gym_contests
+                WHERE guild_id = $1
+                ORDER BY contest_id DESC
+                """,
+                guild_id,
+            )
+        return [
+            GymContest(
+                guild_id=row["guild_id"],
+                contest_id=row["contest_id"],
+                gym_type=row["gym_type"],
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def add_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+        created_by: int,
+    ) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO gym_problem_tags (guild_id, contest_id, problem_index, tag, created_by)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id, contest_id, problem_index, tag) DO NOTHING
+                """,
+                guild_id,
+                contest_id,
+                problem_index,
+                tag,
+                created_by,
+            )
+        return result.endswith("1")
+
+    async def remove_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+    ) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM gym_problem_tags
+                WHERE guild_id = $1
+                  AND contest_id = $2
+                  AND problem_index = $3
+                  AND tag = $4
+                """,
+                guild_id,
+                contest_id,
+                problem_index,
+                tag,
+            )
+        return result.endswith("1")
+
+    async def list_gym_problem_tags(self, guild_id: int, contest_id: int) -> list[GymProblemTag]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, contest_id, problem_index, tag, created_by, created_at
+                FROM gym_problem_tags
+                WHERE guild_id = $1 AND contest_id = $2
+                ORDER BY problem_index, tag
+                """,
+                guild_id,
+                contest_id,
+            )
+        return [
+            GymProblemTag(
+                guild_id=row["guild_id"],
+                contest_id=row["contest_id"],
+                problem_index=row["problem_index"],
+                tag=row["tag"],
+                created_by=row["created_by"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def upsert_gym_problem_rating_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        discord_id: int,
+        estimated_rating: int,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO gym_problem_ratings (
+                    guild_id, contest_id, problem_index, discord_id, estimated_rating
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id, contest_id, problem_index, discord_id)
+                DO UPDATE SET estimated_rating = EXCLUDED.estimated_rating,
+                              updated_at = NOW()
+                """,
+                guild_id,
+                contest_id,
+                problem_index,
+                discord_id,
+                estimated_rating,
+            )
+
+    async def list_gym_problem_rating_votes(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+    ) -> list[GymProblemRatingVote]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, contest_id, problem_index, discord_id, estimated_rating, created_at, updated_at
+                FROM gym_problem_ratings
+                WHERE guild_id = $1
+                  AND contest_id = $2
+                  AND problem_index = $3
+                ORDER BY updated_at DESC
+                """,
+                guild_id,
+                contest_id,
+                problem_index,
+            )
+        return [
+            GymProblemRatingVote(
+                guild_id=row["guild_id"],
+                contest_id=row["contest_id"],
+                problem_index=row["problem_index"],
+                discord_id=row["discord_id"],
+                estimated_rating=row["estimated_rating"],
+                created_at=row["created_at"],
+                updated_at=row["updated_at"],
+            )
+            for row in rows
+        ]
+
+    async def delete_gym_contest(self, guild_id: int, contest_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM gym_problem_tags
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_problem_ratings
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_participation_cache
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                result = await conn.execute(
+                    """
+                    DELETE FROM gym_contests
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+        return result.endswith("1")
+
+    async def reset_gym_contest_data(self, guild_id: int, contest_id: int) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM gym_problem_tags
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_problem_ratings
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+                await conn.execute(
+                    """
+                    DELETE FROM gym_participation_cache
+                    WHERE guild_id = $1 AND contest_id = $2
+                    """,
+                    guild_id,
+                    contest_id,
+                )
+
+    async def get_gym_participation_cache(self, guild_id: int, contest_id: int) -> list[GymParticipationCache]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id, contest_id, discord_id, solved_count, checked_at
+                FROM gym_participation_cache
+                WHERE guild_id = $1 AND contest_id = $2
+                """,
+                guild_id,
+                contest_id,
+            )
+        return [
+            GymParticipationCache(
+                guild_id=row["guild_id"],
+                contest_id=row["contest_id"],
+                discord_id=row["discord_id"],
+                solved_count=row["solved_count"],
+                checked_at=row["checked_at"],
+            )
+            for row in rows
+        ]
+
+    async def upsert_gym_participation_cache(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        solved_count: int,
+        checked_at: datetime,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO gym_participation_cache (
+                    guild_id, contest_id, discord_id, solved_count, checked_at
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id, contest_id, discord_id)
+                DO UPDATE SET solved_count = EXCLUDED.solved_count,
+                              checked_at = EXCLUDED.checked_at
+                """,
+                guild_id,
+                contest_id,
+                discord_id,
+                solved_count,
+                checked_at,
+            )
+
+    async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM gym_participation_cache
+                WHERE guild_id = $1 AND contest_id = $2
+                """,
+                guild_id,
+                contest_id,
+            )
+
+    async def get_guild_text_config(self, guild_id: int, key: str) -> Optional[str]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT value
+                FROM guild_text_config
+                WHERE guild_id = $1 AND key = $2
+                """,
+                guild_id,
+                key,
+            )
+        if row is None:
+            return None
+        return row["value"]
+
+    async def list_guild_text_configs(self, guild_id: int) -> dict[str, str]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT key, value
+                FROM guild_text_config
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        return {str(row["key"]): str(row["value"]) for row in rows}
+
+    async def upsert_guild_text_config(self, guild_id: int, key: str, value: str) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO guild_text_config (guild_id, key, value)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, key)
+                DO UPDATE SET value = EXCLUDED.value
+                """,
+                guild_id,
+                key,
+                value,
+            )
+
+    async def delete_guild_text_config(self, guild_id: int, key: str) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM guild_text_config
+                WHERE guild_id = $1 AND key = $2
+                """,
+                guild_id,
+                key,
             )
         return result.endswith("1")
