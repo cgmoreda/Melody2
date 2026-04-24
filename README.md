@@ -43,6 +43,7 @@ python main.py
 - `!coach <setup|reset|config>`
 - `!voicehours`
 - `!voicehours last <x> <hour|day|week|month>`
+- `!voicehours tahzeeq <x> [last <x> <hour|day|week|month>]` (mentions `Training Arc` members below target)
 - `!voicehours me [last <x> <hour|day|week|month>]`
 - `!voicehours user <@member> [last <x> <hour|day|week|month>]`
 - `!voicehours role <@role> [last <x> <hour|day|week|month>]`

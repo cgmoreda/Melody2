@@ -238,6 +238,24 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return "\n".join(parts)
 
     @staticmethod
+    def _chunk_text(text: str, max_len: int = 1900) -> list[str]:
+        chunks: list[str] = []
+        current: list[str] = []
+        size = 0
+        for line in text.splitlines():
+            addition = len(line) + (1 if current else 0)
+            if current and size + addition > max_len:
+                chunks.append("\n".join(current))
+                current = [line]
+                size = len(line)
+            else:
+                current.append(line)
+                size += addition
+        if current:
+            chunks.append("\n".join(current))
+        return chunks
+
+    @staticmethod
     def _find_rank(totals: dict[int, float], discord_id: int) -> Optional[tuple[int, float]]:
         if discord_id not in totals:
             return None
@@ -329,6 +347,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         Usage:
         - `!voicehours`
         - `!voicehours last <x> <hour/day/week/month>`
+        - `!voicehours tahzeeq <x> [last <x> <hour/day/week/month>]`
         - `!voicehours me [last <x> <hour/day/week/month>]`
         - `!voicehours user <@member> [last <x> <hour/day/week/month>]`
         - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
@@ -374,6 +393,69 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     rank, seconds = rank_data
                     content = f"{content}\nYour rank: **#{rank}** with **{_hours(seconds)}**"
                 await ctx.send(content)
+                return
+
+            if mode == "tahzeeq":
+                if len(args) < 2:
+                    await ctx.send("Usage: `!voicehours tahzeeq <x> [last <x> <hour/day/week/month>]`")
+                    return
+                try:
+                    minimum_hours = float(args[1])
+                except ValueError:
+                    await ctx.send("`x` must be a number (hours).")
+                    return
+                if minimum_hours <= 0:
+                    await ctx.send("`x` must be greater than 0.")
+                    return
+
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                training_arc_role = next(
+                    (role for role in ctx.guild.roles if role.name.lower() == "training arc"),
+                    None,
+                )
+                if training_arc_role is None:
+                    await ctx.send("Role `Training Arc` was not found in this server.")
+                    return
+
+                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                threshold_seconds = minimum_hours * 3600.0
+                members = [member for member in training_arc_role.members if not member.bot]
+                if not members:
+                    await ctx.send("No non-bot members found in role `Training Arc`.")
+                    return
+
+                below: list[tuple[discord.Member, float]] = []
+                for member in members:
+                    worked = totals.get(member.id, 0.0)
+                    if worked < threshold_seconds:
+                        below.append((member, worked))
+
+                if not below:
+                    await ctx.send(
+                        f"Everyone in `Training Arc` met the target: **{minimum_hours:.2f}h** in {label}."
+                    )
+                    return
+
+                below.sort(key=lambda item: item[1])
+                lines = [
+                    f"**Tahzeeq Report ({label})**",
+                    f"Target: **{minimum_hours:.2f}h** | Role: {training_arc_role.mention}",
+                    "",
+                ]
+                for member, worked in below:
+                    deficit = max(0.0, minimum_hours - (worked / 3600.0))
+                    lines.append(
+                        f"{member.mention} - worked {_hours(worked)} (short by {deficit:.2f}h). "
+                        "Get back to work."
+                    )
+
+                for chunk in self._chunk_text("\n".join(lines)):
+                    await ctx.send(chunk)
                 return
 
             if mode == "me":
@@ -511,7 +593,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             await ctx.send(
                 "Unknown mode.\n"
-                "Use one of: `last`, `me`, `user`, `role`, `roles`, `top`.\n"
+                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `top`.\n"
                 "Example: `!voicehours top 20 last 2 weeks`"
             )
             return
