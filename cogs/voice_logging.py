@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import UTC, datetime, timedelta
 from typing import Optional
 
@@ -57,6 +58,30 @@ def _window_delta(amount: int, unit: str) -> timedelta:
 
 def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
     return channel is not None and "solo" in channel.name.lower()
+
+
+SCOLDING_TIERS: tuple[tuple[str, ...], ...] = (
+    (
+        "Warm-up arc only. Time to lock in.",
+        "The grind is waiting for you. Start now.",
+        "You are behind schedule. Catch up today.",
+    ),
+    (
+        "Training Arc badge, trainee output.",
+        "This is not enough volume. Push harder.",
+        "You owe this role more hours than this.",
+    ),
+    (
+        "That timer is allergic to your presence.",
+        "Your solo hours are missing in action.",
+        "This effort level does not survive rank-up season.",
+    ),
+    (
+        "Production is critically low. Immediate grind required.",
+        "At this pace, even your excuses are underperforming.",
+        "You are speedrunning the spectator route.",
+    ),
+)
 
 
 class WorkConfirmationView(discord.ui.View):
@@ -265,6 +290,29 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return rank, seconds
         return None
 
+    @staticmethod
+    def _severity_index(*, minimum_hours: float, worked_hours: float) -> int:
+        if minimum_hours <= 0:
+            return 0
+        shortfall_ratio = max(0.0, (minimum_hours - worked_hours) / minimum_hours)
+        max_idx = len(SCOLDING_TIERS) - 1
+        if shortfall_ratio < 0.20:
+            return 0
+        if shortfall_ratio < 0.45:
+            return min(1, max_idx)
+        if shortfall_ratio < 0.75:
+            return min(2, max_idx)
+        return max_idx
+
+    @staticmethod
+    def _pick_scolding(*, minimum_hours: float, worked_hours: float) -> str:
+        severity = VoiceLoggingCog._severity_index(minimum_hours=minimum_hours, worked_hours=worked_hours)
+        candidate_tiers = SCOLDING_TIERS[: severity + 1]
+        # Farther-behind users skew toward harsher message pools.
+        weights = [float(index + 1) for index in range(len(candidate_tiers))]
+        chosen_tier = random.choices(candidate_tiers, weights=weights, k=1)[0]
+        return random.choice(chosen_tier)
+
     async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
         try:
             while True:
@@ -448,10 +496,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     "",
                 ]
                 for member, worked in below:
-                    deficit = max(0.0, minimum_hours - (worked / 3600.0))
+                    worked_hours = worked / 3600.0
+                    deficit = max(0.0, minimum_hours - worked_hours)
+                    scolding = self._pick_scolding(minimum_hours=minimum_hours, worked_hours=worked_hours)
                     lines.append(
                         f"{member.mention} - worked {_hours(worked)} (short by {deficit:.2f}h). "
-                        "Get back to work."
+                        f"{scolding}"
                     )
 
                 for chunk in self._chunk_text("\n".join(lines)):
