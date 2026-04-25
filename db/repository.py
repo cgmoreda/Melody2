@@ -365,6 +365,9 @@ class UserRepositoryBase(abc.ABC):
 class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
+    _SCHEMA_LOCK_KEY = 3_310_920_014_991
+    _LATEST_SCHEMA_VERSION = 3
+
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
         self._pool: Optional[asyncpg.Pool] = None
@@ -372,174 +375,385 @@ class UserRepository(UserRepositoryBase):
     async def init(self) -> None:
         self._pool = await asyncpg.create_pool(self._database_url)
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS verified_users (
-                    discord_id BIGINT NOT NULL,
-                    guild_id BIGINT NOT NULL,
-                    cf_handle TEXT NOT NULL,
-                    rating INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (discord_id, guild_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_verifications (
-                    guild_id BIGINT NOT NULL,
-                    discord_id BIGINT NOT NULL,
-                    cf_handle TEXT NOT NULL,
-                    verification_code TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (guild_id, discord_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reminder_channels (
-                    guild_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    PRIMARY KEY (guild_id, channel_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sent_reminders (
-                    guild_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    reminder_type TEXT NOT NULL,
-                    sent_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (guild_id, channel_id, contest_id, reminder_type)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_sent_reminders_sent_at
-                ON sent_reminders (sent_at)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS coach_config (
-                    guild_id         BIGINT NOT NULL PRIMARY KEY,
-                    coach_id         BIGINT NOT NULL,
-                    waiting_room_id  BIGINT NOT NULL,
-                    coach_channel_id BIGINT NOT NULL
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS voice_sessions (
-                    id BIGSERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    discord_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    channel_name TEXT NOT NULL,
-                    is_solo BOOLEAN NOT NULL DEFAULT FALSE,
-                    started_at TIMESTAMPTZ NOT NULL,
-                    ended_at TIMESTAMPTZ
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
-                ON voice_sessions (guild_id, discord_id, started_at)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_command_config (
-                    guild_id BIGINT PRIMARY KEY,
-                    reminder_preview_limit INTEGER NOT NULL DEFAULT 3 CHECK (reminder_preview_limit BETWEEN 1 AND 10),
-                    roundchanges_max_lines INTEGER NOT NULL DEFAULT 30 CHECK (roundchanges_max_lines BETWEEN 5 AND 60),
-                    voicehours_max_lines INTEGER NOT NULL DEFAULT 35 CHECK (voicehours_max_lines BETWEEN 5 AND 100),
-                    voice_check_interval_seconds INTEGER NOT NULL DEFAULT 900 CHECK (voice_check_interval_seconds BETWEEN 60 AND 7200),
-                    voice_confirm_timeout_seconds INTEGER NOT NULL DEFAULT 180 CHECK (voice_confirm_timeout_seconds BETWEEN 60 AND 900)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gym_contests (
-                    guild_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    gym_type TEXT NOT NULL CHECK (gym_type IN ('individual', 'team')),
-                    created_by BIGINT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, contest_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gym_problem_tags (
-                    guild_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    problem_index TEXT NOT NULL,
-                    tag TEXT NOT NULL,
-                    created_by BIGINT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, contest_id, problem_index, tag)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gym_problem_ratings (
-                    guild_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    problem_index TEXT NOT NULL,
-                    discord_id BIGINT NOT NULL,
-                    estimated_rating INTEGER NOT NULL CHECK (estimated_rating BETWEEN 300 AND 5000),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, contest_id, problem_index, discord_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gym_quality_ratings (
-                    guild_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    discord_id BIGINT NOT NULL,
-                    quality INTEGER NOT NULL CHECK (quality BETWEEN 1 AND 5),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, contest_id, discord_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS gym_participation_cache (
-                    guild_id BIGINT NOT NULL,
-                    contest_id BIGINT NOT NULL,
-                    discord_id BIGINT NOT NULL,
-                    solved_count INTEGER NOT NULL DEFAULT 0,
-                    checked_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (guild_id, contest_id, discord_id)
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_text_config (
-                    guild_id BIGINT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, key)
-                )
-                """
-            )
+            await conn.execute("SELECT pg_advisory_lock($1)", self._SCHEMA_LOCK_KEY)
+            try:
+                async with conn.transaction():
+                    await self._ensure_schema_version_table(conn)
+                    current_version = await self._get_schema_version(conn)
+                    if current_version is None:
+                        current_version = 0
+                        await self._set_schema_version(conn, current_version)
+                    await self._apply_migrations(conn, current_version)
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", self._SCHEMA_LOCK_KEY)
         logger.info("Database initialised")
+
+    async def _ensure_schema_version_table(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_version (
+                id SMALLINT PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            )
+            """
+        )
+
+    async def _get_schema_version(self, conn: asyncpg.Connection) -> Optional[int]:
+        value = await conn.fetchval(
+            """
+            SELECT version
+            FROM schema_version
+            WHERE id = 1
+            """
+        )
+        if value is None:
+            return None
+        return int(value)
+
+    async def _set_schema_version(self, conn: asyncpg.Connection, version: int) -> None:
+        await conn.execute(
+            """
+            INSERT INTO schema_version (id, version)
+            VALUES (1, $1)
+            ON CONFLICT (id)
+            DO UPDATE SET version = EXCLUDED.version
+            """,
+            version,
+        )
+
+    async def _apply_migrations(self, conn: asyncpg.Connection, current_version: int) -> None:
+        migrations = {
+            1: self._migration_001_create_initial_schema,
+            2: self._migration_002_add_indexes,
+            3: self._migration_003_enforce_integrity_constraints,
+        }
+
+        if current_version > self._LATEST_SCHEMA_VERSION:
+            logger.warning(
+                "Database schema version %d is newer than app-supported version %d.",
+                current_version,
+                self._LATEST_SCHEMA_VERSION,
+            )
+            return
+
+        for version in sorted(migrations):
+            if version <= current_version:
+                continue
+            logger.info("Applying database migration v%d", version)
+            await migrations[version](conn)
+            await self._set_schema_version(conn, version)
+
+    async def _migration_001_create_initial_schema(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verified_users (
+                discord_id BIGINT NOT NULL,
+                guild_id BIGINT NOT NULL,
+                cf_handle TEXT NOT NULL,
+                rating INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (discord_id, guild_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_verifications (
+                guild_id BIGINT NOT NULL,
+                discord_id BIGINT NOT NULL,
+                cf_handle TEXT NOT NULL,
+                verification_code TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (guild_id, discord_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_channels (
+                guild_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_reminders (
+                guild_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                reminder_type TEXT NOT NULL,
+                sent_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (guild_id, channel_id, contest_id, reminder_type)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sent_reminders_sent_at
+            ON sent_reminders (sent_at)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coach_config (
+                guild_id         BIGINT NOT NULL PRIMARY KEY,
+                coach_id         BIGINT NOT NULL,
+                waiting_room_id  BIGINT NOT NULL,
+                coach_channel_id BIGINT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                discord_id BIGINT NOT NULL,
+                channel_id BIGINT NOT NULL,
+                channel_name TEXT NOT NULL,
+                is_solo BOOLEAN NOT NULL DEFAULT FALSE,
+                started_at TIMESTAMPTZ NOT NULL,
+                ended_at TIMESTAMPTZ
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
+            ON voice_sessions (guild_id, discord_id, started_at)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_command_config (
+                guild_id BIGINT PRIMARY KEY,
+                reminder_preview_limit INTEGER NOT NULL DEFAULT 3 CHECK (reminder_preview_limit BETWEEN 1 AND 10),
+                roundchanges_max_lines INTEGER NOT NULL DEFAULT 30 CHECK (roundchanges_max_lines BETWEEN 5 AND 60),
+                voicehours_max_lines INTEGER NOT NULL DEFAULT 35 CHECK (voicehours_max_lines BETWEEN 5 AND 100),
+                voice_check_interval_seconds INTEGER NOT NULL DEFAULT 900 CHECK (voice_check_interval_seconds BETWEEN 60 AND 7200),
+                voice_confirm_timeout_seconds INTEGER NOT NULL DEFAULT 180 CHECK (voice_confirm_timeout_seconds BETWEEN 60 AND 900)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gym_contests (
+                guild_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                gym_type TEXT NOT NULL CHECK (gym_type IN ('individual', 'team')),
+                created_by BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, contest_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gym_problem_tags (
+                guild_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                problem_index TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                created_by BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, contest_id, problem_index, tag)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gym_problem_ratings (
+                guild_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                problem_index TEXT NOT NULL,
+                discord_id BIGINT NOT NULL,
+                estimated_rating INTEGER NOT NULL CHECK (estimated_rating BETWEEN 300 AND 5000),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, contest_id, problem_index, discord_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gym_quality_ratings (
+                guild_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                discord_id BIGINT NOT NULL,
+                quality INTEGER NOT NULL CHECK (quality BETWEEN 1 AND 5),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, contest_id, discord_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gym_participation_cache (
+                guild_id BIGINT NOT NULL,
+                contest_id BIGINT NOT NULL,
+                discord_id BIGINT NOT NULL,
+                solved_count INTEGER NOT NULL DEFAULT 0,
+                checked_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (guild_id, contest_id, discord_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS guild_text_config (
+                guild_id BIGINT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (guild_id, key)
+            )
+            """
+        )
+
+    async def _migration_002_add_indexes(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_verified_users_guild_id
+            ON verified_users (guild_id)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pending_verifications_expires_at
+            ON pending_verifications (expires_at)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_open_guild_user
+            ON voice_sessions (guild_id, discord_id)
+            WHERE ended_at IS NULL
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_solo_started
+            ON voice_sessions (guild_id, is_solo, started_at)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gym_problem_tags_problem
+            ON gym_problem_tags (guild_id, contest_id, problem_index)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gym_quality_ratings_updated
+            ON gym_quality_ratings (guild_id, contest_id, updated_at DESC)
+            """
+        )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_gym_participation_cache_checked
+            ON gym_participation_cache (guild_id, contest_id, checked_at DESC)
+            """
+        )
+
+    async def _migration_003_enforce_integrity_constraints(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    ctid,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY guild_id, LOWER(cf_handle)
+                        ORDER BY rating DESC, discord_id ASC
+                    ) AS rn
+                FROM verified_users
+            )
+            DELETE FROM verified_users v
+            USING ranked r
+            WHERE v.ctid = r.ctid
+              AND r.rn > 1
+            """
+        )
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_verified_users_guild_cf_handle_ci
+            ON verified_users (guild_id, LOWER(cf_handle))
+            """
+        )
+
+        await self._ensure_gym_fk_constraint(
+            conn,
+            table_name="gym_problem_tags",
+            constraint_name="fk_gym_problem_tags_contest",
+        )
+        await self._ensure_gym_fk_constraint(
+            conn,
+            table_name="gym_problem_ratings",
+            constraint_name="fk_gym_problem_ratings_contest",
+        )
+        await self._ensure_gym_fk_constraint(
+            conn,
+            table_name="gym_quality_ratings",
+            constraint_name="fk_gym_quality_ratings_contest",
+        )
+        await self._ensure_gym_fk_constraint(
+            conn,
+            table_name="gym_participation_cache",
+            constraint_name="fk_gym_participation_cache_contest",
+        )
+
+    async def _ensure_gym_fk_constraint(
+        self,
+        conn: asyncpg.Connection,
+        *,
+        table_name: str,
+        constraint_name: str,
+    ) -> None:
+        await conn.execute(
+            f"""
+            DELETE FROM {table_name} child
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM gym_contests parent
+                WHERE parent.guild_id = child.guild_id
+                  AND parent.contest_id = child.contest_id
+            )
+            """
+        )
+        if await self._constraint_exists(conn, table_name, constraint_name):
+            return
+        await conn.execute(
+            f"""
+            ALTER TABLE {table_name}
+            ADD CONSTRAINT {constraint_name}
+            FOREIGN KEY (guild_id, contest_id)
+            REFERENCES gym_contests (guild_id, contest_id)
+            ON DELETE CASCADE
+            """
+        )
+
+    async def _constraint_exists(
+        self,
+        conn: asyncpg.Connection,
+        table_name: str,
+        constraint_name: str,
+    ) -> bool:
+        row = await conn.fetchval(
+            """
+            SELECT 1
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = current_schema()
+              AND t.relname = $1
+              AND c.conname = $2
+            LIMIT 1
+            """,
+            table_name,
+            constraint_name,
+        )
+        return row is not None
 
     async def close(self) -> None:
         if self._pool is not None:
