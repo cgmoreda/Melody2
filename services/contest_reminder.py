@@ -14,6 +14,7 @@ from db.repository import UserRepositoryBase
 logger = logging.getLogger(__name__)
 
 CF_CONTEST_LIST_API = "https://codeforces.com/api/contest.list"
+REMINDER_DEDUPE_RETENTION_DAYS = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,12 +42,20 @@ class ContestReminderService:
         self._repo = repo
         self._poll_seconds = max(300, min(600, poll_seconds))
         self._task: Optional[asyncio.Task[None]] = None
-        self._sent_cache: set[tuple[int, int, str]] = set()
+        self._sent_cache: set[tuple[int, int, int, str]] = set()
+        self._dispatch_locks: dict[tuple[int, int, int, str], asyncio.Lock] = {}
         self._enabled_channels: set[tuple[int, int]] = set()
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         channels = await self._repo.get_reminder_channels()
+        retention_cutoff = datetime.now(tz=UTC) - timedelta(days=REMINDER_DEDUPE_RETENTION_DAYS)
+        try:
+            deleted = await self._repo.cleanup_old_sent_contest_reminders(retention_cutoff)
+            if deleted > 0:
+                logger.info("Cleaned %d old sent reminder dedupe row(s)", deleted)
+        except Exception:
+            logger.exception("Failed cleaning old sent reminder dedupe rows")
         async with self._lock:
             self._enabled_channels = set(channels)
         logger.info("Loaded %d reminder channel(s)", len(channels))
@@ -79,7 +88,12 @@ class ContestReminderService:
             self._sent_cache = {
                 cache_key
                 for cache_key in self._sent_cache
-                if cache_key[0] != channel_id
+                if not (cache_key[0] == guild_id and cache_key[1] == channel_id)
+            }
+            self._dispatch_locks = {
+                cache_key: dispatch_lock
+                for cache_key, dispatch_lock in self._dispatch_locks.items()
+                if not (cache_key[0] == guild_id and cache_key[1] == channel_id)
             }
         return removed
 
@@ -119,7 +133,12 @@ class ContestReminderService:
             self._sent_cache = {
                 cache_key
                 for cache_key in self._sent_cache
-                if cache_key[1] in active_contest_ids
+                if cache_key[2] in active_contest_ids
+            }
+            self._dispatch_locks = {
+                cache_key: dispatch_lock
+                for cache_key, dispatch_lock in self._dispatch_locks.items()
+                if cache_key[2] in active_contest_ids
             }
 
         for guild_id, channel_id in enabled_channels:
@@ -166,7 +185,7 @@ class ContestReminderService:
         message: str,
         until_start: timedelta,
     ) -> None:
-        key = (channel.id, contest.contest_id, reminder_type)
+        key = (guild_id, channel.id, contest.contest_id, reminder_type)
         async with self._lock:
             if key in self._sent_cache:
                 return
@@ -174,35 +193,115 @@ class ContestReminderService:
         if not (target - window <= until_start <= target):
             return
 
-        try:
-            await channel.send(message)
-        except discord.Forbidden:
-            logger.warning(
-                "Cannot send reminder to channel %s in guild %s due to missing permissions",
-                channel.id,
-                guild_id,
-            )
-            return
-        except discord.HTTPException as exc:
-            logger.warning(
-                "Failed sending reminder to channel %s in guild %s: %s",
-                channel.id,
-                guild_id,
-                exc,
-            )
-            return
+        dispatch_lock = await self._get_dispatch_lock(key)
+        async with dispatch_lock:
+            async with self._lock:
+                if key in self._sent_cache:
+                    return
 
+            try:
+                already_sent = await self._repo.has_sent_contest_reminder(
+                    guild_id=guild_id,
+                    channel_id=channel.id,
+                    contest_id=contest.contest_id,
+                    reminder_type=reminder_type,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed reading reminder dedupe key (guild=%s channel=%s contest=%s type=%s)",
+                    guild_id,
+                    channel.id,
+                    contest.contest_id,
+                    reminder_type,
+                )
+                return
+
+            if already_sent:
+                async with self._lock:
+                    self._sent_cache.add(key)
+                return
+
+            try:
+                await channel.send(message)
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot send reminder to channel %s in guild %s due to missing permissions",
+                    channel.id,
+                    guild_id,
+                )
+                return
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Failed sending reminder to channel %s in guild %s: %s",
+                    channel.id,
+                    guild_id,
+                    exc,
+                )
+                return
+
+            sent_at = datetime.now(tz=UTC)
+            try:
+                await self._mark_sent_with_retry(
+                    guild_id=guild_id,
+                    channel_id=channel.id,
+                    contest_id=contest.contest_id,
+                    reminder_type=reminder_type,
+                    sent_at=sent_at,
+                )
+            except Exception:
+                logger.exception(
+                    "Sent reminder but failed to persist dedupe row (guild=%s channel=%s contest=%s type=%s)",
+                    guild_id,
+                    channel.id,
+                    contest.contest_id,
+                    reminder_type,
+                )
+
+            async with self._lock:
+                self._sent_cache.add(key)
+
+            logger.info(
+                "Sent %s reminder for contest %s (%s) in guild %s channel %s",
+                reminder_type,
+                contest.contest_id,
+                contest.name,
+                guild_id,
+                channel.id,
+            )
+
+    async def _get_dispatch_lock(self, key: tuple[int, int, int, str]) -> asyncio.Lock:
         async with self._lock:
-            self._sent_cache.add(key)
+            lock = self._dispatch_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._dispatch_locks[key] = lock
+            return lock
 
-        logger.info(
-            "Sent %s reminder for contest %s (%s) in guild %s channel %s",
-            reminder_type,
-            contest.contest_id,
-            contest.name,
-            guild_id,
-            channel.id,
-        )
+    async def _mark_sent_with_retry(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+        sent_at: datetime,
+    ) -> None:
+        delay_seconds = 0.25
+        for attempt in range(1, 4):
+            try:
+                await self._repo.mark_contest_reminder_sent(
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    contest_id=contest_id,
+                    reminder_type=reminder_type,
+                    sent_at=sent_at,
+                )
+                return
+            except Exception:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(delay_seconds)
+                delay_seconds *= 2.0
 
     async def _fetch_before_contests(self) -> Optional[list[CFContest]]:
         delay = 1.0

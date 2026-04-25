@@ -124,6 +124,31 @@ class UserRepositoryBase(abc.ABC):
         """Return all enabled reminder channels as (guild_id, channel_id)."""
 
     @abc.abstractmethod
+    async def has_sent_contest_reminder(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+    ) -> bool:
+        """Return whether this reminder dispatch key has already been recorded."""
+
+    @abc.abstractmethod
+    async def mark_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+        sent_at: datetime,
+    ) -> bool:
+        """Record one sent reminder. Returns True when inserted, False when it already existed."""
+
+    @abc.abstractmethod
+    async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
+        """Delete old persisted reminder dispatch rows and return deleted row count."""
+
+    @abc.abstractmethod
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         """Return coach config for a guild, or None."""
 
@@ -334,6 +359,24 @@ class UserRepository(UserRepositoryBase):
                     channel_id BIGINT NOT NULL,
                     PRIMARY KEY (guild_id, channel_id)
                 )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sent_reminders (
+                    guild_id BIGINT NOT NULL,
+                    channel_id BIGINT NOT NULL,
+                    contest_id BIGINT NOT NULL,
+                    reminder_type TEXT NOT NULL,
+                    sent_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id, contest_id, reminder_type)
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sent_reminders_sent_at
+                ON sent_reminders (sent_at)
                 """
             )
             await conn.execute(
@@ -554,6 +597,73 @@ class UserRepository(UserRepositoryBase):
                 """
             )
         return [(row["guild_id"], row["channel_id"]) for row in rows]
+
+    async def has_sent_contest_reminder(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+    ) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT 1
+                FROM sent_reminders
+                WHERE guild_id = $1
+                  AND channel_id = $2
+                  AND contest_id = $3
+                  AND reminder_type = $4
+                LIMIT 1
+                """,
+                guild_id,
+                channel_id,
+                contest_id,
+                reminder_type,
+            )
+        return row is not None
+
+    async def mark_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+        sent_at: datetime,
+    ) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO sent_reminders (
+                    guild_id, channel_id, contest_id, reminder_type, sent_at
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id, channel_id, contest_id, reminder_type) DO NOTHING
+                """,
+                guild_id,
+                channel_id,
+                contest_id,
+                reminder_type,
+                sent_at,
+            )
+        return result.endswith("1")
+
+    async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM sent_reminders
+                WHERE sent_at < $1
+                """,
+                before,
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
 
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         assert self._pool is not None, "Call init() first"
