@@ -401,6 +401,12 @@ class GymCog(commands.Cog, name="Gyms"):
     def _sorted_members(members: list[discord.Member]) -> list[discord.Member]:
         return sorted(members, key=lambda member: member.display_name.casefold())
 
+    async def _send_ephemeral(self, interaction: discord.Interaction, content: str) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(content, ephemeral=True)
+            return
+        await interaction.response.send_message(content, ephemeral=True)
+
     @staticmethod
     def _guild_id_from_interaction(interaction: discord.Interaction) -> Optional[int]:
         if interaction.guild_id is not None:
@@ -427,12 +433,12 @@ class GymCog(commands.Cog, name="Gyms"):
     ) -> bool:
         resolved_guild_id = guild_id if guild_id is not None else self._guild_id_from_interaction(interaction)
         if resolved_guild_id is None:
-            await interaction.response.send_message("This action can only be used in a server.", ephemeral=True)
+            await self._send_ephemeral(interaction, "This action can only be used in a server.")
             return False
         gym = await self._repo.get_gym_contest(resolved_guild_id, contest_id)
         if gym is not None:
             return True
-        await interaction.response.send_message(not_found_message, ephemeral=True)
+        await self._send_ephemeral(interaction, not_found_message)
         return False
 
     async def _is_coach(self, member: discord.Member, guild_id: int) -> bool:
@@ -854,15 +860,17 @@ class GymCog(commands.Cog, name="Gyms"):
         problem_index: str,
         tag: str,
     ) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
         allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
         if not allowed:
-            await interaction.response.send_message(reason, ephemeral=True)
+            await self._send_ephemeral(interaction, reason)
             return
         normalized_tag = _normalize_tag(tag)
         if not normalized_tag:
-            await interaction.response.send_message("Tag cannot be empty.", ephemeral=True)
+            await self._send_ephemeral(interaction, "Tag cannot be empty.")
             return
         inserted = await self._repo.add_gym_problem_tag(
             guild_id,
@@ -872,14 +880,14 @@ class GymCog(commands.Cog, name="Gyms"):
             interaction.user.id,
         )
         if inserted:
-            await interaction.response.send_message(
+            await self._send_ephemeral(
+                interaction,
                 f"Added tag `{normalized_tag}` to `{_problem_ref(contest_id, problem_index)}`.",
-                ephemeral=True,
             )
             return
-        await interaction.response.send_message(
+        await self._send_ephemeral(
+            interaction,
             f"Tag `{normalized_tag}` already exists for `{_problem_ref(contest_id, problem_index)}`.",
-            ephemeral=True,
         )
 
     async def _open_delete_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
@@ -915,20 +923,22 @@ class GymCog(commands.Cog, name="Gyms"):
         problem_index: str,
         tag: str,
     ) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
         allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
         if not allowed:
-            await interaction.response.send_message(reason, ephemeral=True)
+            await self._send_ephemeral(interaction, reason)
             return
         removed = await self._repo.remove_gym_problem_tag(guild_id, contest_id, problem_index, tag)
         if removed:
-            await interaction.response.send_message(
+            await self._send_ephemeral(
+                interaction,
                 f"Removed tag `{tag}` from `{_problem_ref(contest_id, problem_index)}`.",
-                ephemeral=True,
             )
             return
-        await interaction.response.send_message("Tag not found.", ephemeral=True)
+        await self._send_ephemeral(interaction, "Tag not found.")
 
     async def _show_tags(self, interaction: discord.Interaction, contest_id: int, problem_index: Optional[str]) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
