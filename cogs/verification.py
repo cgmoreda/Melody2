@@ -13,7 +13,7 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase, VerifiedUser
-from services.cf_client import CFContestChange, CFSubmission, CFUserInfo, CodeforcesClientBase
+from services.cf_client import CFContestChange, CFRequestError, CFSubmission, CFUserInfo, CodeforcesClientBase
 from services.contest_reminder import ContestReminderService
 from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssignerBase
@@ -72,6 +72,15 @@ class VerificationCog(commands.Cog, name="Verification"):
         )
         embed.set_footer(text=f"The code expires in {expires_in_minutes} minutes.")
         return embed
+
+    @staticmethod
+    def _cf_error_message(error: CFRequestError) -> str:
+        status_text = f", status {error.http_status}" if error.http_status is not None else ""
+        lines = [f"Request failed: endpoint {error.endpoint}{status_text} ({error.failure_kind})."]
+        if error.requested_url and error.failure_kind != "non_ok":
+            lines.append(f"URL: `{error.requested_url}`")
+        lines.append("Please try again in a minute.")
+        return "\n".join(lines)
 
     @staticmethod
     def _build_whois_embed(info: CFUserInfo) -> discord.Embed:
@@ -226,7 +235,11 @@ class VerificationCog(commands.Cog, name="Verification"):
         if ctx.guild is None:
             return
 
-        info = await self._cf.get_user(handle)
+        try:
+            info = await self._cf.get_user(handle)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
             return
@@ -261,9 +274,16 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send("Your pending verification code expired. Use **!verify <handle>** to start again.")
             return
 
-        info = await self._cf.get_user(pending.cf_handle)
+        try:
+            info = await self._cf.get_user(pending.cf_handle)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
         if info is None:
-            await ctx.send("Could not reach the Codeforces API. Please try again later.")
+            await ctx.send(
+                f"Codeforces handle **{pending.cf_handle}** was not found. "
+                "Run **!verify <handle>** again."
+            )
             return
 
         if info.first_name != pending.verification_code:
@@ -310,9 +330,16 @@ class VerificationCog(commands.Cog, name="Verification"):
             await ctx.send("You are not verified yet. Use **!verify <handle>** first.")
             return
 
-        info = await self._cf.get_user(record.cf_handle)
+        try:
+            info = await self._cf.get_user(record.cf_handle)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
         if info is None:
-            await ctx.send("Could not reach the Codeforces API. Please try again later.")
+            await ctx.send(
+                f"Linked handle **{record.cf_handle}** was not found on Codeforces. "
+                "Run **!verify <handle>** to relink."
+            )
             return
 
         old_rating = record.rating
@@ -356,7 +383,11 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.guild_only()
     async def whois(self, ctx: commands.Context, handle: str) -> None:
         """Show live Codeforces profile details for a handle."""
-        info = await self._cf.get_user(handle)
+        try:
+            info = await self._cf.get_user(handle)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
             return
@@ -367,13 +398,21 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.guild_only()
     async def stats(self, ctx: commands.Context, handle: str) -> None:
         """Show contest and submission statistics for a Codeforces handle."""
-        info = await self._cf.get_user(handle)
+        try:
+            info = await self._cf.get_user(handle)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
             return
 
-        history = await self._cf.get_rating_history(info.handle)
-        submissions = await self._cf.get_recent_submissions(info.handle, count=500)
+        try:
+            history = await self._cf.get_rating_history(info.handle)
+            submissions = await self._cf.get_recent_submissions(info.handle, count=500)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
 
         embed = discord.Embed(
             title=f"Stats: {info.handle}",
@@ -402,7 +441,11 @@ class VerificationCog(commands.Cog, name="Verification"):
             return
 
         unique_handles = sorted({user.cf_handle for user in users})
-        history_by_handle = await self._fetch_latest_histories(unique_handles)
+        try:
+            history_by_handle = await self._fetch_latest_histories(unique_handles)
+        except CFRequestError as exc:
+            await ctx.send(self._cf_error_message(exc))
+            return
 
         latest_entries = [history[-1] for history in history_by_handle.values() if history]
         if not latest_entries:

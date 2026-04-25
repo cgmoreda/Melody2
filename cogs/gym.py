@@ -10,7 +10,7 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase, VerifiedUser
-from services.cf_client import CFSubmission, CodeforcesClientBase
+from services.cf_client import CFRequestError, CFSubmission, CodeforcesClientBase
 from services.guild_config import GuildConfigService
 
 PARTICIPATION_CACHE_SECONDS = 3600
@@ -380,6 +380,15 @@ class GymCog(commands.Cog, name="Gyms"):
         self._submission_sem = asyncio.Semaphore(6)
 
     @staticmethod
+    def _cf_error_message(error: CFRequestError) -> str:
+        status_text = f", status {error.http_status}" if error.http_status is not None else ""
+        lines = [f"Request failed: endpoint {error.endpoint}{status_text} ({error.failure_kind})."]
+        if error.requested_url and error.failure_kind != "non_ok":
+            lines.append(f"URL: `{error.requested_url}`")
+        lines.append("Please try again in a minute.")
+        return "\n".join(lines)
+
+    @staticmethod
     def _chunk_lines(lines: list[str], max_len: int = 1900) -> list[str]:
         chunks: list[str] = []
         current: list[str] = []
@@ -744,13 +753,17 @@ class GymCog(commands.Cog, name="Gyms"):
         cache_note = "force(10m)" if force else "normal(1h cache)"
 
         for gym in gyms:
-            solved_by_discord, unverified_ids = await self._contest_participation(
-                ctx.guild.id,
-                gym.contest_id,
-                training_members,
-                verified_by_id,
-                force=force,
-            )
+            try:
+                solved_by_discord, unverified_ids = await self._contest_participation(
+                    ctx.guild.id,
+                    gym.contest_id,
+                    training_members,
+                    verified_by_id,
+                    force=force,
+                )
+            except CFRequestError as exc:
+                await ctx.send(self._cf_error_message(exc))
+                return
 
             not_participated = self._sorted_members(
                 [
@@ -864,7 +877,11 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
-        allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        try:
+            allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        except CFRequestError as exc:
+            await self._send_ephemeral(interaction, self._cf_error_message(exc))
+            return
         if not allowed:
             await self._send_ephemeral(interaction, reason)
             return
@@ -927,7 +944,11 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
-        allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        try:
+            allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        except CFRequestError as exc:
+            await self._send_ephemeral(interaction, self._cf_error_message(exc))
+            return
         if not allowed:
             await self._send_ephemeral(interaction, reason)
             return
