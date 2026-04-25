@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 import logging
 import secrets
 from statistics import median
@@ -20,6 +21,7 @@ from services.role_assigner import RoleAssignerBase
 logger = logging.getLogger(__name__)
 
 MAX_RECENT_CONTEST_LINES = 5
+PENDING_VERIFICATION_EXPIRY_MINUTES = 15
 
 
 def _generate_code(length: int = 6) -> str:
@@ -55,14 +57,9 @@ class VerificationCog(commands.Cog, name="Verification"):
         self._repo = repo
         self._config = config_service
         self._reminders = reminder_service
-        self._pending: dict[tuple[int, int], tuple[str, str]] = {}
 
     @staticmethod
-    def _pending_key(guild_id: int, user_id: int) -> tuple[int, int]:
-        return guild_id, user_id
-
-    @staticmethod
-    def _build_verify_embed(handle: str, code: str) -> discord.Embed:
+    def _build_verify_embed(handle: str, code: str, expires_in_minutes: int) -> discord.Embed:
         embed = discord.Embed(
             title="Verification Started",
             description=(
@@ -73,7 +70,7 @@ class VerificationCog(commands.Cog, name="Verification"):
             ),
             colour=discord.Colour.gold(),
         )
-        embed.set_footer(text="The code expires when you start a new verification.")
+        embed.set_footer(text=f"The code expires in {expires_in_minutes} minutes.")
         return embed
 
     @staticmethod
@@ -235,8 +232,17 @@ class VerificationCog(commands.Cog, name="Verification"):
             return
 
         code = _generate_code()
-        self._pending[self._pending_key(ctx.guild.id, ctx.author.id)] = (handle, code)
-        await ctx.send(embed=self._build_verify_embed(handle, code))
+        created_at = datetime.now(tz=UTC)
+        expires_at = created_at + timedelta(minutes=PENDING_VERIFICATION_EXPIRY_MINUTES)
+        await self._repo.upsert_pending_verification(
+            guild_id=ctx.guild.id,
+            discord_id=ctx.author.id,
+            cf_handle=info.handle,
+            verification_code=code,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        await ctx.send(embed=self._build_verify_embed(info.handle, code, PENDING_VERIFICATION_EXPIRY_MINUTES))
 
     @commands.command(name="confirm")
     @commands.guild_only()
@@ -244,28 +250,32 @@ class VerificationCog(commands.Cog, name="Verification"):
         """Confirm verification after setting your temporary code on Codeforces."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
 
-        key = self._pending_key(ctx.guild.id, ctx.author.id)
-        pending = self._pending.get(key)
+        pending = await self._repo.get_pending_verification(ctx.guild.id, ctx.author.id)
         if pending is None:
             await ctx.send("You have no pending verification. Use **!verify <handle>** first.")
             return
 
-        handle, expected_code = pending
-        info = await self._cf.get_user(handle)
+        now = datetime.now(tz=UTC)
+        if pending.expires_at <= now:
+            await self._repo.delete_pending_verification(ctx.guild.id, ctx.author.id)
+            await ctx.send("Your pending verification code expired. Use **!verify <handle>** to start again.")
+            return
+
+        info = await self._cf.get_user(pending.cf_handle)
         if info is None:
             await ctx.send("Could not reach the Codeforces API. Please try again later.")
             return
 
-        if info.first_name != expected_code:
+        if info.first_name != pending.verification_code:
             await ctx.send(
                 "First name mismatch.\n"
-                f"Expected: `{expected_code}`\n"
+                f"Expected: `{pending.verification_code}`\n"
                 f"Found: `{info.first_name or '(empty)'}`\n\n"
                 "Update your CF profile and try **!confirm** again."
             )
             return
 
-        del self._pending[key]
+        await self._repo.delete_pending_verification(ctx.guild.id, ctx.author.id)
 
         user = VerifiedUser(
             discord_id=ctx.author.id,

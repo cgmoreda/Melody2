@@ -92,6 +92,16 @@ class GymParticipationCache:
     checked_at: datetime
 
 
+@dataclass(slots=True)
+class PendingVerification:
+    guild_id: int
+    discord_id: int
+    cf_handle: str
+    verification_code: str
+    created_at: datetime
+    expires_at: datetime
+
+
 class UserRepositoryBase(abc.ABC):
     """Abstraction over persistent user storage."""
 
@@ -110,6 +120,27 @@ class UserRepositoryBase(abc.ABC):
     @abc.abstractmethod
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
         """Return every verified user in a guild."""
+
+    @abc.abstractmethod
+    async def upsert_pending_verification(
+        self,
+        *,
+        guild_id: int,
+        discord_id: int,
+        cf_handle: str,
+        verification_code: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        """Create or replace a pending verification row for one guild/user pair."""
+
+    @abc.abstractmethod
+    async def get_pending_verification(self, guild_id: int, discord_id: int) -> Optional[PendingVerification]:
+        """Return one pending verification row, if present."""
+
+    @abc.abstractmethod
+    async def delete_pending_verification(self, guild_id: int, discord_id: int) -> bool:
+        """Delete one pending verification row. Returns True when a row existed."""
 
     @abc.abstractmethod
     async def add_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
@@ -354,6 +385,19 @@ class UserRepository(UserRepositoryBase):
             )
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS pending_verifications (
+                    guild_id BIGINT NOT NULL,
+                    discord_id BIGINT NOT NULL,
+                    cf_handle TEXT NOT NULL,
+                    verification_code TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (guild_id, discord_id)
+                )
+                """
+            )
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS reminder_channels (
                     guild_id BIGINT NOT NULL,
                     channel_id BIGINT NOT NULL,
@@ -559,6 +603,74 @@ class UserRepository(UserRepositoryBase):
             )
             for row in rows
         ]
+
+    async def upsert_pending_verification(
+        self,
+        *,
+        guild_id: int,
+        discord_id: int,
+        cf_handle: str,
+        verification_code: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO pending_verifications (
+                    guild_id, discord_id, cf_handle, verification_code, created_at, expires_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (guild_id, discord_id)
+                DO UPDATE SET cf_handle = excluded.cf_handle,
+                              verification_code = excluded.verification_code,
+                              created_at = excluded.created_at,
+                              expires_at = excluded.expires_at
+                """,
+                guild_id,
+                discord_id,
+                cf_handle,
+                verification_code,
+                created_at,
+                expires_at,
+            )
+
+    async def get_pending_verification(self, guild_id: int, discord_id: int) -> Optional[PendingVerification]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id, discord_id, cf_handle, verification_code, created_at, expires_at
+                FROM pending_verifications
+                WHERE guild_id = $1 AND discord_id = $2
+                """,
+                guild_id,
+                discord_id,
+            )
+        if row is None:
+            return None
+        return PendingVerification(
+            guild_id=row["guild_id"],
+            discord_id=row["discord_id"],
+            cf_handle=row["cf_handle"],
+            verification_code=row["verification_code"],
+            created_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    async def delete_pending_verification(self, guild_id: int, discord_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM pending_verifications
+                WHERE guild_id = $1 AND discord_id = $2
+                """,
+                guild_id,
+                discord_id,
+            )
+        return result.endswith("1")
 
     async def add_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
         assert self._pool is not None, "Call init() first"
