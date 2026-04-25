@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlencode
 
 import aiohttp
@@ -14,6 +14,17 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 CF_API_BASE = "https://codeforces.com/api"
+FailureKind = Literal["timeout", "network", "http", "non_ok", "parse"]
+SENSITIVE_QUERY_MARKERS: tuple[str, ...] = (
+    "token",
+    "secret",
+    "signature",
+    "sig",
+    "apikey",
+    "api_key",
+    "password",
+    "auth",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +61,31 @@ class CFSubmission:
     problem_key: Optional[str]
     contest_id: Optional[int]
     problem_index: Optional[str]
+
+
+@dataclass(frozen=True, slots=True)
+class CFRequestError(Exception):
+    endpoint: str
+    failure_kind: FailureKind
+    requested_url: str
+    http_status: Optional[int] = None
+    cf_comment: Optional[str] = None
+    detail: Optional[str] = None
+
+    @property
+    def is_not_found(self) -> bool:
+        if self.failure_kind != "non_ok" or self.cf_comment is None:
+            return False
+        return "not found" in self.cf_comment.lower()
+
+    def __str__(self) -> str:
+        status_part = f", status={self.http_status}" if self.http_status is not None else ""
+        comment_part = f", comment={self.cf_comment}" if self.cf_comment is not None else ""
+        detail_part = f", detail={self.detail}" if self.detail is not None else ""
+        return (
+            f"CF request failed endpoint={self.endpoint}, kind={self.failure_kind}{status_part}"
+            f"{comment_part}, url={self.requested_url}{detail_part}"
+        )
 
 
 class CodeforcesClientBase(abc.ABC):
@@ -90,7 +126,30 @@ class CodeforcesClient(CodeforcesClientBase):
             return
         self._cache[cache_key] = (time.time() + self._cache_ttl_seconds, payload)
 
-    async def _get(self, endpoint: str, params: dict[str, object]) -> Optional[dict]:
+    @staticmethod
+    def _is_sensitive_param(param_name: str) -> bool:
+        lowered = param_name.lower()
+        return any(marker in lowered for marker in SENSITIVE_QUERY_MARKERS)
+
+    def _build_requested_url(self, endpoint: str, params: dict[str, object]) -> str:
+        safe_items: list[tuple[str, str]] = []
+        for key, value in sorted(params.items()):
+            if self._is_sensitive_param(key):
+                safe_items.append((key, "<redacted>"))
+                continue
+            safe_items.append((key, str(value)))
+        query = urlencode(safe_items)
+        base = f"{CF_API_BASE}/{endpoint}"
+        return f"{base}?{query}" if query else base
+
+    @staticmethod
+    def _is_retryable_non_ok_comment(comment: Optional[str]) -> bool:
+        if comment is None:
+            return False
+        lowered = comment.lower()
+        return "limit" in lowered or "busy" in lowered or "temporarily unavailable" in lowered
+
+    async def _get(self, endpoint: str, params: dict[str, object]) -> dict:
         request_params = dict(params)
         cache_key = f"{endpoint}?{urlencode(sorted((k, str(v)) for k, v in request_params.items()))}"
         cached = self._cache_get(cache_key)
@@ -98,8 +157,9 @@ class CodeforcesClient(CodeforcesClientBase):
             return cached
 
         url = f"{CF_API_BASE}/{endpoint}"
-        last_error_detail = "Unknown error"
+        requested_url = self._build_requested_url(endpoint, request_params)
         delay = 0.7
+        last_error: Optional[CFRequestError] = None
         for attempt in range(1, self._max_retries + 1):
             try:
                 async with self._session.get(
@@ -108,47 +168,110 @@ class CodeforcesClient(CodeforcesClientBase):
                     timeout=aiohttp.ClientTimeout(total=self._timeout_seconds),
                 ) as response:
                     if response.status != 200:
-                        last_error_detail = f"HTTP {response.status}"
+                        last_error = CFRequestError(
+                            endpoint=endpoint,
+                            failure_kind="http",
+                            requested_url=requested_url,
+                            http_status=response.status,
+                        )
                         if 500 <= response.status < 600 and attempt < self._max_retries:
                             await asyncio.sleep(delay)
                             delay *= 2
                             continue
-                        logger.warning("CF API status %s for %s", response.status, endpoint)
-                        return None
-                    payload = await response.json(content_type=None)
-            except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
-                last_error_detail = str(exc)
+                        logger.warning("%s", last_error)
+                        raise last_error
+                    try:
+                        payload = await response.json(content_type=None)
+                    except ValueError as exc:
+                        last_error = CFRequestError(
+                            endpoint=endpoint,
+                            failure_kind="parse",
+                            requested_url=requested_url,
+                            http_status=response.status,
+                            detail=str(exc),
+                        )
+                        logger.warning("%s", last_error)
+                        raise last_error
+            except asyncio.TimeoutError:
+                last_error = CFRequestError(
+                    endpoint=endpoint,
+                    failure_kind="timeout",
+                    requested_url=requested_url,
+                    detail=f"timeout>{self._timeout_seconds}s",
+                )
                 if attempt < self._max_retries:
                     await asyncio.sleep(delay)
                     delay *= 2
                     continue
-                logger.warning("CF API request failed for %s: %s", endpoint, exc)
-                return None
-
-            if not isinstance(payload, dict):
-                return None
-            if payload.get("status") != "OK":
-                comment = payload.get("comment")
-                last_error_detail = str(comment) if comment is not None else "Codeforces returned non-OK status"
-                if attempt < self._max_retries and isinstance(comment, str) and "limit" in comment.lower():
+                logger.warning("%s", last_error)
+                raise last_error
+            except aiohttp.ClientError as exc:
+                last_error = CFRequestError(
+                    endpoint=endpoint,
+                    failure_kind="network",
+                    requested_url=requested_url,
+                    detail=str(exc),
+                )
+                if attempt < self._max_retries:
                     await asyncio.sleep(delay)
                     delay *= 2
                     continue
-                return None
+                logger.warning("%s", last_error)
+                raise last_error
+
+            if not isinstance(payload, dict):
+                last_error = CFRequestError(
+                    endpoint=endpoint,
+                    failure_kind="parse",
+                    requested_url=requested_url,
+                    detail=f"unexpected payload type: {type(payload).__name__}",
+                )
+                logger.warning("%s", last_error)
+                raise last_error
+            if payload.get("status") != "OK":
+                comment = payload.get("comment")
+                cf_comment = comment if isinstance(comment, str) else None
+                last_error = CFRequestError(
+                    endpoint=endpoint,
+                    failure_kind="non_ok",
+                    requested_url=requested_url,
+                    cf_comment=cf_comment,
+                )
+                if attempt < self._max_retries and self._is_retryable_non_ok_comment(cf_comment):
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                logger.warning("%s", last_error)
+                raise last_error
 
             self._cache_set(cache_key, payload)
             return payload
 
-        return None
+        if last_error is None:
+            last_error = CFRequestError(
+                endpoint=endpoint,
+                failure_kind="network",
+                requested_url=requested_url,
+                detail="exhausted retries",
+            )
+        raise last_error
 
     async def get_user(self, handle: str) -> Optional[CFUserInfo]:
-        data = await self._get("user.info", {"handles": handle})
-        if data is None:
-            return None
+        try:
+            data = await self._get("user.info", {"handles": handle})
+        except CFRequestError as exc:
+            if exc.is_not_found:
+                return None
+            raise
 
         result = data.get("result")
         if not isinstance(result, list) or not result or not isinstance(result[0], dict):
-            return None
+            raise CFRequestError(
+                endpoint="user.info",
+                failure_kind="parse",
+                requested_url=self._build_requested_url("user.info", {"handles": handle}),
+                detail="result payload is missing or malformed",
+            )
         user = result[0]
 
         current_rating = int(user.get("rating", 0) or 0)
@@ -180,11 +303,14 @@ class CodeforcesClient(CodeforcesClientBase):
         for idx in range(0, len(unique_handles), chunk_size):
             batch = unique_handles[idx : idx + chunk_size]
             data = await self._get("user.info", {"handles": ";".join(batch)})
-            if data is None:
-                continue
             rows = data.get("result")
             if not isinstance(rows, list):
-                continue
+                raise CFRequestError(
+                    endpoint="user.info",
+                    failure_kind="parse",
+                    requested_url=self._build_requested_url("user.info", {"handles": ";".join(batch)}),
+                    detail="result payload is not a list",
+                )
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -209,11 +335,14 @@ class CodeforcesClient(CodeforcesClientBase):
 
     async def get_rating_history(self, handle: str) -> list[CFContestChange]:
         data = await self._get("user.rating", {"handle": handle})
-        if data is None:
-            return []
         rows = data.get("result")
         if not isinstance(rows, list):
-            return []
+            raise CFRequestError(
+                endpoint="user.rating",
+                failure_kind="parse",
+                requested_url=self._build_requested_url("user.rating", {"handle": handle}),
+                detail="result payload is not a list",
+            )
         result: list[CFContestChange] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -233,11 +362,17 @@ class CodeforcesClient(CodeforcesClientBase):
     async def get_recent_submissions(self, handle: str, count: int = 500) -> list[CFSubmission]:
         safe_count = max(1, min(count, 5000))
         data = await self._get("user.status", {"handle": handle, "from": 1, "count": safe_count})
-        if data is None:
-            return []
         rows = data.get("result")
         if not isinstance(rows, list):
-            return []
+            raise CFRequestError(
+                endpoint="user.status",
+                failure_kind="parse",
+                requested_url=self._build_requested_url(
+                    "user.status",
+                    {"handle": handle, "from": 1, "count": safe_count},
+                ),
+                detail="result payload is not a list",
+            )
 
         submissions: list[CFSubmission] = []
         for row in rows:

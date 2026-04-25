@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import asyncio
-import time
 from collections import defaultdict
-from datetime import UTC, datetime
 from typing import Awaitable, Callable, Optional
 
 import discord
 from discord.ext import commands
 
-from db.repository import UserRepositoryBase, VerifiedUser
-from services.cf_client import CFSubmission, CodeforcesClientBase
+from db.repository import GymFeatureRepository, VerifiedUser
+from services.discord_output import send_context_lines_chunks, send_interaction_lines_chunks, send_interaction_text_chunks
+from services.cf_client import CFRequestError, CodeforcesClientBase
+from services.gym_service import GymService, normalize_problem_index, normalize_tag, problem_ref
 from services.guild_config import GuildConfigService
-
-PARTICIPATION_CACHE_SECONDS = 3600
-FORCE_REFRESH_SECONDS = 600
-SUBMISSION_CACHE_SECONDS = 3600
 
 COMMON_TAGS: tuple[str, ...] = (
     "implementation",
@@ -40,30 +35,6 @@ COMMON_TAGS: tuple[str, ...] = (
     "probabilities",
     "interactive",
 )
-
-
-def _normalize_problem_index(raw: str) -> str:
-    return raw.strip().upper()
-
-
-def _normalize_tag(raw: str) -> str:
-    return " ".join(raw.strip().lower().split())
-
-
-def _problem_ref(contest_id: int, problem_index: str) -> str:
-    return f"{contest_id}/{_normalize_problem_index(problem_index)}"
-
-
-def _weight_for_rating(rating: int) -> float:
-    if rating < 1200:
-        return 1.0
-    if rating < 1600:
-        return 1.3
-    if rating < 1900:
-        return 1.7
-    if rating < 2100:
-        return 2.1
-    return 2.6
 
 
 class ContestIdModal(discord.ui.Modal):
@@ -100,7 +71,7 @@ class ContestProblemModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message("Contest ID must be an integer.", ephemeral=True)
             return
-        problem_index = _normalize_problem_index(str(self.problem_index))
+        problem_index = normalize_problem_index(str(self.problem_index))
         if not problem_index:
             await interaction.response.send_message("Problem index cannot be empty.", ephemeral=True)
             return
@@ -132,7 +103,7 @@ class ContestProblemOptionalModal(discord.ui.Modal):
             return
 
         problem_index_raw = str(self.problem_index).strip()
-        problem_index = _normalize_problem_index(problem_index_raw) if problem_index_raw else None
+        problem_index = normalize_problem_index(problem_index_raw) if problem_index_raw else None
         await self._callback(interaction, contest_id, problem_index)
 
 
@@ -158,7 +129,7 @@ class RateProblemModal(discord.ui.Modal):
         if rating < 300 or rating > 5000:
             await interaction.response.send_message("Estimated rating must be between 300 and 5000.", ephemeral=True)
             return
-        problem_index = _normalize_problem_index(str(self.problem_index))
+        problem_index = normalize_problem_index(str(self.problem_index))
         if not problem_index:
             await interaction.response.send_message("Problem index cannot be empty.", ephemeral=True)
             return
@@ -200,7 +171,7 @@ class OtherTagModal(discord.ui.Modal):
         self._callback = callback
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        tag = _normalize_tag(str(self.tag))
+        tag = normalize_tag(str(self.tag))
         if not tag:
             await interaction.response.send_message("Tag cannot be empty.", ephemeral=True)
             return
@@ -368,7 +339,7 @@ class GymCog(commands.Cog, name="Gyms"):
     def __init__(
         self,
         bot: commands.Bot,
-        repo: UserRepositoryBase,
+        repo: GymFeatureRepository,
         cf: CodeforcesClientBase,
         config_service: GuildConfigService,
     ) -> None:
@@ -376,36 +347,23 @@ class GymCog(commands.Cog, name="Gyms"):
         self._repo = repo
         self._cf = cf
         self._config = config_service
-        self._submission_cache: dict[str, tuple[float, list[CFSubmission]]] = {}
-        self._submission_sem = asyncio.Semaphore(6)
+        self._gym_service = GymService(repo, cf)
 
     @staticmethod
-    def _chunk_lines(lines: list[str], max_len: int = 1900) -> list[str]:
-        chunks: list[str] = []
-        current: list[str] = []
-        size = 0
-        for line in lines:
-            addition = len(line) + (1 if current else 0)
-            if current and size + addition > max_len:
-                chunks.append("\n".join(current))
-                current = [line]
-                size = len(line)
-            else:
-                current.append(line)
-                size += addition
-        if current:
-            chunks.append("\n".join(current))
-        return chunks
+    def _cf_error_message(error: CFRequestError) -> str:
+        status_text = f", status {error.http_status}" if error.http_status is not None else ""
+        lines = [f"Request failed: endpoint {error.endpoint}{status_text} ({error.failure_kind})."]
+        if error.requested_url and error.failure_kind != "non_ok":
+            lines.append(f"URL: `{error.requested_url}`")
+        lines.append("Please try again in a minute.")
+        return "\n".join(lines)
 
     @staticmethod
     def _sorted_members(members: list[discord.Member]) -> list[discord.Member]:
         return sorted(members, key=lambda member: member.display_name.casefold())
 
     async def _send_ephemeral(self, interaction: discord.Interaction, content: str) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=True)
-            return
-        await interaction.response.send_message(content, ephemeral=True)
+        await send_interaction_text_chunks(interaction, content, ephemeral=True)
 
     @staticmethod
     def _guild_id_from_interaction(interaction: discord.Interaction) -> Optional[int]:
@@ -464,56 +422,7 @@ class GymCog(commands.Cog, name="Gyms"):
         return list(members_by_id.values())
 
     async def _verified_map(self, guild_id: int) -> dict[int, VerifiedUser]:
-        rows = await self._repo.get_all(guild_id)
-        return {row.discord_id: row for row in rows}
-
-    async def _get_submissions(self, handle: str, *, refresh_after_seconds: int = SUBMISSION_CACHE_SECONDS) -> list[CFSubmission]:
-        cache_key = handle.lower()
-        cached = self._submission_cache.get(cache_key)
-        now_ts = time.time()
-        if cached is not None:
-            ts, payload = cached
-            if now_ts - ts < refresh_after_seconds:
-                return payload
-        async with self._submission_sem:
-            payload = await self._cf.get_recent_submissions(handle, count=5000)
-        self._submission_cache[cache_key] = (time.time(), payload)
-        return payload
-
-    async def _solved_count_for_contest(
-        self,
-        handle: str,
-        contest_id: int,
-        *,
-        refresh_after_seconds: int,
-    ) -> int:
-        submissions = await self._get_submissions(handle, refresh_after_seconds=refresh_after_seconds)
-        solved = {
-            submission.problem_index
-            for submission in submissions
-            if submission.verdict == "OK"
-            and submission.contest_id == contest_id
-            and submission.problem_index is not None
-        }
-        return len(solved)
-
-    async def _user_solved_problem(
-        self,
-        handle: str,
-        contest_id: int,
-        problem_index: str,
-    ) -> bool:
-        submissions = await self._get_submissions(handle, refresh_after_seconds=SUBMISSION_CACHE_SECONDS)
-        target_index = _normalize_problem_index(problem_index)
-        for submission in submissions:
-            if submission.verdict != "OK":
-                continue
-            if submission.contest_id != contest_id:
-                continue
-            if submission.problem_index != target_index:
-                continue
-            return True
-        return False
+        return await self._gym_service.verified_map(guild_id)
 
     async def _can_modify_tags(
         self,
@@ -522,15 +431,12 @@ class GymCog(commands.Cog, name="Gyms"):
         contest_id: int,
         problem_index: str,
     ) -> tuple[bool, str]:
-        verified = await self._repo.get_by_discord_id(member.id, guild_id)
-        if verified is None:
-            return False, "You must be verified to modify gym tags."
-        if verified.rating >= 1600:
-            return True, ""
-        solved = await self._user_solved_problem(verified.cf_handle, contest_id, problem_index)
-        if solved:
-            return True, ""
-        return False, "Only solvers of this problem or Expert+ users can modify tags."
+        return await self._gym_service.can_modify_tags(
+            member_id=member.id,
+            guild_id=guild_id,
+            contest_id=contest_id,
+            problem_index=problem_index,
+        )
 
     async def _contest_participation(
         self,
@@ -541,104 +447,20 @@ class GymCog(commands.Cog, name="Gyms"):
         *,
         force: bool,
     ) -> tuple[dict[int, int], set[int]]:
-        now = datetime.now(tz=UTC)
-        refresh_age_seconds = FORCE_REFRESH_SECONDS if force else PARTICIPATION_CACHE_SECONDS
-        submission_refresh_seconds = FORCE_REFRESH_SECONDS if force else SUBMISSION_CACHE_SECONDS
-
-        cache_rows = await self._repo.get_gym_participation_cache(guild_id, contest_id)
-        cache_by_discord = {row.discord_id: row for row in cache_rows}
-
-        solved_by_discord: dict[int, int] = {}
-        unverified_ids: set[int] = set()
-        pending: list[tuple[int, str, int]] = []
-
-        for member in training_members:
-            verified = verified_by_id.get(member.id)
-            if verified is None:
-                unverified_ids.add(member.id)
-                continue
-            cached = cache_by_discord.get(member.id)
-            if cached is not None:
-                age = (now - cached.checked_at).total_seconds()
-                if age < refresh_age_seconds:
-                    solved_by_discord[member.id] = cached.solved_count
-                    continue
-            previous_solved_count = cached.solved_count if cached is not None else 0
-            pending.append((member.id, verified.cf_handle, previous_solved_count))
-
-        async def _refresh_one(discord_id: int, handle: str, previous_solved_count: int) -> tuple[int, int]:
-            fetched_solved_count = await self._solved_count_for_contest(
-                handle,
-                contest_id,
-                refresh_after_seconds=submission_refresh_seconds,
-            )
-            solved_count = max(previous_solved_count, fetched_solved_count)
-            await self._repo.upsert_gym_participation_cache(
-                guild_id,
-                contest_id,
-                discord_id,
-                solved_count,
-                now,
-            )
-            return discord_id, solved_count
-
-        if pending:
-            refreshed = await asyncio.gather(
-                *[
-                    _refresh_one(discord_id, handle, previous_solved_count)
-                    for discord_id, handle, previous_solved_count in pending
-                ]
-            )
-            for discord_id, solved_count in refreshed:
-                solved_by_discord[discord_id] = solved_count
-
-        return solved_by_discord, unverified_ids
+        training_member_ids = [member.id for member in training_members]
+        return await self._gym_service.contest_participation(
+            guild_id=guild_id,
+            contest_id=contest_id,
+            training_member_ids=training_member_ids,
+            verified_by_id=verified_by_id,
+            force=force,
+        )
 
     async def _problem_rating_summary(self, guild_id: int, contest_id: int, problem_index: str) -> dict[str, float]:
-        votes = await self._repo.list_gym_problem_rating_votes(guild_id, contest_id, problem_index)
-        verified = await self._verified_map(guild_id)
-
-        included = []
-        for vote in votes:
-            verifier = verified.get(vote.discord_id)
-            if verifier is None:
-                continue
-            included.append((vote.estimated_rating, _weight_for_rating(verifier.rating)))
-
-        if not included:
-            return {"count": 0.0, "avg": 0.0, "weighted_avg": 0.0}
-
-        avg = sum(v for v, _ in included) / len(included)
-        weight_sum = sum(w for _, w in included)
-        weighted_avg = sum(v * w for v, w in included) / weight_sum if weight_sum > 0 else avg
-        return {
-            "count": float(len(included)),
-            "avg": avg,
-            "weighted_avg": weighted_avg,
-        }
+        return await self._gym_service.problem_rating_summary(guild_id, contest_id, problem_index)
 
     async def _gym_quality_summary(self, guild_id: int, contest_id: int) -> dict[str, float]:
-        votes = await self._repo.list_gym_quality_votes(guild_id, contest_id)
-        verified = await self._verified_map(guild_id)
-
-        included = []
-        for vote in votes:
-            verifier = verified.get(vote.discord_id)
-            if verifier is None:
-                continue
-            included.append((vote.quality, _weight_for_rating(verifier.rating)))
-
-        if not included:
-            return {"count": 0.0, "avg": 0.0, "weighted_avg": 0.0}
-
-        avg = sum(v for v, _ in included) / len(included)
-        weight_sum = sum(w for _, w in included)
-        weighted_avg = sum(v * w for v, w in included) / weight_sum if weight_sum > 0 else avg
-        return {
-            "count": float(len(included)),
-            "avg": avg,
-            "weighted_avg": weighted_avg,
-        }
+        return await self._gym_service.gym_quality_summary(guild_id, contest_id)
 
     @commands.command(
         name="gym",
@@ -744,13 +566,17 @@ class GymCog(commands.Cog, name="Gyms"):
         cache_note = "force(10m)" if force else "normal(1h cache)"
 
         for gym in gyms:
-            solved_by_discord, unverified_ids = await self._contest_participation(
-                ctx.guild.id,
-                gym.contest_id,
-                training_members,
-                verified_by_id,
-                force=force,
-            )
+            try:
+                solved_by_discord, unverified_ids = await self._contest_participation(
+                    ctx.guild.id,
+                    gym.contest_id,
+                    training_members,
+                    verified_by_id,
+                    force=force,
+                )
+            except CFRequestError as exc:
+                await ctx.send(self._cf_error_message(exc))
+                return
 
             not_participated = self._sorted_members(
                 [
@@ -779,8 +605,7 @@ class GymCog(commands.Cog, name="Gyms"):
                     lines.append(f"Unverified trainees (cannot track CF handle) ({len(unverified_members)}):")
                     lines.extend(member.mention for member in unverified_members)
 
-            for chunk in self._chunk_lines(lines):
-                await ctx.send(chunk)
+            await send_context_lines_chunks(ctx, lines)
 
     async def _start_add_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -834,10 +659,7 @@ class GymCog(commands.Cog, name="Gyms"):
             owner_text = owner.mention if owner is not None else f"`{gym.created_by}`"
             created_text = gym.created_at.strftime("%Y-%m-%d")
             lines.append(f"- `{gym.contest_id}` | `{gym.gym_type}` | by {owner_text} | {created_text}")
-        chunks = self._chunk_lines(lines)
-        await interaction.response.send_message(chunks[0], ephemeral=True)
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk, ephemeral=True)
+        await send_interaction_lines_chunks(interaction, lines, ephemeral=True)
 
     async def _open_add_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -847,7 +669,7 @@ class GymCog(commands.Cog, name="Gyms"):
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
         await interaction.response.send_message(
-            f"Choose a tag for `{_problem_ref(contest_id, problem_index)}`:",
+            f"Choose a tag for `{problem_ref(contest_id, problem_index)}`:",
             view=TagAddView(self, interaction.user.id, guild_id, contest_id, problem_index),
             ephemeral=True,
         )
@@ -864,11 +686,15 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
-        allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        try:
+            allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        except CFRequestError as exc:
+            await self._send_ephemeral(interaction, self._cf_error_message(exc))
+            return
         if not allowed:
             await self._send_ephemeral(interaction, reason)
             return
-        normalized_tag = _normalize_tag(tag)
+        normalized_tag = normalize_tag(tag)
         if not normalized_tag:
             await self._send_ephemeral(interaction, "Tag cannot be empty.")
             return
@@ -882,12 +708,12 @@ class GymCog(commands.Cog, name="Gyms"):
         if inserted:
             await self._send_ephemeral(
                 interaction,
-                f"Added tag `{normalized_tag}` to `{_problem_ref(contest_id, problem_index)}`.",
+                f"Added tag `{normalized_tag}` to `{problem_ref(contest_id, problem_index)}`.",
             )
             return
         await self._send_ephemeral(
             interaction,
-            f"Tag `{normalized_tag}` already exists for `{_problem_ref(contest_id, problem_index)}`.",
+            f"Tag `{normalized_tag}` already exists for `{problem_ref(contest_id, problem_index)}`.",
         )
 
     async def _open_delete_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
@@ -903,7 +729,7 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.send_message("No tags found for that problem.", ephemeral=True)
             return
         await interaction.response.send_message(
-            f"Select tag to remove from `{_problem_ref(contest_id, problem_index)}`:",
+            f"Select tag to remove from `{problem_ref(contest_id, problem_index)}`:",
             view=TagDeleteView(
                 self,
                 interaction.user.id,
@@ -927,7 +753,11 @@ class GymCog(commands.Cog, name="Gyms"):
             await interaction.response.defer(ephemeral=True)
         if not await self._ensure_gym_exists(interaction, contest_id, guild_id=guild_id):
             return
-        allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        try:
+            allowed, reason = await self._can_modify_tags(interaction.user, guild_id, contest_id, problem_index)
+        except CFRequestError as exc:
+            await self._send_ephemeral(interaction, self._cf_error_message(exc))
+            return
         if not allowed:
             await self._send_ephemeral(interaction, reason)
             return
@@ -935,7 +765,7 @@ class GymCog(commands.Cog, name="Gyms"):
         if removed:
             await self._send_ephemeral(
                 interaction,
-                f"Removed tag `{tag}` from `{_problem_ref(contest_id, problem_index)}`.",
+                f"Removed tag `{tag}` from `{problem_ref(contest_id, problem_index)}`.",
             )
             return
         await self._send_ephemeral(interaction, "Tag not found.")
@@ -961,7 +791,7 @@ class GymCog(commands.Cog, name="Gyms"):
         lines = [f"Tags for contest `{contest_id}`:"]
         for idx in sorted(grouped):
             lines.append(f"- {idx}: {', '.join(sorted(grouped[idx]))}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await send_interaction_lines_chunks(interaction, lines, ephemeral=True)
 
     async def _rate_problem(self, interaction: discord.Interaction, contest_id: int, problem_index: str, rating: int) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -987,7 +817,7 @@ class GymCog(commands.Cog, name="Gyms"):
         )
         summary = await self._problem_rating_summary(guild_id, contest_id, problem_index)
         await interaction.response.send_message(
-            f"Saved vote for `{_problem_ref(contest_id, problem_index)}`.\n"
+            f"Saved vote for `{problem_ref(contest_id, problem_index)}`.\n"
             f"Votes: **{int(summary['count'])}** | Avg: **{summary['avg']:.1f}** | "
             f"Weighted Avg: **{summary['weighted_avg']:.1f}**",
             ephemeral=True,
@@ -1013,8 +843,9 @@ class GymCog(commands.Cog, name="Gyms"):
                 f"Avg: {summary['avg']:.1f} | "
                 f"Weighted Avg: {summary['weighted_avg']:.1f}"
             )
-        await interaction.response.send_message(
-            f"**{_problem_ref(contest_id, problem_index)}**\nTags: {tags_text}\nRatings: {rating_text}",
+        await send_interaction_text_chunks(
+            interaction,
+            f"**{problem_ref(contest_id, problem_index)}**\nTags: {tags_text}\nRatings: {rating_text}",
             ephemeral=True,
         )
 

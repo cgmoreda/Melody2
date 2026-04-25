@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from services.contest_reminder import CFContest, ContestReminderService
+
+
+class _PersistentReminderRepo:
+    def __init__(self) -> None:
+        self._sent: set[tuple[int, int, int, str]] = set()
+        self.has_calls = 0
+        self.mark_calls = 0
+
+    async def get_reminder_channels(self) -> list[tuple[int, int]]:
+        return []
+
+    async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
+        return 0
+
+    async def has_sent_contest_reminder(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+    ) -> bool:
+        self.has_calls += 1
+        return (guild_id, channel_id, contest_id, reminder_type) in self._sent
+
+    async def mark_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+        sent_at: datetime,
+    ) -> bool:
+        self.mark_calls += 1
+        key = (guild_id, channel_id, contest_id, reminder_type)
+        if key in self._sent:
+            return False
+        self._sent.add(key)
+        return True
+
+
+class _FakeTextChannel:
+    def __init__(self, channel_id: int) -> None:
+        self.id = channel_id
+        self.messages: list[str] = []
+
+    async def send(self, message: str) -> None:
+        await asyncio.sleep(0.02)
+        self.messages.append(message)
+
+
+def _service(repo: _PersistentReminderRepo) -> ContestReminderService:
+    return ContestReminderService(
+        session=object(),  # type: ignore[arg-type]
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        poll_seconds=300,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reminder_attempts_send_once_and_mark_once() -> None:
+    repo = _PersistentReminderRepo()
+    service = _service(repo)
+    channel = _FakeTextChannel(12345)
+    contest = CFContest(
+        contest_id=2062,
+        name="Codeforces Round 2062 (Div. 2)",
+        start_time_seconds=int(datetime.now(tz=UTC).timestamp()) + 24 * 3600,
+    )
+
+    async def _attempt() -> None:
+        await service._maybe_send_reminder(
+            guild_id=77,
+            channel=channel,  # type: ignore[arg-type]
+            contest=contest,
+            reminder_type="24h",
+            target=timedelta(hours=24),
+            window=timedelta(minutes=5),
+            message="[Reminder] test starts in 24h",
+            until_start=timedelta(hours=24) - timedelta(seconds=30),
+        )
+
+    await asyncio.gather(_attempt(), _attempt())
+
+    assert channel.messages == ["[Reminder] test starts in 24h"]
+    assert repo.mark_calls == 1
+    assert repo.has_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_persisted_dedupe_survives_restart_like_new_service_instance() -> None:
+    repo = _PersistentReminderRepo()
+    channel = _FakeTextChannel(54321)
+    contest = CFContest(
+        contest_id=1888,
+        name="Codeforces Round 1888 (Div. 3)",
+        start_time_seconds=int(datetime.now(tz=UTC).timestamp()) + 3600,
+    )
+
+    service_before_restart = _service(repo)
+    await service_before_restart._maybe_send_reminder(
+        guild_id=99,
+        channel=channel,  # type: ignore[arg-type]
+        contest=contest,
+        reminder_type="1h",
+        target=timedelta(hours=1),
+        window=timedelta(minutes=5),
+        message="[Reminder] test starts in 1h",
+        until_start=timedelta(hours=1) - timedelta(seconds=20),
+    )
+
+    service_after_restart = _service(repo)
+    await service_after_restart._maybe_send_reminder(
+        guild_id=99,
+        channel=channel,  # type: ignore[arg-type]
+        contest=contest,
+        reminder_type="1h",
+        target=timedelta(hours=1),
+        window=timedelta(minutes=5),
+        message="[Reminder] test starts in 1h",
+        until_start=timedelta(hours=1) - timedelta(seconds=10),
+    )
+
+    assert channel.messages == ["[Reminder] test starts in 1h"]
+    assert repo.mark_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_persisted_dedupe_key_skips_send_and_mark() -> None:
+    repo = _PersistentReminderRepo()
+    repo._sent.add((123, 456, 789, "24h"))
+    service = _service(repo)
+    channel = _FakeTextChannel(456)
+    contest = CFContest(
+        contest_id=789,
+        name="Codeforces Round 789 (Div. 2)",
+        start_time_seconds=int(datetime.now(tz=UTC).timestamp()) + 24 * 3600,
+    )
+
+    await service._maybe_send_reminder(
+        guild_id=123,
+        channel=channel,  # type: ignore[arg-type]
+        contest=contest,
+        reminder_type="24h",
+        target=timedelta(hours=24),
+        window=timedelta(minutes=5),
+        message="[Reminder] already persisted",
+        until_start=timedelta(hours=24) - timedelta(seconds=1),
+    )
+
+    assert channel.messages == []
+    assert repo.has_calls >= 1
+    assert repo.mark_calls == 0

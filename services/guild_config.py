@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from db.repository import GuildCommandConfig, UserRepositoryBase
+from db.repository import GuildCommandConfig, GuildConfigRepository
 
 
 DEFAULT_COMMAND_CONFIG = GuildCommandConfig(
@@ -66,7 +66,7 @@ TEXT_CONFIG_SPECS: dict[str, tuple[int, str]] = {
 
 
 class GuildConfigService:
-    def __init__(self, repo: UserRepositoryBase) -> None:
+    def __init__(self, repo: GuildConfigRepository) -> None:
         self._repo = repo
         self._cache: dict[int, GuildCommandConfig] = {}
         self._text_cache: dict[int, dict[str, str]] = {}
