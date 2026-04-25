@@ -9,7 +9,7 @@ from typing import Optional
 import aiohttp
 import discord
 
-from db.repository import UserRepositoryBase
+from db.repository import ReminderRepository
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class ContestReminderService:
         *,
         session: aiohttp.ClientSession,
         bot: discord.Client,
-        repo: UserRepositoryBase,
+        repo: ReminderRepository,
         poll_seconds: int = 300,
     ) -> None:
         self._session = session

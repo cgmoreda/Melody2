@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from cogs.gym import GymCog
 from db.repository import GymQualityVote, VerifiedUser
+from services.gym_service import GymService
 
 
 class _FakeRepo:
@@ -18,6 +18,11 @@ class _FakeRepo:
 
     async def list_gym_quality_votes(self, guild_id: int, contest_id: int) -> list[GymQualityVote]:
         return [row for row in self._votes if row.guild_id == guild_id and row.contest_id == contest_id]
+
+
+class _FakeCF:
+    async def get_recent_submissions(self, handle: str, count: int = 5000) -> list[object]:
+        return []
 
 
 @pytest.mark.asyncio
@@ -36,13 +41,11 @@ async def test_gym_quality_summary_weighted_and_verified_only() -> None:
         GymQualityVote(guild_id, contest_id, 33, 5, now, now),  # ignored (not verified)
     ]
 
-    cog = GymCog(
-        bot=object(),  # type: ignore[arg-type]
+    service = GymService(
         repo=_FakeRepo(verified, votes),  # type: ignore[arg-type]
-        cf=object(),  # type: ignore[arg-type]
-        config_service=object(),  # type: ignore[arg-type]
+        cf=_FakeCF(),  # type: ignore[arg-type]
     )
-    summary = await cog._gym_quality_summary(guild_id, contest_id)
+    summary = await service.gym_quality_summary(guild_id, contest_id)
 
     assert summary["count"] == pytest.approx(2.0)
     assert summary["avg"] == pytest.approx(3.0)
@@ -57,12 +60,10 @@ async def test_gym_quality_summary_empty_when_no_verified_votes() -> None:
     now = datetime.now(tz=UTC)
 
     votes = [GymQualityVote(guild_id, contest_id, 44, 4, now, now)]
-    cog = GymCog(
-        bot=object(),  # type: ignore[arg-type]
+    service = GymService(
         repo=_FakeRepo([], votes),  # type: ignore[arg-type]
-        cf=object(),  # type: ignore[arg-type]
-        config_service=object(),  # type: ignore[arg-type]
+        cf=_FakeCF(),  # type: ignore[arg-type]
     )
-    summary = await cog._gym_quality_summary(guild_id, contest_id)
+    summary = await service.gym_quality_summary(guild_id, contest_id)
 
     assert summary == {"count": 0.0, "avg": 0.0, "weighted_avg": 0.0}

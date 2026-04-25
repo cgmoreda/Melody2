@@ -4,7 +4,7 @@ import abc
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Protocol
 
 import asyncpg
 
@@ -100,6 +100,238 @@ class PendingVerification:
     verification_code: str
     created_at: datetime
     expires_at: datetime
+
+
+class VerificationReadRepository(Protocol):
+    async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
+        ...
+
+    async def get_all(self, guild_id: int) -> list[VerifiedUser]:
+        ...
+
+
+class VerificationRepository(VerificationReadRepository, Protocol):
+    async def upsert(self, user: VerifiedUser) -> None:
+        ...
+
+    async def upsert_pending_verification(
+        self,
+        *,
+        guild_id: int,
+        discord_id: int,
+        cf_handle: str,
+        verification_code: str,
+        created_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        ...
+
+    async def get_pending_verification(self, guild_id: int, discord_id: int) -> Optional[PendingVerification]:
+        ...
+
+    async def delete_pending_verification(self, guild_id: int, discord_id: int) -> bool:
+        ...
+
+
+class ReminderRepository(Protocol):
+    async def add_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        ...
+
+    async def remove_reminder_channel(self, guild_id: int, channel_id: int) -> bool:
+        ...
+
+    async def get_reminder_channels(self) -> list[tuple[int, int]]:
+        ...
+
+    async def has_sent_contest_reminder(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+    ) -> bool:
+        ...
+
+    async def mark_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: int,
+        reminder_type: str,
+        sent_at: datetime,
+    ) -> bool:
+        ...
+
+    async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
+        ...
+
+
+class CoachRepository(Protocol):
+    async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
+        ...
+
+    async def upsert_coach_config(self, config: CoachConfig) -> None:
+        ...
+
+    async def delete_coach_config(self, guild_id: int) -> bool:
+        ...
+
+
+class VoiceRepository(Protocol):
+    async def start_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        channel_id: int,
+        channel_name: str,
+        is_solo: bool,
+        started_at: datetime,
+    ) -> None:
+        ...
+
+    async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
+        ...
+
+    async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
+        ...
+
+    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
+        ...
+
+    async def get_solo_voice_totals(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        since: Optional[datetime] = None,
+    ) -> dict[int, float]:
+        ...
+
+    async def get_solo_voice_summary(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        week_since: datetime,
+        month_since: datetime,
+    ) -> dict[int, dict[str, float]]:
+        ...
+
+
+class GuildConfigRepository(Protocol):
+    async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
+        ...
+
+    async def upsert_guild_command_config(self, config: GuildCommandConfig) -> None:
+        ...
+
+    async def delete_guild_command_config(self, guild_id: int) -> bool:
+        ...
+
+    async def get_guild_text_config(self, guild_id: int, key: str) -> Optional[str]:
+        ...
+
+    async def list_guild_text_configs(self, guild_id: int) -> dict[str, str]:
+        ...
+
+    async def upsert_guild_text_config(self, guild_id: int, key: str, value: str) -> None:
+        ...
+
+    async def delete_guild_text_config(self, guild_id: int, key: str) -> bool:
+        ...
+
+
+class GymRepository(Protocol):
+    async def upsert_gym_contest(self, guild_id: int, contest_id: int, gym_type: str, created_by: int) -> None:
+        ...
+
+    async def get_gym_contest(self, guild_id: int, contest_id: int) -> Optional[GymContest]:
+        ...
+
+    async def list_gym_contests(self, guild_id: int) -> list[GymContest]:
+        ...
+
+    async def add_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+        created_by: int,
+    ) -> bool:
+        ...
+
+    async def remove_gym_problem_tag(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        tag: str,
+    ) -> bool:
+        ...
+
+    async def list_gym_problem_tags(self, guild_id: int, contest_id: int) -> list[GymProblemTag]:
+        ...
+
+    async def upsert_gym_problem_rating_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+        discord_id: int,
+        estimated_rating: int,
+    ) -> None:
+        ...
+
+    async def list_gym_problem_rating_votes(
+        self,
+        guild_id: int,
+        contest_id: int,
+        problem_index: str,
+    ) -> list[GymProblemRatingVote]:
+        ...
+
+    async def upsert_gym_quality_vote(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        quality: int,
+    ) -> None:
+        ...
+
+    async def list_gym_quality_votes(self, guild_id: int, contest_id: int) -> list[GymQualityVote]:
+        ...
+
+    async def delete_gym_contest(self, guild_id: int, contest_id: int) -> bool:
+        ...
+
+    async def reset_gym_contest_data(self, guild_id: int, contest_id: int) -> None:
+        ...
+
+    async def get_gym_participation_cache(self, guild_id: int, contest_id: int) -> list[GymParticipationCache]:
+        ...
+
+    async def upsert_gym_participation_cache(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        solved_count: int,
+        checked_at: datetime,
+    ) -> None:
+        ...
+
+    async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:
+        ...
+
+
+class VoiceFeatureRepository(VoiceRepository, VerificationReadRepository, Protocol):
+    ...
+
+
+class GymFeatureRepository(GymRepository, VerificationReadRepository, Protocol):
+    ...
 
 
 class UserRepositoryBase(abc.ABC):

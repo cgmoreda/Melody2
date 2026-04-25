@@ -12,7 +12,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from db.repository import UserRepositoryBase, VerifiedUser
+from db.repository import VerificationRepository, VerifiedUser
 from services.discord_output import (
     DISCORD_EMBED_FIELD_VALUE_LIMIT,
     clip_embed_description,
@@ -54,7 +54,7 @@ class VerificationCog(commands.Cog, name="Verification"):
         self,
         cf_client: CodeforcesClientBase,
         role_assigner: RoleAssignerBase,
-        repo: UserRepositoryBase,
+        repo: VerificationRepository,
         config_service: GuildConfigService,
         reminder_service: Optional[ContestReminderService],
     ) -> None:

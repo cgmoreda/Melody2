@@ -8,7 +8,7 @@ from typing import Optional
 
 import discord
 
-from db.repository import CoachConfig, UserRepositoryBase
+from db.repository import CoachConfig, CoachRepository
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class ApprovalView(discord.ui.View):
 class CoachSecretary(CoachSecretaryBase):
     """Concrete coach routing service with approval workflow."""
 
-    def __init__(self, repo: UserRepositoryBase) -> None:
+    def __init__(self, repo: CoachRepository) -> None:
         self._repo = repo
         self._notified: dict[int, set[int]] = {}
         self._configs: dict[int, CoachConfig] = {}
