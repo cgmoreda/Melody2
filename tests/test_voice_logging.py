@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from cogs.voice_logging import VoiceLoggingCog
+from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 
 
 class _FakeMember:
@@ -166,3 +167,16 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
     assert start_call["started_at"].tzinfo is UTC
 
     assert sorted(started_watchdogs) == [1, 2]
+
+
+def test_render_ranked_message_is_capped_to_discord_limit() -> None:
+    lines = [f"#{index:03d} {'user' * 12} 1234.56h" for index in range(1, 300)]
+    rendered = VoiceLoggingCog._render_ranked_message(
+        title="**Solo Voice Hours (all time)**",
+        lines=lines,
+        max_lines=250,
+        overflow_label="users",
+    )
+
+    assert len(rendered) <= DISCORD_MESSAGE_CHAR_LIMIT
+    assert rendered.count("```") % 2 == 0

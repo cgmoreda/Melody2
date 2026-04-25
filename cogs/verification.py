@@ -13,6 +13,12 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase, VerifiedUser
+from services.discord_output import (
+    DISCORD_EMBED_FIELD_VALUE_LIMIT,
+    clip_embed_description,
+    clip_text,
+    split_embed_description_chunks,
+)
 from services.cf_client import CFContestChange, CFRequestError, CFSubmission, CFUserInfo, CodeforcesClientBase
 from services.contest_reminder import ContestReminderService
 from services.guild_config import GuildConfigService
@@ -57,6 +63,41 @@ class VerificationCog(commands.Cog, name="Verification"):
         self._repo = repo
         self._config = config_service
         self._reminders = reminder_service
+
+    @staticmethod
+    def _build_roundchanges_embeds(
+        *,
+        displayed_lines: list[str],
+        contest_name: str,
+        contest_id: int,
+        verified_users: int,
+        hidden_count: int,
+    ) -> list[discord.Embed]:
+        descriptions = split_embed_description_chunks("\n".join(displayed_lines))
+        total_pages = len(descriptions)
+        round_value = clip_text(contest_name, limit=DISCORD_EMBED_FIELD_VALUE_LIMIT)
+
+        embeds: list[discord.Embed] = []
+        for index, description in enumerate(descriptions, start=1):
+            title = "Server Round Changes" if total_pages == 1 else f"Server Round Changes ({index}/{total_pages})"
+            embed = discord.Embed(
+                title=title,
+                description=clip_embed_description(description),
+                colour=discord.Colour.gold(),
+            )
+            embed.add_field(name="Round", value=round_value or "-", inline=False)
+            embed.add_field(name="Contest ID", value=str(contest_id), inline=True)
+            embed.add_field(name="Verified Users", value=str(verified_users), inline=True)
+
+            if index == total_pages:
+                if hidden_count > 0:
+                    embed.set_footer(text=f"{hidden_count} more users not shown due to message length.")
+                else:
+                    embed.set_footer(text="Data fetched live from Codeforces.")
+            else:
+                embed.set_footer(text=f"Page {index}/{total_pages}")
+            embeds.append(embed)
+        return embeds
 
     @staticmethod
     def _build_verify_embed(handle: str, code: str, expires_in_minutes: int) -> discord.Embed:
@@ -493,20 +534,14 @@ class VerificationCog(commands.Cog, name="Verification"):
         displayed = lines[: config.roundchanges_max_lines]
         hidden_count = len(lines) - len(displayed)
 
-        embed = discord.Embed(
-            title="Server Round Changes",
-            description="\n".join(displayed),
-            colour=discord.Colour.gold(),
-        )
-        embed.add_field(name="Round", value=target_contest_name, inline=False)
-        embed.add_field(name="Contest ID", value=str(target_contest_id), inline=True)
-        embed.add_field(name="Verified Users", value=str(len(users)), inline=True)
-
-        if hidden_count > 0:
-            embed.set_footer(text=f"{hidden_count} more users not shown due to message length.")
-        else:
-            embed.set_footer(text="Data fetched live from Codeforces.")
-        await ctx.send(embed=embed)
+        for embed in self._build_roundchanges_embeds(
+            displayed_lines=displayed,
+            contest_name=target_contest_name,
+            contest_id=target_contest_id,
+            verified_users=len(users),
+            hidden_count=hidden_count,
+        ):
+            await ctx.send(embed=embed)
 
     @commands.group(name="reminder", invoke_without_command=True)
     @commands.guild_only()

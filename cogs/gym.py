@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase, VerifiedUser
+from services.discord_output import send_context_lines_chunks, send_interaction_lines_chunks, send_interaction_text_chunks
 from services.cf_client import CFRequestError, CFSubmission, CodeforcesClientBase
 from services.guild_config import GuildConfigService
 
@@ -389,32 +390,11 @@ class GymCog(commands.Cog, name="Gyms"):
         return "\n".join(lines)
 
     @staticmethod
-    def _chunk_lines(lines: list[str], max_len: int = 1900) -> list[str]:
-        chunks: list[str] = []
-        current: list[str] = []
-        size = 0
-        for line in lines:
-            addition = len(line) + (1 if current else 0)
-            if current and size + addition > max_len:
-                chunks.append("\n".join(current))
-                current = [line]
-                size = len(line)
-            else:
-                current.append(line)
-                size += addition
-        if current:
-            chunks.append("\n".join(current))
-        return chunks
-
-    @staticmethod
     def _sorted_members(members: list[discord.Member]) -> list[discord.Member]:
         return sorted(members, key=lambda member: member.display_name.casefold())
 
     async def _send_ephemeral(self, interaction: discord.Interaction, content: str) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=True)
-            return
-        await interaction.response.send_message(content, ephemeral=True)
+        await send_interaction_text_chunks(interaction, content, ephemeral=True)
 
     @staticmethod
     def _guild_id_from_interaction(interaction: discord.Interaction) -> Optional[int]:
@@ -792,8 +772,7 @@ class GymCog(commands.Cog, name="Gyms"):
                     lines.append(f"Unverified trainees (cannot track CF handle) ({len(unverified_members)}):")
                     lines.extend(member.mention for member in unverified_members)
 
-            for chunk in self._chunk_lines(lines):
-                await ctx.send(chunk)
+            await send_context_lines_chunks(ctx, lines)
 
     async def _start_add_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -847,10 +826,7 @@ class GymCog(commands.Cog, name="Gyms"):
             owner_text = owner.mention if owner is not None else f"`{gym.created_by}`"
             created_text = gym.created_at.strftime("%Y-%m-%d")
             lines.append(f"- `{gym.contest_id}` | `{gym.gym_type}` | by {owner_text} | {created_text}")
-        chunks = self._chunk_lines(lines)
-        await interaction.response.send_message(chunks[0], ephemeral=True)
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk, ephemeral=True)
+        await send_interaction_lines_chunks(interaction, lines, ephemeral=True)
 
     async def _open_add_tag(self, interaction: discord.Interaction, contest_id: int, problem_index: str) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -982,7 +958,7 @@ class GymCog(commands.Cog, name="Gyms"):
         lines = [f"Tags for contest `{contest_id}`:"]
         for idx in sorted(grouped):
             lines.append(f"- {idx}: {', '.join(sorted(grouped[idx]))}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await send_interaction_lines_chunks(interaction, lines, ephemeral=True)
 
     async def _rate_problem(self, interaction: discord.Interaction, contest_id: int, problem_index: str, rating: int) -> None:
         guild_id = self._guild_id_from_interaction(interaction)
@@ -1034,7 +1010,8 @@ class GymCog(commands.Cog, name="Gyms"):
                 f"Avg: {summary['avg']:.1f} | "
                 f"Weighted Avg: {summary['weighted_avg']:.1f}"
             )
-        await interaction.response.send_message(
+        await send_interaction_text_chunks(
+            interaction,
             f"**{_problem_ref(contest_id, problem_index)}**\nTags: {tags_text}\nRatings: {rating_text}",
             ephemeral=True,
         )

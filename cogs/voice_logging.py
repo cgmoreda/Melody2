@@ -9,6 +9,13 @@ import discord
 from discord.ext import commands
 
 from db.repository import UserRepositoryBase
+from services.discord_output import (
+    DISCORD_MESSAGE_CHAR_LIMIT,
+    clip_text,
+    send_context_lines_chunks,
+    send_context_text_chunks,
+    split_lines_chunks,
+)
 from services.guild_config import GuildConfigService
 
 
@@ -271,30 +278,20 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
     @staticmethod
     def _render_ranked_message(*, title: str, lines: list[str], max_lines: int, overflow_label: str) -> str:
-        shown = lines[: max_lines + 1]
-        parts = [title, "```text", *shown, "```"]
-        remaining_count = max(0, len(lines) - len(shown))
-        if remaining_count > 0:
-            parts.append(f"... and {remaining_count} more {overflow_label}")
-        return "\n".join(parts)
+        visible_limit = min(len(lines), max_lines + 1)
 
-    @staticmethod
-    def _chunk_text(text: str, max_len: int = 1900) -> list[str]:
-        chunks: list[str] = []
-        current: list[str] = []
-        size = 0
-        for line in text.splitlines():
-            addition = len(line) + (1 if current else 0)
-            if current and size + addition > max_len:
-                chunks.append("\n".join(current))
-                current = [line]
-                size = len(line)
-            else:
-                current.append(line)
-                size += addition
-        if current:
-            chunks.append("\n".join(current))
-        return chunks
+        while visible_limit > 0:
+            shown = lines[:visible_limit]
+            parts = [title, "```text", *shown, "```"]
+            remaining_count = max(0, len(lines) - visible_limit)
+            if remaining_count > 0:
+                parts.append(f"... and {remaining_count} more {overflow_label}")
+            rendered = "\n".join(parts)
+            if len(rendered) <= DISCORD_MESSAGE_CHAR_LIMIT:
+                return rendered
+            visible_limit -= 1
+
+        return clip_text(f"{title}\n```text\n```", limit=DISCORD_MESSAGE_CHAR_LIMIT)
 
     @staticmethod
     def _find_rank(totals: dict[int, float], discord_id: int) -> Optional[tuple[int, float]]:
@@ -458,7 +455,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if rank_data is not None:
                     rank, seconds = rank_data
                     content = f"{content}\nYour rank: **#{rank}** with **{_hours(seconds)}**"
-                await ctx.send(content)
+                await send_context_text_chunks(ctx, content)
                 return
 
             if mode == "tahzeeq":
@@ -537,8 +534,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         f"{scolding}"
                     )
 
-                for chunk in self._chunk_text("\n".join(lines)):
-                    await ctx.send(chunk)
+                await send_context_lines_chunks(ctx, lines)
                 return
 
             if mode == "me":
@@ -602,13 +598,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     return
 
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                await ctx.send(
+                await send_context_text_chunks(
+                    ctx,
                     self._render_ranked_message(
                         title=f"**Solo Voice Hours for {target_role.name} ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="users",
-                    )
+                    ),
                 )
                 return
 
@@ -643,13 +640,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 for index, (role_name, seconds, member_count) in enumerate(role_totals, start=1):
                     lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds):<8} {member_count}")
 
-                await ctx.send(
+                await send_context_text_chunks(
+                    ctx,
                     self._render_ranked_message(
                         title=f"**Team Role Solo Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="roles",
-                    )
+                    ),
                 )
                 return
 
@@ -664,13 +662,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("No solo-channel voice logs found for that period.")
                     return
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                await ctx.send(
+                await send_context_text_chunks(
+                    ctx,
                     self._render_ranked_message(
                         title=f"**Solo Voice Hours ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="users",
-                    )
+                    ),
                 )
                 return
 
@@ -711,17 +710,18 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 f"{_hours(month.get(discord_id, 0.0))} | {_hours(all_time.get(discord_id, 0.0))}"
             )
 
-        header = "**Rank | Handle | Last Week | Last Month | All Time**\n"
-        body = "\n".join(lines[: config.voicehours_max_lines])
-        extra = len(lines) - min(len(lines), config.voicehours_max_lines)
+        message_lines = ["**Rank | Handle | Last Week | Last Month | All Time**"]
+        displayed_lines = lines[: config.voicehours_max_lines]
+        message_lines.extend(displayed_lines)
+        extra = len(lines) - len(displayed_lines)
         if extra > 0:
-            body += f"\n... and {extra} more users"
+            message_lines.append(f"... and {extra} more users")
         rank_data = self._find_rank(all_time, ctx.author.id)
-        footer = ""
         if rank_data is not None:
             rank, seconds = rank_data
-            footer = f"\nYour all-time rank: **#{rank}** with **{_hours(seconds)}**"
-        await ctx.send(header + body + footer)
+            message_lines.append(f"Your all-time rank: **#{rank}** with **{_hours(seconds)}**")
+        for chunk in split_lines_chunks(message_lines):
+            await ctx.send(chunk)
 
 
 async def setup(bot: commands.Bot) -> None:

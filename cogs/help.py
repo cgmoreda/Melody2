@@ -5,6 +5,16 @@ from difflib import get_close_matches
 import discord
 from discord.ext import commands
 
+from services.discord_output import (
+    DISCORD_EMBED_MAX_FIELDS,
+    DISCORD_EMBED_FIELD_VALUE_LIMIT,
+    DISCORD_EMBED_TOTAL_CHAR_LIMIT,
+    clip_embed_description,
+    clip_embed_field_name,
+    clip_text,
+    split_embed_field_lines,
+)
+
 
 class HelpCog(commands.Cog, name="Help"):
     def __init__(self, bot: commands.Bot) -> None:
@@ -34,28 +44,79 @@ class HelpCog(commands.Cog, name="Help"):
             cog_name = command.cog_name or "General"
             grouped.setdefault(cog_name, []).append(command)
 
-        embed = discord.Embed(
-            title="Bot Commands",
-            description="Use `!help <command>` for details on one command. Prefix commands are shown as `!`.",
-            colour=discord.Colour.blurple(),
-        )
-
+        base_description = "Use `!help <command>` for details on one command. Prefix commands are shown as `!`."
+        fields: list[tuple[str, str, bool]] = []
         for cog_name in sorted(grouped):
             commands_in_cog = grouped[cog_name]
             lines = [f"`{self._signature(cmd)}` - {self._short_help(cmd)}" for cmd in commands_in_cog]
-            for index, chunk in enumerate(self._chunk_lines(lines), start=1):
+            for index, chunk in enumerate(split_embed_field_lines(lines), start=1):
                 field_name = cog_name if index == 1 else f"{cog_name} (cont.)"
-                embed.add_field(name=field_name, value=chunk, inline=False)
+                fields.append((clip_embed_field_name(field_name), chunk, False))
 
-        await ctx.send(embed=embed)
+        embeds = self._build_general_help_embeds(base_description=base_description, fields=fields)
+        for embed in embeds:
+            await ctx.send(embed=embed)
+
+    @staticmethod
+    def _build_general_help_embeds(
+        *,
+        base_description: str,
+        fields: list[tuple[str, str, bool]],
+    ) -> list[discord.Embed]:
+        description = clip_embed_description(base_description)
+        # Reserve room for optional page footer when output spans multiple embeds.
+        page_char_budget = DISCORD_EMBED_TOTAL_CHAR_LIMIT - 32
+        base_size = len("Bot Commands") + len(description)
+
+        pages: list[list[tuple[str, str, bool]]] = []
+        current: list[tuple[str, str, bool]] = []
+        current_size = base_size
+
+        for name, value, inline in fields:
+            field_size = len(name) + len(value)
+            if current and (
+                len(current) >= DISCORD_EMBED_MAX_FIELDS
+                or current_size + field_size > page_char_budget
+            ):
+                pages.append(current)
+                current = []
+                current_size = base_size
+
+            current.append((name, value, inline))
+            current_size += field_size
+
+        if current:
+            pages.append(current)
+        if not pages:
+            pages.append([])
+
+        embeds: list[discord.Embed] = []
+        total_pages = len(pages)
+        for page_index, page_fields in enumerate(pages, start=1):
+            title = "Bot Commands" if total_pages == 1 else f"Bot Commands ({page_index}/{total_pages})"
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                colour=discord.Colour.blurple(),
+            )
+            for name, value, inline in page_fields:
+                embed.add_field(name=name, value=value, inline=inline)
+            if total_pages > 1:
+                embed.set_footer(text=f"Page {page_index}/{total_pages}")
+            embeds.append(embed)
+        return embeds
 
     async def _send_command_help(self, ctx: commands.Context, command: commands.Command) -> None:
         embed = discord.Embed(
             title=f"Command: !{command.qualified_name}",
             colour=discord.Colour.blurple(),
-            description=command.help or "No detailed description.",
+            description=clip_embed_description(command.help or "No detailed description."),
         )
-        embed.add_field(name="Usage", value=f"`!{self._signature(command)}`", inline=False)
+        embed.add_field(
+            name="Usage",
+            value=clip_text(f"`!{self._signature(command)}`", limit=DISCORD_EMBED_FIELD_VALUE_LIMIT),
+            inline=False,
+        )
         embed.add_field(
             name="Slash",
             value="Yes" if isinstance(command, commands.HybridCommand) else "No",
@@ -63,13 +124,15 @@ class HelpCog(commands.Cog, name="Help"):
         )
 
         aliases = ", ".join(f"`{alias}`" for alias in command.aliases) if command.aliases else "None"
-        embed.add_field(name="Aliases", value=aliases, inline=True)
+        embed.add_field(name="Aliases", value=clip_text(aliases, limit=DISCORD_EMBED_FIELD_VALUE_LIMIT), inline=True)
 
         if isinstance(command, commands.Group):
             visible_subcommands = [sub for sub in command.commands if not sub.hidden]
             if visible_subcommands:
                 lines = [f"`{sub.qualified_name}` - {self._short_help(sub)}" for sub in visible_subcommands]
-                embed.add_field(name="Subcommands", value="\n".join(lines), inline=False)
+                for index, chunk in enumerate(split_embed_field_lines(lines), start=1):
+                    field_name = "Subcommands" if index == 1 else "Subcommands (cont.)"
+                    embed.add_field(name=field_name, value=chunk, inline=False)
 
         await ctx.send(embed=embed)
 
@@ -111,25 +174,6 @@ class HelpCog(commands.Cog, name="Help"):
         if command.help:
             return command.help.splitlines()[0]
         return "No description."
-
-    @staticmethod
-    def _chunk_lines(lines: list[str], limit: int = 1024) -> list[str]:
-        chunks: list[str] = []
-        current: list[str] = []
-        size = 0
-        for line in lines:
-            extra = len(line) + (1 if current else 0)
-            if current and size + extra > limit:
-                chunks.append("\n".join(current))
-                current = [line]
-                size = len(line)
-            else:
-                current.append(line)
-                size += extra
-
-        if current:
-            chunks.append("\n".join(current))
-        return chunks
 
 
 async def setup(bot: commands.Bot) -> None:
