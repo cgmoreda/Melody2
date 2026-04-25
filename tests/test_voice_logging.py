@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import cogs.voice_logging as voice_logging_module
 from cogs.voice_logging import VoiceLoggingCog
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 
@@ -37,6 +38,11 @@ class _FakeGuild:
 
     def get_member(self, member_id: int) -> _FakeMember | None:
         return self._members.get(member_id)
+
+
+class _FakeVoiceState:
+    def __init__(self, channel: _FakeVoiceChannel | None) -> None:
+        self.channel = channel
 
 
 class _FakeBot:
@@ -180,3 +186,48 @@ def test_render_ranked_message_is_capped_to_discord_limit() -> None:
 
     assert len(rendered) <= DISCORD_MESSAGE_CHAR_LIMIT
     assert rendered.count("```") % 2 == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_state_switch_starts_new_session_and_watchdog_for_solo_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(42)
+    source_channel = _FakeVoiceChannel(1001, "General VC", [member])
+    target_channel = _FakeVoiceChannel(1002, "Solo Room B", [])
+    guild = _FakeGuild(900, [source_channel, target_channel])
+    member.guild = guild
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigService(),  # type: ignore[arg-type]
+    )
+
+    stopped: list[int] = []
+    started: list[int] = []
+    cog._stop_watchdog = lambda member_id: stopped.append(member_id)  # type: ignore[assignment]
+    cog._start_watchdog = lambda member_obj: started.append(member_obj.id)  # type: ignore[assignment]
+
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(source_channel),  # type: ignore[arg-type]
+        _FakeVoiceState(target_channel),  # type: ignore[arg-type]
+    )
+
+    assert stopped == [member.id]
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+
+    assert len(repo.started_calls) == 1
+    start_call = repo.started_calls[0]
+    assert start_call["guild_id"] == guild.id
+    assert start_call["discord_id"] == member.id
+    assert start_call["channel_id"] == target_channel.id
+    assert start_call["is_solo"] is True
+
+    assert started == [member.id]

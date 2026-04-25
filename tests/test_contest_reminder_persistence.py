@@ -131,3 +131,31 @@ async def test_persisted_dedupe_survives_restart_like_new_service_instance() -> 
 
     assert channel.messages == ["[Reminder] test starts in 1h"]
     assert repo.mark_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_existing_persisted_dedupe_key_skips_send_and_mark() -> None:
+    repo = _PersistentReminderRepo()
+    repo._sent.add((123, 456, 789, "24h"))
+    service = _service(repo)
+    channel = _FakeTextChannel(456)
+    contest = CFContest(
+        contest_id=789,
+        name="Codeforces Round 789 (Div. 2)",
+        start_time_seconds=int(datetime.now(tz=UTC).timestamp()) + 24 * 3600,
+    )
+
+    await service._maybe_send_reminder(
+        guild_id=123,
+        channel=channel,  # type: ignore[arg-type]
+        contest=contest,
+        reminder_type="24h",
+        target=timedelta(hours=24),
+        window=timedelta(minutes=5),
+        message="[Reminder] already persisted",
+        until_start=timedelta(hours=24) - timedelta(seconds=1),
+    )
+
+    assert channel.messages == []
+    assert repo.has_calls >= 1
+    assert repo.mark_calls == 0

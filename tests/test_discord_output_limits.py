@@ -42,6 +42,13 @@ def test_clip_text_uses_suffix_with_exact_limit() -> None:
     assert len(clipped) == 7
 
 
+def test_split_text_chunks_preserves_exact_limit_without_extra_chunk() -> None:
+    exact = "z" * DISCORD_MESSAGE_CHAR_LIMIT
+    chunks = split_text_chunks(exact)
+
+    assert chunks == [exact]
+
+
 def test_roundchanges_embeds_paginate_description_limit() -> None:
     displayed_lines = [
         f"<@{idx}> (`handle{idx}`): **+123** (1500 -> 1623, rank {idx})"

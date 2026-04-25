@@ -138,6 +138,21 @@ async def test_cf_client_error_includes_rendered_requested_url() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cf_client_maps_invalid_payload_shape_to_parse_error() -> None:
+    client = CodeforcesClient(
+        _FakeSession([_FakeResponse(status=200, payload=["not", "an", "object"])])  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(CFRequestError) as raised:
+        await client.get_rating_history("tourist")
+
+    error = raised.value
+    assert error.endpoint == "user.rating"
+    assert error.failure_kind == "parse"
+    assert "user.rating?handle=tourist" in error.requested_url
+
+
+@pytest.mark.asyncio
 async def test_verify_command_surfaces_typed_error_context() -> None:
     ctx = _FakeCtx()
     cog = VerificationCog(

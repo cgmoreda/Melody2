@@ -227,3 +227,39 @@ async def test_confirm_success_deletes_pending_row() -> None:
     assert len(repo.verified) == 1
     assert repo.verified[0].cf_handle == "active_handle"
     assert roles.apply_calls == [(member.id, guild.id, 2100)]
+
+
+@pytest.mark.asyncio
+async def test_confirm_code_mismatch_keeps_pending_row_active() -> None:
+    repo = _FakeRepo()
+    guild = _FakeGuild(700)
+    member = _FakeMember(701)
+    ctx = _FakeContext(guild, member)
+
+    now = datetime.now(tz=UTC)
+    await repo.upsert_pending_verification(
+        guild_id=guild.id,
+        discord_id=member.id,
+        cf_handle="mismatch_handle",
+        verification_code="CF-VERIFY-expected",
+        created_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+
+    roles = _FakeRoleAssigner()
+    cog = VerificationCog(
+        cf_client=_FakeCFClient({"mismatch_handle": _build_user(handle="mismatch_handle", first_name="wrong-code")}),  # type: ignore[arg-type]
+        role_assigner=roles,  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=object(),  # type: ignore[arg-type]
+        reminder_service=None,
+    )
+
+    await cog.confirm.callback(cog, ctx)
+
+    pending = await repo.get_pending_verification(guild.id, member.id)
+    assert pending is not None
+    assert pending.verification_code == "CF-VERIFY-expected"
+    assert repo.verified == []
+    assert roles.apply_calls == []
+    assert any("First name mismatch" in message for message in ctx.messages)
