@@ -136,20 +136,32 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def on_ready(self) -> None:
         now = datetime.now(tz=UTC)
         for guild in self.bot.guilds:
+            active_solo_channels_by_member_id: dict[int, discord.VoiceChannel] = {}
             for voice_channel in guild.voice_channels:
                 if not _is_solo_channel(voice_channel):
                     continue
                 for member in voice_channel.members:
                     if member.bot:
                         continue
-                    has_open = await self._repo.has_open_voice_session(guild.id, member.id)
-                    if not has_open:
-                        await self._start_voice_session(
-                            guild_id=guild.id,
-                            member_id=member.id,
-                            channel=voice_channel,
-                            started_at=now,
-                        )
+                    active_solo_channels_by_member_id[member.id] = voice_channel
+
+            active_solo_member_ids = set(active_solo_channels_by_member_id)
+            open_solo_member_ids = await self._repo.get_open_solo_voice_member_ids(guild.id)
+
+            for stale_member_id in open_solo_member_ids - active_solo_member_ids:
+                await self._repo.close_open_voice_sessions(guild.id, stale_member_id, now)
+
+            for member_id, voice_channel in active_solo_channels_by_member_id.items():
+                if member_id not in open_solo_member_ids:
+                    await self._start_voice_session(
+                        guild_id=guild.id,
+                        member_id=member_id,
+                        channel=voice_channel,
+                        started_at=now,
+                    )
+
+                member = guild.get_member(member_id)
+                if member is not None:
                     self._start_watchdog(member)
 
     @commands.Cog.listener()
@@ -191,6 +203,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         task = self._watchdogs.pop(member_id, None)
         if task is not None:
             task.cancel()
+
+    def _clear_watchdog_if_current(self, member_id: int, task: asyncio.Task[None]) -> None:
+        if self._watchdogs.get(member_id) is task:
+            self._watchdogs.pop(member_id, None)
 
     async def _resolve_handles(self, guild: discord.Guild) -> dict[int, str]:
         verified = await self._repo.get_all(guild.id)
@@ -361,7 +377,9 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         except asyncio.CancelledError:
             pass
         finally:
-            self._watchdogs.pop(member_id, None)
+            task = asyncio.current_task()
+            if task is not None:
+                self._clear_watchdog_if_current(member_id, task)
 
     async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> Optional[bool]:
         view = WorkConfirmationView(member.id, timeout_seconds)

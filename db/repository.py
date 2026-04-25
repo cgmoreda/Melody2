@@ -156,6 +156,10 @@ class UserRepositoryBase(abc.ABC):
         """Return whether the user currently has an open voice session row."""
 
     @abc.abstractmethod
+    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
+        """Return member IDs that currently have open solo voice sessions in a guild."""
+
+    @abc.abstractmethod
     async def get_solo_voice_totals(
         self,
         guild_id: int,
@@ -663,6 +667,21 @@ class UserRepository(UserRepositoryBase):
                 discord_id,
             )
         return row is not None
+
+    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT discord_id
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND is_solo = TRUE
+                  AND ended_at IS NULL
+                """,
+                guild_id,
+            )
+        return {int(row["discord_id"]) for row in rows}
 
     async def get_solo_voice_totals(
         self,
