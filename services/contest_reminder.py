@@ -140,7 +140,9 @@ class ContestReminderService:
         self._session = session
         self._bot = bot
         self._repo = repo
-        self._providers: Sequence[ContestProvider] = providers or [CodeforcesProvider()]
+        self._providers: Sequence[ContestProvider] = (
+            [CodeforcesProvider()] if providers is None else providers
+        )
         self._poll_seconds = max(300, min(600, poll_seconds))
         self._task: Optional[asyncio.Task[None]] = None
         self._sent_cache: set[_CacheKey] = set()
