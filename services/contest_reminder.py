@@ -80,7 +80,7 @@ class CodeforcesProvider:
                     if response.status != 200:
                         raise RuntimeError(f"contest.list returned HTTP {response.status}")
                     payload = await response.json()
-            except (aiohttp.ClientError, TimeoutError, RuntimeError) as exc:
+            except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError) as exc:
                 logger.warning("CF contest.list attempt %d failed: %s", attempt, exc)
                 if attempt < 3:
                     await asyncio.sleep(delay)
