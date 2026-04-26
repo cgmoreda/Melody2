@@ -202,18 +202,20 @@ class ContestReminderService:
         async with self._lock:
             return (guild_id, channel_id) in self._enabled_channels
 
-    async def get_upcoming_div_contests(self, limit: int = 3) -> list[Contest]:
-        """Return upcoming Codeforces Div contests (used by !reminder next)."""
-        cf_provider = next((p for p in self._providers if p.platform == "codeforces"), None)
-        if cf_provider is None:
+    async def get_upcoming_contests(self, platform: str = "codeforces", limit: int = 3) -> list[Contest]:
+        """Return upcoming contests for a specific platform (used by !reminder next)."""
+        provider = next((p for p in self._providers if p.platform == platform), None)
+        if provider is None:
             return []
-        contests = await cf_provider.fetch_upcoming(self._session)
+        contests = await provider.fetch_upcoming(self._session)
         if contests is None:
             return []
 
-        div_contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
-        div_contests.sort(key=lambda contest: contest.start_time_seconds)
-        return div_contests[: max(1, limit)]
+        if platform == "codeforces":
+            contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
+            
+        contests.sort(key=lambda contest: contest.start_time_seconds)
+        return contests[: max(1, limit)]
 
     # ------------------------------------------------------------------
     # Main loop
