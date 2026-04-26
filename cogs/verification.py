@@ -546,8 +546,8 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.group(name="reminder", invoke_without_command=True)
     @commands.guild_only()
     async def reminder(self, ctx: commands.Context) -> None:
-        """Manage Codeforces contest reminders for channels."""
-        await ctx.send("Usage: **!reminder <enable|disable|status|next> [#channel]**")
+        """Manage Codeforces and AtCoder contest reminders for channels."""
+        await ctx.send("Usage: **!reminder <enable|disable|status|next [platform]> [#channel]**")
 
     @reminder.command(name="enable")
     @commands.guild_only()
@@ -620,33 +620,53 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @reminder.command(name="next")
     @commands.guild_only()
-    async def reminder_next(self, ctx: commands.Context) -> None:
-        """Show upcoming Div contests currently visible on Codeforces."""
+    async def reminder_next(self, ctx: commands.Context, platform: str = "codeforces") -> None:
+        """Show upcoming contests for a given platform.
+        
+        Example: `!reminder next atcoder` or `!reminder next codeforces`
+        """
+        platform = platform.lower()
+        if platform not in ("codeforces", "atcoder", "cf", "ac"):
+            await ctx.send("Unsupported platform. Use `codeforces` or `atcoder`.")
+            return
+            
+        platform_mapping = {"cf": "codeforces", "ac": "atcoder"}
+        canonical_platform = platform_mapping.get(platform, platform)
+
         assert ctx.guild is not None
         if self._reminders is None:
             await ctx.send("Reminder service is not available.")
             return
 
         config = await self._config.get(ctx.guild.id)
-        contests = await self._reminders.get_upcoming_div_contests(limit=config.reminder_preview_limit)
+        contests = await self._reminders.get_upcoming_contests(platform=canonical_platform, limit=config.reminder_preview_limit)
+        
+        display_platform = "Codeforces Div" if canonical_platform == "codeforces" else "AtCoder"
+
         if not contests:
-            await ctx.send("No upcoming Div contests found right now.")
+            await ctx.send(f"No upcoming {display_platform} contests found right now.")
             return
 
         lines: list[str] = []
         for idx, contest in enumerate(contests, start=1):
             ts = contest.start_time_seconds
+            
+            if canonical_platform == "codeforces":
+                url = f"https://codeforces.com/contest/{contest.contest_id}"
+            else:
+                url = f"https://atcoder.jp/contests/{contest.contest_id}"
+                
             lines.append(
-                f"{idx}. [{contest.name}](https://codeforces.com/contest/{contest.contest_id}) - "
+                f"{idx}. [{contest.name}]({url}) - "
                 f"<t:{ts}:R> (<t:{ts}:f>)"
             )
 
         embed = discord.Embed(
-            title="Upcoming Div Contests",
+            title=f"Upcoming {display_platform} Contests",
             description="\n".join(lines),
             colour=discord.Colour.gold(),
         )
-        embed.set_footer(text=f"Showing up to {config.reminder_preview_limit} upcoming Div contests")
+        embed.set_footer(text=f"Showing up to {config.reminder_preview_limit} upcoming {display_platform} contests")
         await ctx.send(embed=embed)
 
     @verify.error
