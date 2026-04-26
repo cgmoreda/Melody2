@@ -147,8 +147,9 @@ class ReminderRepository(Protocol):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
+        platform: str = "codeforces",
     ) -> bool:
         ...
 
@@ -156,9 +157,10 @@ class ReminderRepository(Protocol):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
         sent_at: datetime,
+        platform: str = "codeforces",
     ) -> bool:
         ...
 
@@ -391,8 +393,9 @@ class UserRepositoryBase(abc.ABC):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
+        platform: str = "codeforces",
     ) -> bool:
         """Return whether this reminder dispatch key has already been recorded."""
 
@@ -401,9 +404,10 @@ class UserRepositoryBase(abc.ABC):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
         sent_at: datetime,
+        platform: str = "codeforces",
     ) -> bool:
         """Record one sent reminder. Returns True when inserted, False when it already existed."""
 
@@ -598,7 +602,7 @@ class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
     _SCHEMA_LOCK_KEY = 3_310_920_014_991
-    _LATEST_SCHEMA_VERSION = 3
+    _LATEST_SCHEMA_VERSION = 4
 
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
@@ -658,6 +662,7 @@ class UserRepository(UserRepositoryBase):
             1: self._migration_001_create_initial_schema,
             2: self._migration_002_add_indexes,
             3: self._migration_003_enforce_integrity_constraints,
+            4: self._migration_004_add_platform_to_sent_reminders,
         }
 
         if current_version > self._LATEST_SCHEMA_VERSION:
@@ -987,6 +992,37 @@ class UserRepository(UserRepositoryBase):
         )
         return row is not None
 
+    async def _migration_004_add_platform_to_sent_reminders(self, conn: asyncpg.Connection) -> None:
+        # Add platform column (default existing rows to 'codeforces').
+        await conn.execute(
+            """
+            ALTER TABLE sent_reminders
+            ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'codeforces'
+            """
+        )
+
+        # Convert contest_id from BIGINT to TEXT so string-based IDs (AtCoder) work.
+        await conn.execute(
+            """
+            ALTER TABLE sent_reminders
+            ALTER COLUMN contest_id TYPE TEXT USING contest_id::TEXT
+            """
+        )
+
+        # Rebuild primary key to include platform.
+        await conn.execute(
+            """
+            ALTER TABLE sent_reminders
+            DROP CONSTRAINT IF EXISTS sent_reminders_pkey
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE sent_reminders
+            ADD PRIMARY KEY (guild_id, channel_id, platform, contest_id, reminder_type)
+            """
+        )
+
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
@@ -1160,8 +1196,9 @@ class UserRepository(UserRepositoryBase):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
+        platform: str = "codeforces",
     ) -> bool:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
@@ -1171,12 +1208,14 @@ class UserRepository(UserRepositoryBase):
                 FROM sent_reminders
                 WHERE guild_id = $1
                   AND channel_id = $2
-                  AND contest_id = $3
-                  AND reminder_type = $4
+                  AND platform = $3
+                  AND contest_id = $4
+                  AND reminder_type = $5
                 LIMIT 1
                 """,
                 guild_id,
                 channel_id,
+                platform,
                 contest_id,
                 reminder_type,
             )
@@ -1186,22 +1225,24 @@ class UserRepository(UserRepositoryBase):
         self,
         guild_id: int,
         channel_id: int,
-        contest_id: int,
+        contest_id: str,
         reminder_type: str,
         sent_at: datetime,
+        platform: str = "codeforces",
     ) -> bool:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
             result = await conn.execute(
                 """
                 INSERT INTO sent_reminders (
-                    guild_id, channel_id, contest_id, reminder_type, sent_at
+                    guild_id, channel_id, platform, contest_id, reminder_type, sent_at
                 )
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (guild_id, channel_id, contest_id, reminder_type) DO NOTHING
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (guild_id, channel_id, platform, contest_id, reminder_type) DO NOTHING
                 """,
                 guild_id,
                 channel_id,
+                platform,
                 contest_id,
                 reminder_type,
                 sent_at,
