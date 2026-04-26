@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from db.repository import UserRepository
 from services.cf_client import CodeforcesClient
 from services.coach_secretary import CoachSecretary
+from services.atcoder_client import AtCoderProvider
 from services.contest_reminder import CodeforcesProvider, ContestReminderService
 from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssigner
@@ -100,7 +101,7 @@ async def _setup_services(bot: commands.Bot) -> None:
         session=session,
         bot=bot,
         repo=repo,
-        providers=[CodeforcesProvider()],
+        providers=[CodeforcesProvider(), AtCoderProvider()],
         poll_seconds=poll_seconds,
     )
     await reminder.initialize()
