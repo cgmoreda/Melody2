@@ -113,7 +113,7 @@ async def test_init_new_database_runs_all_migrations_in_order(monkeypatch: pytes
     repo = await _run_init_with_fake_conn(monkeypatch, conn)
 
     assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
-    assert conn.schema_version_updates == [0, 1, 2, 3]
+    assert conn.schema_version_updates == [0, 1, 2, 3, 4]
 
     assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS schema_version")
     assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS verified_users")
@@ -137,7 +137,7 @@ async def test_init_upgrade_from_version_one_skips_base_schema(monkeypatch: pyte
     repo = await _run_init_with_fake_conn(monkeypatch, conn)
 
     assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
-    assert conn.schema_version_updates == [2, 3]
+    assert conn.schema_version_updates == [2, 3, 4]
     assert not _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS verified_users")
     assert _contains_statement(
         conn.executed_statements,
