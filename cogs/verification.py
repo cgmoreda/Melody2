@@ -546,8 +546,8 @@ class VerificationCog(commands.Cog, name="Verification"):
     @commands.group(name="reminder", invoke_without_command=True)
     @commands.guild_only()
     async def reminder(self, ctx: commands.Context) -> None:
-        """Manage Codeforces contest reminders for channels."""
-        await ctx.send("Usage: **!reminder <enable|disable|status|next> [#channel]**")
+        """Manage Codeforces and AtCoder contest reminders for channels."""
+        await ctx.send("Usage: **!reminder <enable|disable|status|next [platform]> [#channel]**")
 
     @reminder.command(name="enable")
     @commands.guild_only()
@@ -621,7 +621,10 @@ class VerificationCog(commands.Cog, name="Verification"):
     @reminder.command(name="next")
     @commands.guild_only()
     async def reminder_next(self, ctx: commands.Context, platform: str = "codeforces") -> None:
-        """Show upcoming contests for a given platform (default: codeforces)."""
+        """Show upcoming contests for a given platform.
+        
+        Example: `!reminder next atcoder` or `!reminder next codeforces`
+        """
         platform = platform.lower()
         if platform not in ("codeforces", "atcoder", "cf", "ac"):
             await ctx.send("Unsupported platform. Use `codeforces` or `atcoder`.")
