@@ -319,6 +319,9 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
         - `!voicehours roles [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
+        - `!voicehours track list`
+        - `!voicehours track add <keyword>`
+        - `!voicehours track remove <keyword>`
         """
         assert ctx.guild is not None
 
