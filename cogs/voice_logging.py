@@ -488,7 +488,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
-            if mode in {"roles", "teams"}:
+            if mode in {"roles", "teams", "unis"}:
                 try:
                     since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
                 except ValueError as err:
@@ -496,17 +496,17 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     return
 
                 totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
-                team_roles = [
+                uni_roles = [
                     role
                     for role in ctx.guild.roles
-                    if "team" in role.name.lower() and role.name != "@everyone"
+                    if "uni" in role.name.lower() and role.name != "@everyone"
                 ]
-                if not team_roles:
-                    await ctx.send("No roles containing `team` were found in this server.")
+                if not uni_roles:
+                    await ctx.send("No roles containing `uni` were found in this server.")
                     return
 
                 role_totals: list[tuple[str, float, int]] = []
-                for role in team_roles:
+                for role in uni_roles:
                     non_bot_members = [member for member in role.members if not member.bot]
                     seconds_sum = 0.0
                     for member in non_bot_members:
@@ -522,7 +522,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Team Role Solo Voice Standings ({label})**",
+                        title=f"**Uni Role Solo Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="roles",
