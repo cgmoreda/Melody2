@@ -527,17 +527,17 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     return
 
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
-                uni_roles = [
+                team_roles = [
                     role
                     for role in ctx.guild.roles
-                    if "uni" in role.name.lower() and role.name != "@everyone"
+                    if role.name.lower().startswith("team ") and role.name != "@everyone"
                 ]
-                if not uni_roles:
-                    await ctx.send("No roles containing `uni` were found in this server.")
+                if not team_roles:
+                    await ctx.send("No roles starting with `Team` were found in this server.")
                     return
 
                 role_totals: list[tuple[str, float, int]] = []
-                for role in uni_roles:
+                for role in team_roles:
                     non_bot_members = [member for member in role.members if not member.bot]
                     seconds_sum = 0.0
                     for member in non_bot_members:
@@ -553,7 +553,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Uni Role Tracked Voice Standings ({label})**",
+                        title=f"**Team Role Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="roles",
