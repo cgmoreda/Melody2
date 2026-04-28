@@ -12,6 +12,78 @@ from cogs.voice_logging import VoiceLoggingCog
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 
 
+# ---------------------------------------------------------------------------
+# Additional fake helpers for voicehours roles/teams/unis tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeRole:
+    def __init__(self, name: str, members: list[_FakeMemberWithBot]) -> None:
+        self.name = name
+        self.members = members
+
+
+class _FakeMemberWithBot:
+    def __init__(self, member_id: int, *, bot: bool = False) -> None:
+        self.id = member_id
+        self.bot = bot
+
+
+class _FakeGuildWithRoles:
+    def __init__(self, guild_id: int, roles: list[_FakeRole]) -> None:
+        self.id = guild_id
+        self.roles = roles
+        self.voice_channels: list[Any] = []
+
+    def get_member(self, member_id: int) -> None:
+        return None
+
+
+class _FakeRepoWithTotals:
+    def __init__(self, totals: dict[int, float] | None = None) -> None:
+        self._totals = totals or {}
+        self._open_tracked_by_guild: dict[int, set[int]] = {}
+
+    async def get_all(self, guild_id: int) -> list[Any]:
+        return []
+
+    async def get_tracked_voice_totals(
+        self, guild_id: int, *, now: Any, since: Any
+    ) -> dict[int, float]:
+        return dict(self._totals)
+
+    async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
+        return set()
+
+
+class _FakeConfigServiceWithMaxLines:
+    async def get(self, guild_id: int) -> Any:
+        class _Config:
+            voice_check_interval_seconds = 3600
+            voice_confirm_timeout_seconds = 60
+            voicehours_max_lines = 50
+
+        return _Config()
+
+    async def get_text(self, guild_id: int, key: str) -> str:
+        return ""
+
+
+class _FakeContext:
+    def __init__(self, guild: Any, author_id: int = 1) -> None:
+        self.guild = guild
+        self.sent_messages: list[str] = []
+
+        class _Author:
+            id = author_id
+            display_name = "TestUser"
+
+        self.author = _Author()
+
+    async def send(self, message: str) -> None:
+        self.sent_messages.append(message)
+
+
 class _FakeMember:
     def __init__(self, member_id: int, *, is_bot: bool = False) -> None:
         self.id = member_id
@@ -234,3 +306,155 @@ async def test_voice_state_switch_starts_new_session_and_watchdog_for_solo_chann
     assert start_call["is_tracked"] is True
 
     assert started == [member.id]
+
+
+# ---------------------------------------------------------------------------
+# Tests for voicehours roles/teams/unis leaderboard filtering
+# ---------------------------------------------------------------------------
+
+
+def _make_cog_for_leaderboard(
+    guild: Any,
+    totals: dict[int, float],
+) -> VoiceLoggingCog:
+    repo = _FakeRepoWithTotals(totals=totals)
+    config_service = _FakeConfigServiceWithMaxLines()
+    return VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=config_service,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_voicehours_roles_only_includes_team_prefixed_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only roles whose names start with 'team ' (case-insensitive) appear in roles/teams mode."""
+    team_member = _FakeMemberWithBot(1)
+    other_member = _FakeMemberWithBot(2)
+    team_role = _FakeRole("Team Alpha", [team_member])
+    uni_role = _FakeRole("UniRed", [other_member])
+    guild = _FakeGuildWithRoles(10, [team_role, uni_role])
+
+    totals = {1: 3600.0, 2: 7200.0}
+    cog = _make_cog_for_leaderboard(guild, totals)
+
+    sent: list[str] = []
+
+    async def _fake_send_chunks(ctx: Any, content: str) -> None:
+        sent.append(content)
+
+    monkeypatch.setattr(voice_logging_module, "send_context_text_chunks", _fake_send_chunks)
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "roles")  # type: ignore[union-attr]
+
+    assert len(sent) == 1
+    output = sent[0]
+    assert "Team Alpha" in output
+    assert "UniRed" not in output
+    assert "Team Role Voice Standings" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_teams_alias_behaves_like_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'teams' is an alias for 'roles' and uses the same team-prefix filter."""
+    team_member = _FakeMemberWithBot(3)
+    team_role = _FakeRole("Team Beta", [team_member])
+    guild = _FakeGuildWithRoles(11, [team_role])
+
+    totals = {3: 1800.0}
+    cog = _make_cog_for_leaderboard(guild, totals)
+
+    sent: list[str] = []
+
+    async def _fake_send_chunks(ctx: Any, content: str) -> None:
+        sent.append(content)
+
+    monkeypatch.setattr(voice_logging_module, "send_context_text_chunks", _fake_send_chunks)
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "teams")  # type: ignore[union-attr]
+
+    assert len(sent) == 1
+    assert "Team Role Voice Standings" in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_roles_empty_state_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no 'team ' roles exist the correct empty-state message is sent."""
+    guild = _FakeGuildWithRoles(12, [_FakeRole("UniRed", [_FakeMemberWithBot(4)])])
+    cog = _make_cog_for_leaderboard(guild, {})
+
+    monkeypatch.setattr(
+        voice_logging_module,
+        "send_context_text_chunks",
+        lambda ctx, content: None,
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "roles")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    assert "`team `" in ctx.sent_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_unis_only_includes_uni_roles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'unis' mode filters by 'uni' substring (case-insensitive) and not by team prefix."""
+    uni_member = _FakeMemberWithBot(5)
+    team_member = _FakeMemberWithBot(6)
+    uni_role = _FakeRole("UniRed", [uni_member])
+    team_role = _FakeRole("Team Alpha", [team_member])
+    # Also check case-insensitivity: 'UniVersity' should match
+    uni_upper_member = _FakeMemberWithBot(7)
+    uni_upper_role = _FakeRole("UniVersity", [uni_upper_member])
+    guild = _FakeGuildWithRoles(13, [uni_role, team_role, uni_upper_role])
+
+    totals = {5: 1800.0, 6: 3600.0, 7: 900.0}
+    cog = _make_cog_for_leaderboard(guild, totals)
+
+    sent: list[str] = []
+
+    async def _fake_send_chunks(ctx: Any, content: str) -> None:
+        sent.append(content)
+
+    monkeypatch.setattr(voice_logging_module, "send_context_text_chunks", _fake_send_chunks)
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "unis")  # type: ignore[union-attr]
+
+    assert len(sent) == 1
+    output = sent[0]
+    assert "UniRed" in output
+    assert "UniVersity" in output
+    assert "Team Alpha" not in output
+    assert "Uni Role Voice Standings" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_unis_empty_state_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no 'uni' roles exist the correct empty-state message is sent for unis mode."""
+    guild = _FakeGuildWithRoles(14, [_FakeRole("Team Alpha", [_FakeMemberWithBot(8)])])
+    cog = _make_cog_for_leaderboard(guild, {})
+
+    monkeypatch.setattr(
+        voice_logging_module,
+        "send_context_text_chunks",
+        lambda ctx, content: None,
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "unis")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    assert "`uni`" in ctx.sent_messages[0]
