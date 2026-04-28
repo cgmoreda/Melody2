@@ -242,13 +242,18 @@ class DynamicVoiceManager:
                     return
                 if isinstance(fresh, discord.VoiceChannel) and len(fresh.members) > 0:
                     return
-                try:
-                    await channel.delete(reason="Dynamic voice channel empty")
-                    logger.info("Deleted empty channel %s (id=%s)", channel.name, channel.id)
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    logger.error("Failed to delete channel %s: %s", channel.name, exc)
-                    return
-                self._untrack(channel.guild.id, channel.id)
+                channel_to_delete = fresh
+                channel_name = fresh.name
+                guild_id = fresh.guild.id
+                channel_id = fresh.id
+            try:
+                await channel_to_delete.delete(reason="Dynamic voice channel empty")
+                logger.info("Deleted empty channel %s (id=%s)", channel_name, channel_id)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.error("Failed to delete channel %s: %s", channel_name, exc)
+                return
+            async with self._lock:
+                self._untrack(guild_id, channel_id)
         except asyncio.CancelledError:
             pass
         finally:
