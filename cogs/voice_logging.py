@@ -533,7 +533,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     if role.name.lower().startswith("team ") and role.name != "@everyone"
                 ]
                 if not team_roles:
-                    await ctx.send("No roles starting with `Team` were found in this server.")
+                    await ctx.send("No roles starting with `team ` (case-insensitive) were found in this server.")
                     return
 
                 role_totals: list[tuple[str, float, int]] = []
