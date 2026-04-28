@@ -579,18 +579,18 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("No roles containing `uni` (case-insensitive) were found in this server.")
                     return
 
-                uni_role_totals: list[tuple[str, float, int]] = []
+                role_totals: list[tuple[str, float, int]] = []
                 for role in uni_roles:
                     non_bot_members = [member for member in role.members if not member.bot]
                     seconds_sum = 0.0
                     for member in non_bot_members:
                         seconds_sum += totals.get(member.id, 0.0)
-                    uni_role_totals.append((role.name, seconds_sum, len(non_bot_members)))
+                    role_totals.append((role.name, seconds_sum, len(non_bot_members)))
 
-                uni_role_totals.sort(key=lambda item: (-item[1], item[0].lower()))
+                role_totals.sort(key=lambda item: (-item[1], item[0].lower()))
 
                 lines = ["rk   role               total    members"]
-                for index, (role_name, seconds, member_count) in enumerate(uni_role_totals, start=1):
+                for index, (role_name, seconds, member_count) in enumerate(role_totals, start=1):
                     lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds):<8} {member_count}")
 
                 await send_context_text_chunks(
@@ -599,7 +599,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         title=f"**Uni Role Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
-                        overflow_label="roles",
+                        overflow_label="unis",
                     ),
                 )
                 return
