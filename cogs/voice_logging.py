@@ -321,7 +321,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours me [last <x> <hour/day/week/month>]`
         - `!voicehours user <@member> [last <x> <hour/day/week/month>]`
         - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
-        - `!voicehours roles [last <x> <hour/day/week/month>]`
+        - `!voicehours roles [last <x> <hour/day/week/month>]`  (alias: teams)
+        - `!voicehours unis [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
         - `!voicehours track list`
         - `!voicehours track add <keyword>`
@@ -519,7 +520,49 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
-            if mode in {"roles", "teams", "unis"}:
+            if mode in {"roles", "teams"}:
+                try:
+                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
+                except ValueError as err:
+                    await ctx.send(str(err))
+                    return
+
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                team_roles = [
+                    role
+                    for role in ctx.guild.roles
+                    if role.name.lower().startswith("team ") and role.name != "@everyone"
+                ]
+                if not team_roles:
+                    await ctx.send("No roles starting with `team ` (case-insensitive) were found in this server.")
+                    return
+
+                role_totals: list[tuple[str, float, int]] = []
+                for role in team_roles:
+                    non_bot_members = [member for member in role.members if not member.bot]
+                    seconds_sum = 0.0
+                    for member in non_bot_members:
+                        seconds_sum += totals.get(member.id, 0.0)
+                    role_totals.append((role.name, seconds_sum, len(non_bot_members)))
+
+                role_totals.sort(key=lambda item: (-item[1], item[0].lower()))
+
+                lines = ["rk   role               total    members"]
+                for index, (role_name, seconds, member_count) in enumerate(role_totals, start=1):
+                    lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds):<8} {member_count}")
+
+                await send_context_text_chunks(
+                    ctx,
+                    self._render_ranked_message(
+                        title=f"**Team Role Voice Standings ({label})**",
+                        lines=lines,
+                        max_lines=config.voicehours_max_lines,
+                        overflow_label="roles",
+                    ),
+                )
+                return
+
+            if mode == "unis":
                 try:
                     since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
                 except ValueError as err:
@@ -533,7 +576,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     if "uni" in role.name.lower() and role.name != "@everyone"
                 ]
                 if not uni_roles:
-                    await ctx.send("No roles containing `uni` were found in this server.")
+                    await ctx.send("No roles containing `uni` (case-insensitive) were found in this server.")
                     return
 
                 role_totals: list[tuple[str, float, int]] = []
@@ -553,10 +596,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Uni Role Tracked Voice Standings ({label})**",
+                        title=f"**Uni Role Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
-                        overflow_label="roles",
+                        overflow_label="unis",
                     ),
                 )
                 return
@@ -589,7 +632,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             await ctx.send(
                 "Unknown mode.\n"
-                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `top`, `track`.\n"
+                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, `top`, `track`.\n"
                 "Example: `!voicehours top 20 last 2 weeks`"
             )
             return
