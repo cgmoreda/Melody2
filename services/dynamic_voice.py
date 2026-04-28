@@ -21,9 +21,9 @@ class ChannelType(Enum):
 
 
 ENTRY_CHANNEL_NAMES: dict[str, ChannelType] = {
-    "➕ | Solo": ChannelType.SOLO,
-    "➕ | Duo": ChannelType.DUO,
-    "➕ | Team": ChannelType.TEAM,
+    "➕ | Solo (new)": ChannelType.SOLO,
+    "➕ | Duo (new)": ChannelType.DUO,
+    "➕ | Team (new)": ChannelType.TEAM,
 }
 
 USER_LIMITS: dict[ChannelType, int] = {
