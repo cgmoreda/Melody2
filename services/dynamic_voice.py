@@ -81,14 +81,6 @@ class DynamicVoiceManager:
         """Create a dynamic channel and move *member* into it."""
         async with self._lock:
             label = self._build_label(member, channel_type)
-            if label is None:
-                logger.warning(
-                    "Member %s (%s) has no Uni role for %s channel",
-                    member.id,
-                    member.display_name,
-                    channel_type.value,
-                )
-                return
 
             number = self._next_number(member.guild.id, label)
             channel_name = f"{label} #{number}"
@@ -171,23 +163,37 @@ class DynamicVoiceManager:
     # ── internals ───────────────────────────────────────────────
 
     @staticmethod
-    def _get_uni_name(member: discord.Member) -> Optional[str]:
-        """Return the university name from the member's 'Uni ...' role."""
+    def _get_role_name(member: discord.Member, prefix: str) -> Optional[str]:
+        """Return the name portion after *prefix* from the member's roles."""
         for role in member.roles:
-            if role.name.startswith("Uni "):
-                return role.name[4:]
+            if role.name.startswith(prefix):
+                return role.name[len(prefix):]
         return None
 
-    def _build_label(self, member: discord.Member, channel_type: ChannelType) -> Optional[str]:
-        """Build the base label for a channel (without the #N suffix)."""
+    def _build_label(self, member: discord.Member, channel_type: ChannelType) -> str:
+        """Build the base label for a channel (without the #N suffix).
+
+        Fallback chain:
+        - Solo: always "solo"
+        - Duo:  Uni role → display_name
+        - Team: Team role → Uni role → display_name
+        """
         if channel_type is ChannelType.SOLO:
             return "solo"
-        uni = self._get_uni_name(member)
-        if uni is None:
-            return None
+
         if channel_type is ChannelType.DUO:
-            return f"{uni} Duo"
-        return f"{uni} Team"
+            name = self._get_role_name(member, "Uni ")
+            if name is None:
+                name = member.display_name
+            return f"{name} Duo"
+
+        # TEAM: Team role → Uni role → display_name
+        name = self._get_role_name(member, "Team ")
+        if name is None:
+            name = self._get_role_name(member, "Uni ")
+        if name is None:
+            name = member.display_name
+        return f"{name} Team"
 
     def _next_number(self, guild_id: int, label: str) -> int:
         """Return the lowest unused number for *label* in a guild."""
