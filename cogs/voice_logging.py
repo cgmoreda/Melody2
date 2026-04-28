@@ -308,7 +308,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
     async def voicehours(self, ctx: commands.Context, *args: str) -> None:
-        """Show solo voice-channel hours.
+        """Show tracked voice-channel hours.
+
+        Hours are counted for channels whose names start with ``solo #`` as well
+        as any channels whose names contain a keyword configured via
+        ``!voicehours track add``.
 
         Usage:
         - `!voicehours`
