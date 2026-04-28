@@ -186,7 +186,7 @@ class VoiceRepository(Protocol):
         discord_id: int,
         channel_id: int,
         channel_name: str,
-        is_solo: bool,
+        is_tracked: bool,
         started_at: datetime,
     ) -> None:
         ...
@@ -197,10 +197,10 @@ class VoiceRepository(Protocol):
     async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
         ...
 
-    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
+    async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
         ...
 
-    async def get_solo_voice_totals(
+    async def get_tracked_voice_totals(
         self,
         guild_id: int,
         *,
@@ -209,7 +209,7 @@ class VoiceRepository(Protocol):
     ) -> dict[int, float]:
         ...
 
-    async def get_solo_voice_summary(
+    async def get_tracked_voice_summary(
         self,
         guild_id: int,
         *,
@@ -434,7 +434,7 @@ class UserRepositoryBase(abc.ABC):
         discord_id: int,
         channel_id: int,
         channel_name: str,
-        is_solo: bool,
+        is_tracked: bool,
         started_at: datetime,
     ) -> None:
         """Insert a new voice session entry."""
@@ -448,21 +448,21 @@ class UserRepositoryBase(abc.ABC):
         """Return whether the user currently has an open voice session row."""
 
     @abc.abstractmethod
-    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
-        """Return member IDs that currently have open solo voice sessions in a guild."""
+    async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
+        """Return member IDs that currently have open tracked voice sessions in a guild."""
 
     @abc.abstractmethod
-    async def get_solo_voice_totals(
+    async def get_tracked_voice_totals(
         self,
         guild_id: int,
         *,
         now: datetime,
         since: Optional[datetime] = None,
     ) -> dict[int, float]:
-        """Return total solo-channel voice time in seconds per user."""
+        """Return total tracked-channel voice time in seconds per user."""
 
     @abc.abstractmethod
-    async def get_solo_voice_summary(
+    async def get_tracked_voice_summary(
         self,
         guild_id: int,
         *,
@@ -470,7 +470,7 @@ class UserRepositoryBase(abc.ABC):
         week_since: datetime,
         month_since: datetime,
     ) -> dict[int, dict[str, float]]:
-        """Return per-user solo totals for week, month, and all time in one query."""
+        """Return per-user tracked totals for week, month, and all time in one query."""
 
     @abc.abstractmethod
     async def get_guild_command_config(self, guild_id: int) -> Optional[GuildCommandConfig]:
@@ -602,7 +602,7 @@ class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
     _SCHEMA_LOCK_KEY = 3_310_920_014_991
-    _LATEST_SCHEMA_VERSION = 4
+    _LATEST_SCHEMA_VERSION = 5
 
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
@@ -663,6 +663,7 @@ class UserRepository(UserRepositoryBase):
             2: self._migration_002_add_indexes,
             3: self._migration_003_enforce_integrity_constraints,
             4: self._migration_004_add_platform_to_sent_reminders,
+            5: self._migration_005_rename_is_solo_to_is_tracked,
         }
 
         if current_version > self._LATEST_SCHEMA_VERSION:
@@ -750,7 +751,7 @@ class UserRepository(UserRepositoryBase):
                 discord_id BIGINT NOT NULL,
                 channel_id BIGINT NOT NULL,
                 channel_name TEXT NOT NULL,
-                is_solo BOOLEAN NOT NULL DEFAULT FALSE,
+                is_tracked BOOLEAN NOT NULL DEFAULT FALSE,
                 started_at TIMESTAMPTZ NOT NULL,
                 ended_at TIMESTAMPTZ
             )
@@ -871,8 +872,8 @@ class UserRepository(UserRepositoryBase):
         )
         await conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_solo_started
-            ON voice_sessions (guild_id, is_solo, started_at)
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
+            ON voice_sessions (guild_id, is_tracked, started_at)
             """
         )
         await conn.execute(
@@ -1020,6 +1021,24 @@ class UserRepository(UserRepositoryBase):
             """
             ALTER TABLE sent_reminders
             ADD PRIMARY KEY (guild_id, channel_id, platform, contest_id, reminder_type)
+            """
+        )
+
+    async def _migration_005_rename_is_solo_to_is_tracked(self, conn: asyncpg.Connection) -> None:
+        # Rename the is_solo column to is_tracked to reflect that keyword-matched
+        # (non-solo) channels also set this flag.
+        await conn.execute(
+            """
+            ALTER TABLE voice_sessions
+            RENAME COLUMN is_solo TO is_tracked
+            """
+        )
+        # Drop the old index (created in migration 002) and recreate under the new name.
+        await conn.execute("DROP INDEX IF EXISTS idx_voice_sessions_solo_started")
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
+            ON voice_sessions (guild_id, is_tracked, started_at)
             """
         )
 
@@ -1320,7 +1339,7 @@ class UserRepository(UserRepositoryBase):
         discord_id: int,
         channel_id: int,
         channel_name: str,
-        is_solo: bool,
+        is_tracked: bool,
         started_at: datetime,
     ) -> None:
         assert self._pool is not None, "Call init() first"
@@ -1328,7 +1347,7 @@ class UserRepository(UserRepositoryBase):
             await conn.execute(
                 """
                 INSERT INTO voice_sessions (
-                    guild_id, discord_id, channel_id, channel_name, is_solo, started_at
+                    guild_id, discord_id, channel_id, channel_name, is_tracked, started_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6)
                 """,
@@ -1336,7 +1355,7 @@ class UserRepository(UserRepositoryBase):
                 discord_id,
                 channel_id,
                 channel_name,
-                is_solo,
+                is_tracked,
                 started_at,
             )
 
@@ -1377,7 +1396,7 @@ class UserRepository(UserRepositoryBase):
             )
         return row is not None
 
-    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
+    async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -1385,14 +1404,14 @@ class UserRepository(UserRepositoryBase):
                 SELECT DISTINCT discord_id
                 FROM voice_sessions
                 WHERE guild_id = $1
-                  AND is_solo = TRUE
+                  AND is_tracked = TRUE
                   AND ended_at IS NULL
                 """,
                 guild_id,
             )
         return {int(row["discord_id"]) for row in rows}
 
-    async def get_solo_voice_totals(
+    async def get_tracked_voice_totals(
         self,
         guild_id: int,
         *,
@@ -1412,7 +1431,7 @@ class UserRepository(UserRepositoryBase):
                            ) AS seconds
                     FROM voice_sessions
                     WHERE guild_id = $1
-                      AND is_solo = TRUE
+                      AND is_tracked = TRUE
                       AND started_at < $2
                     GROUP BY discord_id
                     HAVING SUM(
@@ -1437,7 +1456,7 @@ class UserRepository(UserRepositoryBase):
                            ) AS seconds
                     FROM voice_sessions
                     WHERE guild_id = $1
-                      AND is_solo = TRUE
+                      AND is_tracked = TRUE
                       AND started_at < $3
                       AND COALESCE(ended_at, $3) > $2
                     GROUP BY discord_id
@@ -1455,7 +1474,7 @@ class UserRepository(UserRepositoryBase):
                 )
         return {row["discord_id"]: float(row["seconds"]) for row in rows}
 
-    async def get_solo_voice_summary(
+    async def get_tracked_voice_summary(
         self,
         guild_id: int,
         *,
@@ -1498,7 +1517,7 @@ class UserRepository(UserRepositoryBase):
                     ) AS month_seconds
                 FROM voice_sessions
                 WHERE guild_id = $1
-                  AND is_solo = TRUE
+                  AND is_tracked = TRUE
                   AND started_at < $2
                 GROUP BY discord_id
                 HAVING SUM(

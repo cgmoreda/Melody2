@@ -57,13 +57,13 @@ class _FakeBot:
 
 
 class _FakeRepo:
-    def __init__(self, open_solo_by_guild: dict[int, set[int]] | None = None) -> None:
-        self._open_solo_by_guild = open_solo_by_guild or {}
+    def __init__(self, open_tracked_by_guild: dict[int, set[int]] | None = None) -> None:
+        self._open_tracked_by_guild = open_tracked_by_guild or {}
         self.closed_calls: list[tuple[int, int, datetime]] = []
         self.started_calls: list[dict[str, Any]] = []
 
-    async def get_open_solo_voice_member_ids(self, guild_id: int) -> set[int]:
-        return set(self._open_solo_by_guild.get(guild_id, set()))
+    async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
+        return set(self._open_tracked_by_guild.get(guild_id, set()))
 
     async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
         self.closed_calls.append((guild_id, discord_id, ended_at))
@@ -75,7 +75,7 @@ class _FakeRepo:
         discord_id: int,
         channel_id: int,
         channel_name: str,
-        is_solo: bool,
+        is_tracked: bool,
         started_at: datetime,
     ) -> None:
         self.started_calls.append(
@@ -84,7 +84,7 @@ class _FakeRepo:
                 "discord_id": discord_id,
                 "channel_id": channel_id,
                 "channel_name": channel_name,
-                "is_solo": is_solo,
+                "is_tracked": is_tracked,
                 "started_at": started_at,
             }
         )
@@ -97,6 +97,9 @@ class _FakeConfigService:
             voice_confirm_timeout_seconds = 60
 
         return _Config()
+
+    async def get_text(self, guild_id: int, key: str) -> str:
+        return ""
 
 
 @pytest.mark.asyncio
@@ -145,7 +148,7 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
     non_solo_channel = _FakeVoiceChannel(777, "General Voice", [member_not_solo])
     guild = _FakeGuild(100, [solo_channel, non_solo_channel])
 
-    repo = _FakeRepo(open_solo_by_guild={100: {2, 3}})
+    repo = _FakeRepo(open_tracked_by_guild={100: {2, 3}})
     cog = VoiceLoggingCog(
         bot=_FakeBot([guild]),  # type: ignore[arg-type]
         repo=repo,  # type: ignore[arg-type]
@@ -169,7 +172,7 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
     assert start_call["discord_id"] == 1
     assert start_call["channel_id"] == 501
     assert start_call["channel_name"] == "Solo Room A"
-    assert start_call["is_solo"] is True
+    assert start_call["is_tracked"] is True
     assert start_call["started_at"].tzinfo is UTC
 
     assert sorted(started_watchdogs) == [1, 2]
@@ -228,6 +231,6 @@ async def test_voice_state_switch_starts_new_session_and_watchdog_for_solo_chann
     assert start_call["guild_id"] == guild.id
     assert start_call["discord_id"] == member.id
     assert start_call["channel_id"] == target_channel.id
-    assert start_call["is_solo"] is True
+    assert start_call["is_tracked"] is True
 
     assert started == [member.id]
