@@ -41,7 +41,8 @@ class VoiceService:
 
     @staticmethod
     def is_solo_channel_name(channel_name: str) -> bool:
-        return "solo" in channel_name.lower()
+        normalized = channel_name.strip().lower()
+        return normalized.startswith(("solo #", "solo room"))
 
     @staticmethod
     def _normalize_window_unit(raw: str) -> Optional[str]:

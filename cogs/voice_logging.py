@@ -53,11 +53,31 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._config = config_service
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
+        self._tracked_keywords_cache: dict[int, list[str]] = {}
 
     def cog_unload(self) -> None:
         for task in self._watchdogs.values():
             task.cancel()
         self._watchdogs.clear()
+
+    async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
+        cached = self._tracked_keywords_cache.get(guild_id)
+        if cached is not None:
+            return cached
+        raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
+        keywords = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        self._tracked_keywords_cache[guild_id] = keywords
+        return keywords
+
+    async def _is_tracked_channel(self, guild_id: int, channel: discord.VoiceChannel) -> bool:
+        """Return True if channel counts for voice hours (solo or keyword match)."""
+        if _is_solo_channel(channel):
+            return True
+        keywords = await self._get_tracked_keywords(guild_id)
+        if not keywords:
+            return False
+        name_lower = channel.name.lower()
+        return any(kw in name_lower for kw in keywords)
 
     async def _start_voice_session(
         self,
@@ -67,12 +87,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         channel: discord.VoiceChannel,
         started_at: datetime,
     ) -> None:
+        tracked = await self._is_tracked_channel(guild_id, channel)
         await self._repo.start_voice_session(
             guild_id=guild_id,
             discord_id=member_id,
             channel_id=channel.id,
             channel_name=channel.name,
-            is_solo=_is_solo_channel(channel),
+            is_tracked=tracked,
             started_at=started_at,
         )
 
@@ -80,23 +101,24 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def on_ready(self) -> None:
         now = datetime.now(tz=UTC)
         for guild in self.bot.guilds:
-            active_solo_channels_by_member_id: dict[int, discord.VoiceChannel] = {}
+            active_tracked_by_member: dict[int, discord.VoiceChannel] = {}
             for voice_channel in guild.voice_channels:
-                if not _is_solo_channel(voice_channel):
+                is_tracked = await self._is_tracked_channel(guild.id, voice_channel)
+                if not is_tracked:
                     continue
                 for member in voice_channel.members:
                     if member.bot:
                         continue
-                    active_solo_channels_by_member_id[member.id] = voice_channel
+                    active_tracked_by_member[member.id] = voice_channel
 
-            active_solo_member_ids = set(active_solo_channels_by_member_id)
-            open_solo_member_ids = await self._repo.get_open_solo_voice_member_ids(guild.id)
+            active_member_ids = set(active_tracked_by_member)
+            open_tracked_member_ids = await self._repo.get_open_tracked_voice_member_ids(guild.id)
 
-            for stale_member_id in open_solo_member_ids - active_solo_member_ids:
+            for stale_member_id in open_tracked_member_ids - active_member_ids:
                 await self._repo.close_open_voice_sessions(guild.id, stale_member_id, now)
 
-            for member_id, voice_channel in active_solo_channels_by_member_id.items():
-                if member_id not in open_solo_member_ids:
+            for member_id, voice_channel in active_tracked_by_member.items():
+                if member_id not in open_tracked_member_ids:
                     await self._start_voice_session(
                         guild_id=guild.id,
                         member_id=member_id,
@@ -104,9 +126,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         started_at=now,
                     )
 
-                member = guild.get_member(member_id)
-                if member is not None:
-                    self._start_watchdog(member)
+                # Watchdog only for strict solo channels
+                if _is_solo_channel(voice_channel):
+                    member = guild.get_member(member_id)
+                    if member is not None:
+                        self._start_watchdog(member)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -284,7 +308,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
     async def voicehours(self, ctx: commands.Context, *args: str) -> None:
-        """Show solo voice-channel hours.
+        """Show tracked voice-channel hours.
+
+        Hours are counted for channels whose names start with ``solo #`` as well
+        as any channels whose names contain a keyword configured via
+        ``!voicehours track add``.
 
         Usage:
         - `!voicehours`
@@ -295,6 +323,9 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours role <@role> [last <x> <hour/day/week/month>]`
         - `!voicehours roles [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
+        - `!voicehours track list`
+        - `!voicehours track add <keyword>`
+        - `!voicehours track remove <keyword>`
         """
         assert ctx.guild is not None
 
@@ -318,14 +349,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 if not totals:
-                    await ctx.send("No solo-channel voice logs found for that period.")
+                    await ctx.send("No tracked-channel voice logs found for that period.")
                     return
 
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
                 content = self._render_ranked_message(
-                    title=f"**Top Solo Voice Hours ({label})**",
+                    title=f"**Top Tracked Voice Hours ({label})**",
                     lines=lines,
                     max_lines=limit,
                     overflow_label="users",
@@ -369,7 +400,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     )
                     return
 
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 threshold_seconds = minimum_hours * 3600.0
                 members_by_id: dict[int, discord.Member] = {}
                 for role in matching_roles:
@@ -423,10 +454,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 rank_data = self._find_rank(totals, ctx.author.id)
                 if rank_data is None:
-                    await ctx.send(f"You have no solo voice logs for {label}.")
+                    await ctx.send(f"You have no tracked voice logs for {label}.")
                     return
                 rank, seconds = rank_data
                 await ctx.send(f"**{ctx.author.display_name}** in {label}: **{_hours(seconds)}** (rank **#{rank}**)")
@@ -447,7 +478,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 seconds = totals.get(target_member.id, 0.0)
                 rank_data = self._find_rank(totals, target_member.id)
                 rank_text = f" (rank **#{rank_data[0]}**)" if rank_data is not None else ""
@@ -469,18 +500,18 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                all_totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                all_totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 member_ids = {member.id for member in target_role.members if not member.bot}
                 totals = {discord_id: value for discord_id, value in all_totals.items() if discord_id in member_ids}
                 if not totals:
-                    await ctx.send(f"No solo voice logs found for role {target_role.mention} in {label}.")
+                    await ctx.send(f"No tracked voice logs found for role {target_role.mention} in {label}.")
                     return
 
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Solo Voice Hours for {target_role.name} ({label})**",
+                        title=f"**Tracked Voice Hours for {target_role.name} ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="users",
@@ -488,25 +519,25 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
-            if mode in {"roles", "teams"}:
+            if mode in {"roles", "teams", "unis"}:
                 try:
                     since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
                 except ValueError as err:
                     await ctx.send(str(err))
                     return
 
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
-                team_roles = [
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                uni_roles = [
                     role
                     for role in ctx.guild.roles
-                    if "team" in role.name.lower() and role.name != "@everyone"
+                    if "uni" in role.name.lower() and role.name != "@everyone"
                 ]
-                if not team_roles:
-                    await ctx.send("No roles containing `team` were found in this server.")
+                if not uni_roles:
+                    await ctx.send("No roles containing `uni` were found in this server.")
                     return
 
                 role_totals: list[tuple[str, float, int]] = []
-                for role in team_roles:
+                for role in uni_roles:
                     non_bot_members = [member for member in role.members if not member.bot]
                     seconds_sum = 0.0
                     for member in non_bot_members:
@@ -522,7 +553,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Team Role Solo Voice Standings ({label})**",
+                        title=f"**Uni Role Tracked Voice Standings ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="roles",
@@ -536,15 +567,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 except ValueError as err:
                     await ctx.send(str(err))
                     return
-                totals = await self._repo.get_solo_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 if not totals:
-                    await ctx.send("No solo-channel voice logs found for that period.")
+                    await ctx.send("No tracked-channel voice logs found for that period.")
                     return
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
-                        title=f"**Solo Voice Hours ({label})**",
+                        title=f"**Tracked Voice Hours ({label})**",
                         lines=lines,
                         max_lines=config.voicehours_max_lines,
                         overflow_label="users",
@@ -552,16 +583,20 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
+            if mode == "track":
+                await self._handle_track(ctx, args[1:])
+                return
+
             await ctx.send(
                 "Unknown mode.\n"
-                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `top`.\n"
+                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `top`, `track`.\n"
                 "Example: `!voicehours top 20 last 2 weeks`"
             )
             return
 
         week_since = now - timedelta(days=7)
         month_since = now - timedelta(days=30)
-        summary = await self._repo.get_solo_voice_summary(
+        summary = await self._repo.get_tracked_voice_summary(
             ctx.guild.id,
             now=now,
             week_since=week_since,
@@ -572,7 +607,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         all_time = {discord_id: row["all_time"] for discord_id, row in summary.items()}
 
         if not all_time and not week and not month:
-            await ctx.send("No solo-channel voice logs found yet.")
+            await ctx.send("No tracked-channel voice logs found yet.")
             return
 
         all_ids = set(week) | set(month) | set(all_time)
@@ -601,6 +636,94 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             message_lines.append(f"Your all-time rank: **#{rank}** with **{_hours(seconds)}**")
         for chunk in split_lines_chunks(message_lines):
             await ctx.send(chunk)
+
+    # ── track subcommand logic ──────────────────────────────────
+
+    async def _handle_track(self, ctx: commands.Context, args: tuple[str, ...]) -> None:
+        """Handle `!voicehours track add|remove|list`."""
+        assert ctx.guild is not None
+
+        if not args:
+            await ctx.send(
+                "Usage:\n"
+                "`!voicehours track list`\n"
+                "`!voicehours track add <keyword>`\n"
+                "`!voicehours track remove <keyword>`"
+            )
+            return
+
+        action = args[0].lower()
+
+        if action == "list":
+            raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+            keywords = [k.strip() for k in raw.split(",") if k.strip()]
+            if not keywords:
+                await ctx.send(
+                    "No tracked keywords configured. Only `solo #` channels count.\n"
+                    "Use `!voicehours track add <keyword>` to add one."
+                )
+                return
+            listing = "\n".join(f"• `{kw}`" for kw in keywords)
+            await ctx.send(
+                f"**Tracked keywords** (channels containing any of these count in voice hours):\n"
+                f"{listing}\n\n`solo #` channels are always tracked."
+            )
+            return
+
+        if action == "add":
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("You need Administrator permission for this.")
+                return
+            if len(args) < 2:
+                await ctx.send("Usage: `!voicehours track add <keyword>`")
+                return
+            keyword = " ".join(args[1:]).strip().lower()
+            if not keyword:
+                await ctx.send("Keyword cannot be empty.")
+                return
+
+            raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+            existing = [k.strip().lower() for k in raw.split(",") if k.strip()]
+            if keyword in existing:
+                await ctx.send(f"`{keyword}` is already tracked.")
+                return
+
+            existing.append(keyword)
+            await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+            self._tracked_keywords_cache.pop(ctx.guild.id, None)
+            await ctx.send(f"Added `{keyword}`. Channels containing it will now count in voice hours.")
+            return
+
+        if action == "remove":
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send("You need Administrator permission for this.")
+                return
+            if len(args) < 2:
+                await ctx.send("Usage: `!voicehours track remove <keyword>`")
+                return
+            keyword = " ".join(args[1:]).strip().lower()
+
+            raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+            existing = [k.strip().lower() for k in raw.split(",") if k.strip()]
+            if keyword not in existing:
+                await ctx.send(f"`{keyword}` is not currently tracked.")
+                return
+
+            existing.remove(keyword)
+            if existing:
+                await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+            else:
+                await self._config.reset_text(ctx.guild.id, "voice_tracked_keywords")
+            self._tracked_keywords_cache.pop(ctx.guild.id, None)
+            await ctx.send(f"Removed `{keyword}` from tracked keywords.")
+            return
+
+        await ctx.send(
+            "Usage:\n"
+            "`!voicehours track list`\n"
+            "`!voicehours track add <keyword>`\n"
+            "`!voicehours track remove <keyword>`"
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

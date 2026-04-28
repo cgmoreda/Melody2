@@ -11,6 +11,7 @@ from services.cf_client import CodeforcesClient
 from services.coach_secretary import CoachSecretary
 from services.atcoder_client import AtCoderProvider
 from services.contest_reminder import CodeforcesProvider, ContestReminderService
+from services.dynamic_voice import DynamicVoiceManager
 from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssigner
 
@@ -29,6 +30,7 @@ EXTENSIONS: tuple[str, ...] = (
     "cogs.gym",
     "cogs.coach_secretary",
     "cogs.voice_logging",
+    "cogs.dynamic_voice",
 )
 
 
@@ -116,6 +118,10 @@ async def _setup_services(bot: commands.Bot) -> None:
     guild_config = GuildConfigService(repo)
     bot.guild_config = guild_config  # type: ignore[attr-defined]
     logger.info("Guild config service ready")
+
+    dynamic_voice = DynamicVoiceManager()
+    bot.dynamic_voice = dynamic_voice  # type: ignore[attr-defined]
+    logger.info("Dynamic voice manager ready")
 
 
 async def _teardown_services(bot: commands.Bot) -> None:
