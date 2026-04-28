@@ -53,11 +53,31 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._config = config_service
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
+        self._tracked_keywords_cache: dict[int, list[str]] = {}
 
     def cog_unload(self) -> None:
         for task in self._watchdogs.values():
             task.cancel()
         self._watchdogs.clear()
+
+    async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
+        cached = self._tracked_keywords_cache.get(guild_id)
+        if cached is not None:
+            return cached
+        raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
+        keywords = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        self._tracked_keywords_cache[guild_id] = keywords
+        return keywords
+
+    async def _is_tracked_channel(self, guild_id: int, channel: discord.VoiceChannel) -> bool:
+        """Return True if channel counts for voice hours (solo or keyword match)."""
+        if _is_solo_channel(channel):
+            return True
+        keywords = await self._get_tracked_keywords(guild_id)
+        if not keywords:
+            return False
+        name_lower = channel.name.lower()
+        return any(kw in name_lower for kw in keywords)
 
     async def _start_voice_session(
         self,
@@ -67,12 +87,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         channel: discord.VoiceChannel,
         started_at: datetime,
     ) -> None:
+        tracked = await self._is_tracked_channel(guild_id, channel)
         await self._repo.start_voice_session(
             guild_id=guild_id,
             discord_id=member_id,
             channel_id=channel.id,
             channel_name=channel.name,
-            is_solo=_is_solo_channel(channel),
+            is_solo=tracked,
             started_at=started_at,
         )
 
@@ -80,22 +101,23 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def on_ready(self) -> None:
         now = datetime.now(tz=UTC)
         for guild in self.bot.guilds:
-            active_solo_channels_by_member_id: dict[int, discord.VoiceChannel] = {}
+            active_tracked_by_member: dict[int, discord.VoiceChannel] = {}
             for voice_channel in guild.voice_channels:
-                if not _is_solo_channel(voice_channel):
+                is_tracked = await self._is_tracked_channel(guild.id, voice_channel)
+                if not is_tracked:
                     continue
                 for member in voice_channel.members:
                     if member.bot:
                         continue
-                    active_solo_channels_by_member_id[member.id] = voice_channel
+                    active_tracked_by_member[member.id] = voice_channel
 
-            active_solo_member_ids = set(active_solo_channels_by_member_id)
+            active_member_ids = set(active_tracked_by_member)
             open_solo_member_ids = await self._repo.get_open_solo_voice_member_ids(guild.id)
 
-            for stale_member_id in open_solo_member_ids - active_solo_member_ids:
+            for stale_member_id in open_solo_member_ids - active_member_ids:
                 await self._repo.close_open_voice_sessions(guild.id, stale_member_id, now)
 
-            for member_id, voice_channel in active_solo_channels_by_member_id.items():
+            for member_id, voice_channel in active_tracked_by_member.items():
                 if member_id not in open_solo_member_ids:
                     await self._start_voice_session(
                         guild_id=guild.id,
@@ -104,9 +126,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         started_at=now,
                     )
 
-                member = guild.get_member(member_id)
-                if member is not None:
-                    self._start_watchdog(member)
+                # Watchdog only for strict solo channels
+                if _is_solo_channel(voice_channel):
+                    member = guild.get_member(member_id)
+                    if member is not None:
+                        self._start_watchdog(member)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -601,6 +625,96 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             message_lines.append(f"Your all-time rank: **#{rank}** with **{_hours(seconds)}**")
         for chunk in split_lines_chunks(message_lines):
             await ctx.send(chunk)
+
+    # ── voicetrack command group ────────────────────────────────
+
+    @commands.group(name="voicetrack", invoke_without_command=True)
+    @commands.guild_only()
+    async def voicetrack(self, ctx: commands.Context) -> None:
+        """Manage which non-solo channels count in voice hours.
+
+        Usage:
+        - `!voicetrack add <keyword>`
+        - `!voicetrack remove <keyword>`
+        - `!voicetrack list`
+        """
+        await ctx.send(
+            "Usage: `!voicetrack add <keyword>` | `!voicetrack remove <keyword>` | `!voicetrack list`"
+        )
+
+    @voicetrack.command(name="add")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def voicetrack_add(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Add a keyword. Channels containing it will count in voice hours."""
+        assert ctx.guild is not None
+        keyword = keyword.strip().lower()
+        if not keyword:
+            await ctx.send("Keyword cannot be empty.")
+            return
+
+        raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+        existing = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        if keyword in existing:
+            await ctx.send(f"`{keyword}` is already tracked.")
+            return
+
+        existing.append(keyword)
+        await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+        self._tracked_keywords_cache.pop(ctx.guild.id, None)
+        await ctx.send(f"Added `{keyword}` to tracked keywords. Channels containing it will now count in voice hours.")
+
+    @voicetrack.command(name="remove")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def voicetrack_remove(self, ctx: commands.Context, *, keyword: str) -> None:
+        """Remove a tracked keyword."""
+        assert ctx.guild is not None
+        keyword = keyword.strip().lower()
+
+        raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+        existing = [k.strip().lower() for k in raw.split(",") if k.strip()]
+        if keyword not in existing:
+            await ctx.send(f"`{keyword}` is not currently tracked.")
+            return
+
+        existing.remove(keyword)
+        await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+        self._tracked_keywords_cache.pop(ctx.guild.id, None)
+        await ctx.send(f"Removed `{keyword}` from tracked keywords.")
+
+    @voicetrack.command(name="list")
+    @commands.guild_only()
+    async def voicetrack_list(self, ctx: commands.Context) -> None:
+        """Show all tracked keywords."""
+        assert ctx.guild is not None
+        raw = await self._config.get_text(ctx.guild.id, "voice_tracked_keywords")
+        keywords = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keywords:
+            await ctx.send("No tracked keywords configured. Only `solo #` channels count.\nUse `!voicetrack add <keyword>` to add one.")
+            return
+        listing = "\n".join(f"• `{kw}`" for kw in keywords)
+        await ctx.send(f"**Tracked keywords** (channels containing any of these count in voice hours):\n{listing}\n\n`solo #` channels are always tracked.")
+
+    @voicetrack_add.error
+    async def voicetrack_add_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need Administrator permission for this command.")
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: `!voicetrack add <keyword>`")
+            return
+        raise error
+
+    @voicetrack_remove.error
+    async def voicetrack_remove_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need Administrator permission for this command.")
+            return
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: `!voicetrack remove <keyword>`")
+            return
+        raise error
 
 
 async def setup(bot: commands.Bot) -> None:

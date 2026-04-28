@@ -51,6 +51,7 @@ CONFIG_SPECS: dict[str, tuple[str, int, int, str]] = {
 DEFAULT_TEXT_CONFIG: dict[str, str] = {
     "training_role_substring": "training arc",
     "coach_role_substring": "coach",
+    "voice_tracked_keywords": "",
 }
 
 TEXT_CONFIG_SPECS: dict[str, tuple[int, str]] = {
@@ -61,6 +62,10 @@ TEXT_CONFIG_SPECS: dict[str, tuple[int, str]] = {
     "coach_role_substring": (
         64,
         "Substring used to detect coach roles for gym management.",
+    ),
+    "voice_tracked_keywords": (
+        256,
+        "Comma-separated keywords. Channels whose name contains any keyword count in voice hours.",
     ),
 }
 
