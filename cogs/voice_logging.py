@@ -710,7 +710,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return
 
             existing.remove(keyword)
-            await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+            if existing:
+                await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
+            else:
+                await self._config.reset_text(ctx.guild.id, "voice_tracked_keywords")
             self._tracked_keywords_cache.pop(ctx.guild.id, None)
             await ctx.send(f"Removed `{keyword}` from tracked keywords.")
             return
