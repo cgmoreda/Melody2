@@ -546,9 +546,9 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 role_totals.sort(key=lambda item: (-item[1], item[0].lower()))
 
-                lines = ["rk   role               total    members"]
+                lines = ["rk   role                      total    members"]
                 for index, (role_name, seconds, member_count) in enumerate(role_totals, start=1):
-                    lines.append(f"{_rank_prefix(index):<4} {role_name:<18.18} {_hours(seconds):<8} {member_count}")
+                    lines.append(f"{_rank_prefix(index):<4} {role_name:<25.25} {_hours(seconds):<8} {member_count}")
 
                 await send_context_text_chunks(
                     ctx,
