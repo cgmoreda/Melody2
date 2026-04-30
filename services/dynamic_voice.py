@@ -102,7 +102,7 @@ class DynamicVoiceManager:
             return True  # fallback: allow if we can't determine the group
 
         member_group = self._get_role_name(member, "Team ")
-        return member_group is not None and member_group == required_group
+        return member_group is not None and member_group.lower() == required_group.lower()
 
     def cancel_pending_delete(self, channel_id: int) -> None:
         """Cancel a pending deletion task for a channel, if one exists."""
@@ -205,9 +205,10 @@ class DynamicVoiceManager:
 
     @staticmethod
     def _get_role_name(member: discord.Member, prefix: str) -> Optional[str]:
-        """Return the name portion after *prefix* from the member's roles."""
+        """Return the name portion after *prefix* from the member's roles (case-insensitive)."""
+        prefix_lower = prefix.lower()
         for role in member.roles:
-            if role.name.startswith(prefix):
+            if role.name.lower().startswith(prefix_lower):
                 return role.name[len(prefix):]
         return None
 
@@ -233,25 +234,19 @@ class DynamicVoiceManager:
 
         Fallback chain:
         - Solo: always "solo"
-        - Duo:  Uni role → display_name
-        - Team: Team role → Uni role → display_name
+        - Duo/Team: Team role → Uni role → display_name
         """
         if channel_type is ChannelType.SOLO:
             return "solo"
 
-        if channel_type is ChannelType.DUO:
-            name = self._get_role_name(member, "Uni ")
-            if name is None:
-                name = member.display_name
-            return f"{name} Duo"
-
-        # TEAM: Team role → Uni role → display_name
         name = self._get_role_name(member, "Team ")
         if name is None:
             name = self._get_role_name(member, "Uni ")
         if name is None:
             name = member.display_name
-        return f"{name} Team"
+
+        suffix = " Duo" if channel_type is ChannelType.DUO else " Team"
+        return f"{name}{suffix}"
 
     def _build_overwrites(
         self,
@@ -284,9 +279,9 @@ class DynamicVoiceManager:
 
     @staticmethod
     def _find_team_role(member: discord.Member) -> Optional[discord.Role]:
-        """Return the first role with prefix 'Team ' from the member's roles."""
+        """Return the first role with prefix 'Team ' from the member's roles (case-insensitive)."""
         for role in member.roles:
-            if role.name.startswith("Team "):
+            if role.name.lower().startswith("team "):
                 return role
         return None
 
