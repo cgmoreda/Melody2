@@ -72,6 +72,41 @@ class DynamicVoiceManager:
                 return True
         return False
 
+    def get_tracked_info(self, channel_id: int) -> Optional[TrackedChannel]:
+        """Return TrackedChannel metadata, or None if not tracked."""
+        for guild_channels in self._channels.values():
+            info = guild_channels.get(channel_id)
+            if info is not None:
+                return info
+        return None
+
+    async def check_access(self, member: discord.Member, channel: discord.VoiceChannel) -> bool:
+        """Return True if *member* is allowed in the dynamic channel.
+
+        Solo channels: always allowed.
+        Duo/Team channels: member must have a role whose 'Team ' suffix
+        matches the channel label (e.g. label 'Assiut Duo' requires 'Team Assiut').
+        """
+        info = self.get_tracked_info(channel.id)
+        if info is None:
+            return True  # not tracked → no restriction
+        if info.channel_type is ChannelType.SOLO:
+            return True
+
+        # Extract the group name from the label (e.g. 'Assiut Duo' → 'Assiut')
+        required_group = self._extract_group_from_label(info.label, info.channel_type)
+        if required_group is None:
+            return True  # fallback: allow if we can't determine the group
+
+        member_group = self._get_role_name(member, "Team ")
+        return member_group is not None and member_group == required_group
+
+    def cancel_pending_delete(self, channel_id: int) -> None:
+        """Cancel a pending deletion task for a channel, if one exists."""
+        task = self._delete_tasks.pop(channel_id, None)
+        if task is not None:
+            task.cancel()
+
     async def handle_join(
         self,
         member: discord.Member,
@@ -87,11 +122,14 @@ class DynamicVoiceManager:
             user_limit = USER_LIMITS[channel_type]
             category = entry_channel.category
 
+            overwrites = self._build_overwrites(member, channel_type)
+
             try:
                 new_channel = await member.guild.create_voice_channel(
                     name=channel_name,
                     user_limit=user_limit,
                     category=category,
+                    overwrites=overwrites,
                     reason=f"Dynamic {channel_type.value} channel for {member.display_name}",
                 )
             except (discord.Forbidden, discord.HTTPException) as exc:
@@ -170,6 +208,23 @@ class DynamicVoiceManager:
                 return role.name[len(prefix):]
         return None
 
+    @staticmethod
+    def _extract_group_from_label(label: str, channel_type: ChannelType) -> Optional[str]:
+        """Extract the group name from a channel label.
+
+        'Assiut Duo' → 'Assiut', 'Cairo Team' → 'Cairo'.
+        Returns None for solo or unrecognised labels.
+        """
+        if channel_type is ChannelType.DUO:
+            suffix = " Duo"
+        elif channel_type is ChannelType.TEAM:
+            suffix = " Team"
+        else:
+            return None
+        if label.endswith(suffix):
+            return label[: -len(suffix)]
+        return None
+
     def _build_label(self, member: discord.Member, channel_type: ChannelType) -> str:
         """Build the base label for a channel (without the #N suffix).
 
@@ -194,6 +249,43 @@ class DynamicVoiceManager:
         if name is None:
             name = member.display_name
         return f"{name} Team"
+
+    def _build_overwrites(
+        self,
+        member: discord.Member,
+        channel_type: ChannelType,
+    ) -> dict[discord.Role | discord.Member, discord.PermissionOverwrite]:
+        """Build permission overwrites for a new dynamic channel.
+
+        Solo: no restrictions (inherits category permissions).
+        Duo/Team: deny @everyone connect, allow matching Team role.
+        """
+        if channel_type is ChannelType.SOLO:
+            return {}  # inherit defaults
+
+        overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
+
+        # Deny @everyone connect
+        everyone_role = member.guild.default_role
+        overwrites[everyone_role] = discord.PermissionOverwrite(connect=False)
+
+        # Find and allow the creator's Team role
+        team_role = self._find_team_role(member)
+        if team_role is not None:
+            overwrites[team_role] = discord.PermissionOverwrite(connect=True)
+        else:
+            # Fallback: allow creator explicitly when they have no Team role
+            overwrites[member] = discord.PermissionOverwrite(connect=True)
+
+        return overwrites
+
+    @staticmethod
+    def _find_team_role(member: discord.Member) -> Optional[discord.Role]:
+        """Return the first role with prefix 'Team ' from the member's roles."""
+        for role in member.roles:
+            if role.name.startswith("Team "):
+                return role
+        return None
 
     def _next_number(self, guild_id: int, label: str) -> int:
         """Return the lowest unused number for *label* in a guild."""

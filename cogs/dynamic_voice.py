@@ -41,11 +41,27 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
         if before.channel is not None and isinstance(before.channel, discord.VoiceChannel):
             await self._manager.handle_leave(before.channel)
 
-        # Handle join to an entry channel
+        # Handle join to an entry channel OR a tracked dynamic channel
         if after.channel is not None and isinstance(after.channel, discord.VoiceChannel):
             channel_type = self._manager.is_entry_channel(after.channel.name)
             if channel_type is not None:
                 await self._manager.handle_join(member, after.channel, channel_type)
+            elif self._manager.is_tracked(after.channel.id):
+                # Enforce role-based access for duo/team channels
+                allowed = await self._manager.check_access(member, after.channel)
+                if not allowed:
+                    try:
+                        await member.move_to(None, reason="No matching team role for this channel")
+                        logger.info(
+                            "Blocked member %s from channel %s (no matching role)",
+                            member.id,
+                            after.channel.name,
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        logger.error("Failed to remove unauthorized member %s: %s", member.id, exc)
+                else:
+                    # Cancel any pending deletion since someone joined
+                    self._manager.cancel_pending_delete(after.channel.id)
 
 
 async def setup(bot: commands.Bot) -> None:
