@@ -72,6 +72,15 @@ class DynamicVoiceManager:
                 return True
         return False
 
+    @staticmethod
+    def is_dynamic_channel_name(name: str) -> bool:
+        """Return True if *name* matches a dynamically-created channel name pattern.
+
+        This check is based solely on the channel name, so it works even before
+        :py:meth:`rebuild_state` has populated the in-memory tracking state.
+        """
+        return DynamicVoiceManager._parse_channel_name(name) is not None
+
     def get_tracked_info(self, channel_id: int) -> Optional[TrackedChannel]:
         """Return TrackedChannel metadata, or None if not tracked."""
         for guild_channels in self._channels.values():

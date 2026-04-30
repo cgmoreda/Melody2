@@ -88,10 +88,18 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - It is a solo channel (name starts with 'solo #' or 'solo room').
         - It is a dynamically-created channel (solo, duo, or team).
         - Its name contains a configured tracked keyword.
+
+        The dynamic-channel check uses both the in-memory manager state (populated
+        after ``rebuild_state`` completes) and a name-pattern fallback so that
+        channels are correctly identified even during the ``on_ready`` window before
+        ``DynamicVoiceCog.on_ready`` has finished rebuilding state.
         """
         if _is_solo_channel(channel):
             return True
-        if self._dynamic_voice is not None and self._dynamic_voice.is_tracked(channel.id):
+        if self._dynamic_voice is not None and (
+            self._dynamic_voice.is_tracked(channel.id)
+            or self._dynamic_voice.is_dynamic_channel_name(channel.name)
+        ):
             return True
         keywords = await self._get_tracked_keywords(guild_id)
         if not keywords:
