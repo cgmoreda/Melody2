@@ -93,7 +93,7 @@ class DynamicVoiceManager:
         """Return True if *member* is allowed in the dynamic channel.
 
         Solo channels: always allowed.
-        Creator is always allowed.
+        Creator is always allowed (when known; ``creator_id == 0`` means unknown after a restart).
         Duo/Team channels: member must have a role whose 'Team ' suffix
         matches the channel label (e.g. label 'Assiut Duo' requires 'Team Assiut').
         """
@@ -102,7 +102,10 @@ class DynamicVoiceManager:
             return True  # not tracked → no restriction
         if info.channel_type is ChannelType.SOLO:
             return True
-        if member.id == info.creator_id:
+        # Only apply the creator shortcut when the creator is known (creator_id > 0).
+        # creator_id == 0 is set by rebuild_state() when the creator could not be inferred
+        # from channel overwrites; in that case we fall through to the role-based check.
+        if info.creator_id != 0 and member.id == info.creator_id:
             return True
 
         # Extract the group name from the label (e.g. 'Assiut Duo' → 'Assiut')
@@ -203,7 +206,7 @@ class DynamicVoiceManager:
                     channel_id=vc.id,
                     guild_id=guild.id,
                     channel_type=channel_type,
-                    creator_id=0,
+                    creator_id=self._infer_creator_id_from_channel(vc),
                     label=label,
                     number=number,
                 )
@@ -211,6 +214,23 @@ class DynamicVoiceManager:
                 logger.info("Recovered tracked channel %s (id=%s)", vc.name, vc.id)
 
     # ── internals ───────────────────────────────────────────────
+
+    @staticmethod
+    def _infer_creator_id_from_channel(channel: discord.VoiceChannel) -> int:
+        """Try to recover the creator's Discord ID from channel permission overwrites.
+
+        When a Duo/Team channel is created for a member who has **no** Team role,
+        ``_build_overwrites`` adds a member-specific ``connect=True`` overwrite as a
+        fallback.  We can recover that member ID on restart by looking for the first
+        ``discord.Member`` target with an explicit ``connect=True`` overwrite.
+
+        Returns 0 when no such overwrite is found (e.g., the creator had a Team role
+        and was covered by the role overwrite rather than a member overwrite).
+        """
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Member) and overwrite.connect is True:
+                return target.id
+        return 0
 
     @staticmethod
     def _get_role_name(member: discord.Member, prefix: str) -> Optional[str]:
