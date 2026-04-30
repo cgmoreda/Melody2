@@ -2,8 +2,8 @@
 
 Melody2 is a Discord bot for Codeforces communities. It provides:
 - Codeforces account verification and rating-role updates
-- Contest reminder channels with restart-safe dedupe
-- Voice logging (solo sessions + watchdog checks)
+- Contest reminder channels (Codeforces + AtCoder) with restart-safe dedupe
+- Voice logging (solo sessions + watchdog checks) plus dynamic voice channel management
 - Gym management, tags, rating votes, and GALD trainee tracking
 - Coach secretary waiting-room routing
 - Per-guild command/text configuration
@@ -49,7 +49,7 @@ Reminders:
 - `!reminder enable [#channel]`
 - `!reminder disable [#channel]`
 - `!reminder status [#channel]`
-- `!reminder next`
+- `!reminder next [codeforces|atcoder]`
 
 Config:
 - `!config show`
@@ -74,7 +74,11 @@ Voice logging:
 - `!voicehours user <@member> [last <x> <hour|day|week|month>]`
 - `!voicehours role <@role> [last <x> <hour|day|week|month>]`
 - `!voicehours roles [last <x> <hour|day|week|month>]`
+- `!voicehours unis [last <x> <hour|day|week|month>]`
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
+- `!voicehours track list`
+- `!voicehours track add <keyword>`
+- `!voicehours track remove <keyword>`
 
 Gym:
 - `!gym` (interactive panel)
@@ -83,11 +87,12 @@ Gym:
 Text config keys:
 - `training_role_substring` (default: `training arc`)
 - `coach_role_substring` (default: `coach`)
+- `voice_tracked_keywords` (default: empty; comma-separated channel keywords)
 
 ## Operational Notes
 - Verification pending state is persisted in DB and expires after 15 minutes. A restart does not drop pending verification requests.
 - Reminder dedupe is persisted in DB (`sent_reminders`) and guarded in-memory for fast repeats in-process. Startup cleanup removes old dedupe rows (retention window: 120 days).
-- Voice startup reconciliation closes stale open solo sessions left from downtime and recreates missing sessions for currently active solo members.
+- Voice startup reconciliation closes stale open tracked sessions left from downtime and recreates missing sessions for currently active tracked members.
 - Solo watchdog tasks are race-safe: replacing a task for the same member does not let an old task clear the new map entry.
 - Gym participation uses caching: default freshness 1 hour, or 10 minutes when `force` is used.
 - High-volume outputs are chunked/truncated to stay within Discord limits (message `2000`, embed description `4096`, field value `1024`).
@@ -96,15 +101,22 @@ Text config keys:
 ## Database Migrations / Upgrades
 - Schema versioning is tracked in table `schema_version` (single row, id `1`).
 - Migrations are applied automatically during `UserRepository.init()` in order.
-- Current schema version is `3`.
+- Current schema version is `5`.
 - Migration highlights:
   - v1: base schema creation
   - v2: lookup/performance indexes
   - v3: integrity constraints and cleanup
+  - v4: sent reminder platform support + text contest IDs
+  - v5: rename voice session tracking flag to `is_tracked`
 - v3 adds:
   - case-insensitive unique handle-per-guild index on `verified_users`
   - gym child-table foreign keys to `gym_contests (guild_id, contest_id)` with `ON DELETE CASCADE`
   - pre-constraint cleanup for duplicate handles and orphan gym child rows
+- v4 adds:
+  - `platform` column on `sent_reminders` and expands primary key to include platform
+  - `contest_id` stored as text to support non-numeric IDs
+- v5 adds:
+  - `voice_sessions.is_tracked` (renamed from `is_solo`) to cover keyword-tracked channels
 - Upgrades are in-place on startup; no manual SQL steps are normally required.
 
 ## Tests
@@ -113,4 +125,4 @@ Run:
 python -m pytest -q
 ```
 
-Current tests cover verification lifecycle, reminder dedupe persistence, voice watchdog/reconciliation behavior, gym rating logic, output size guards, CF error mapping, and migration upgrade paths.
+Current tests cover verification lifecycle, reminder dedupe persistence, voice watchdog/reconciliation behavior, dynamic voice access rules, gym rating logic, output size guards, CF error mapping, help metadata, and migration upgrade paths.
