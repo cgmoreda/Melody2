@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import discord
 from discord.ext import commands
@@ -11,6 +11,9 @@ from db.repository import VoiceFeatureRepository
 from services.discord_output import send_context_lines_chunks, send_context_text_chunks, split_lines_chunks
 from services.guild_config import GuildConfigService
 from services.voice_service import VoiceService
+
+if TYPE_CHECKING:
+    from services.dynamic_voice import DynamicVoiceManager
 
 _VOICE_SERVICE = VoiceService()
 
@@ -47,10 +50,17 @@ class WorkConfirmationView(discord.ui.View):
 
 
 class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
-    def __init__(self, bot: commands.Bot, repo: VoiceFeatureRepository, config_service: GuildConfigService) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        repo: VoiceFeatureRepository,
+        config_service: GuildConfigService,
+        dynamic_voice: Optional[DynamicVoiceManager] = None,
+    ) -> None:
         self.bot = bot
         self._repo = repo
         self._config = config_service
+        self._dynamic_voice = dynamic_voice
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
         self._tracked_keywords_cache: dict[int, list[str]] = {}
@@ -70,8 +80,16 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return keywords
 
     async def _is_tracked_channel(self, guild_id: int, channel: discord.VoiceChannel) -> bool:
-        """Return True if channel counts for voice hours (solo or keyword match)."""
+        """Return True if channel counts for voice hours.
+
+        A channel is tracked when any of these hold:
+        - It is a solo channel (name starts with 'solo #' or 'solo room').
+        - It is a dynamically-created channel (solo, duo, or team).
+        - Its name contains a configured tracked keyword.
+        """
         if _is_solo_channel(channel):
+            return True
+        if self._dynamic_voice is not None and self._dynamic_voice.is_tracked(channel.id):
             return True
         keywords = await self._get_tracked_keywords(guild_id)
         if not keywords:
@@ -727,5 +745,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(VoiceLoggingCog(bot, getattr(bot, "user_repo"), getattr(bot, "guild_config")))
+    dynamic_voice: Optional[DynamicVoiceManager] = getattr(bot, "dynamic_voice", None)
+    await bot.add_cog(
+        VoiceLoggingCog(
+            bot,
+            getattr(bot, "user_repo"),
+            getattr(bot, "guild_config"),
+            dynamic_voice=dynamic_voice,
+        )
+    )
 
