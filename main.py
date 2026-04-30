@@ -29,8 +29,8 @@ EXTENSIONS: tuple[str, ...] = (
     "cogs.config",
     "cogs.gym",
     "cogs.coach_secretary",
-    "cogs.voice_logging",
     "cogs.dynamic_voice",
+    "cogs.voice_logging",
 )
 
 
