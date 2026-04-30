@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from services.dynamic_voice import DynamicVoiceManager
 
 _VOICE_SERVICE = VoiceService()
+logger = logging.getLogger(__name__)
 
 
 def _hours(seconds: float) -> str:
@@ -106,6 +108,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         started_at: datetime,
     ) -> None:
         tracked = await self._is_tracked_channel(guild_id, channel)
+        logger.info(
+            "Starting voice session: member=%s channel=%s (%s) tracked=%s",
+            member_id,
+            channel.name,
+            channel.id,
+            tracked,
+        )
         await self._repo.start_voice_session(
             guild_id=guild_id,
             discord_id=member_id,
@@ -163,6 +172,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             return
 
         now = datetime.now(tz=UTC)
+        logger.debug(
+            "Voice state change: member=%s before=%s after=%s",
+            member.id,
+            getattr(before.channel, "name", None),
+            getattr(after.channel, "name", None),
+        )
         await self._repo.close_open_voice_sessions(member.guild.id, member.id, now)
         self._stop_watchdog(member.id)
 
