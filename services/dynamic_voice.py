@@ -84,6 +84,7 @@ class DynamicVoiceManager:
         """Return True if *member* is allowed in the dynamic channel.
 
         Solo channels: always allowed.
+        Creator is always allowed.
         Duo/Team channels: member must have a role whose 'Team ' suffix
         matches the channel label (e.g. label 'Assiut Duo' requires 'Team Assiut').
         """
@@ -91,6 +92,8 @@ class DynamicVoiceManager:
         if info is None:
             return True  # not tracked → no restriction
         if info.channel_type is ChannelType.SOLO:
+            return True
+        if member.id == info.creator_id:
             return True
 
         # Extract the group name from the label (e.g. 'Assiut Duo' → 'Assiut')
