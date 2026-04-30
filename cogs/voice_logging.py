@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import discord
 from discord.ext import commands
@@ -12,7 +13,11 @@ from services.discord_output import send_context_lines_chunks, send_context_text
 from services.guild_config import GuildConfigService
 from services.voice_service import VoiceService
 
+if TYPE_CHECKING:
+    from services.dynamic_voice import DynamicVoiceManager
+
 _VOICE_SERVICE = VoiceService()
+logger = logging.getLogger(__name__)
 
 
 def _hours(seconds: float) -> str:
@@ -47,10 +52,17 @@ class WorkConfirmationView(discord.ui.View):
 
 
 class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
-    def __init__(self, bot: commands.Bot, repo: VoiceFeatureRepository, config_service: GuildConfigService) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        repo: VoiceFeatureRepository,
+        config_service: GuildConfigService,
+        dynamic_voice: Optional[DynamicVoiceManager] = None,
+    ) -> None:
         self.bot = bot
         self._repo = repo
         self._config = config_service
+        self._dynamic_voice = dynamic_voice
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
         self._tracked_keywords_cache: dict[int, list[str]] = {}
@@ -70,8 +82,24 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return keywords
 
     async def _is_tracked_channel(self, guild_id: int, channel: discord.VoiceChannel) -> bool:
-        """Return True if channel counts for voice hours (solo or keyword match)."""
+        """Return True if channel counts for voice hours.
+
+        A channel is tracked when any of these hold:
+        - It is a solo channel (name starts with 'solo #' or 'solo room').
+        - It is a dynamically-created channel (solo, duo, or team).
+        - Its name contains a configured tracked keyword.
+
+        The dynamic-channel check uses both the in-memory manager state (populated
+        after ``rebuild_state`` completes) and a name-pattern fallback so that
+        channels are correctly identified even during the ``on_ready`` window before
+        ``DynamicVoiceCog.on_ready`` has finished rebuilding state.
+        """
         if _is_solo_channel(channel):
+            return True
+        if self._dynamic_voice is not None and (
+            self._dynamic_voice.is_tracked(channel.id)
+            or self._dynamic_voice.is_dynamic_channel_name(channel.name)
+        ):
             return True
         keywords = await self._get_tracked_keywords(guild_id)
         if not keywords:
@@ -88,6 +116,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         started_at: datetime,
     ) -> None:
         tracked = await self._is_tracked_channel(guild_id, channel)
+        logger.info(
+            "Starting voice session: member=%s channel=%s (%s) tracked=%s",
+            member_id,
+            channel.name,
+            channel.id,
+            tracked,
+        )
         await self._repo.start_voice_session(
             guild_id=guild_id,
             discord_id=member_id,
@@ -145,6 +180,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             return
 
         now = datetime.now(tz=UTC)
+        logger.debug(
+            "Voice state change: member=%s before=%s after=%s",
+            member.id,
+            getattr(before.channel, "name", None),
+            getattr(after.channel, "name", None),
+        )
         await self._repo.close_open_voice_sessions(member.guild.id, member.id, now)
         self._stop_watchdog(member.id)
 
@@ -770,5 +811,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(VoiceLoggingCog(bot, getattr(bot, "user_repo"), getattr(bot, "guild_config")))
+    dynamic_voice: Optional[DynamicVoiceManager] = getattr(bot, "dynamic_voice", None)
+    await bot.add_cog(
+        VoiceLoggingCog(
+            bot,
+            getattr(bot, "user_repo"),
+            getattr(bot, "guild_config"),
+            dynamic_voice=dynamic_voice,
+        )
+    )
 

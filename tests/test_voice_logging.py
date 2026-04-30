@@ -10,6 +10,7 @@ import pytest
 import cogs.voice_logging as voice_logging_module
 from cogs.voice_logging import VoiceLoggingCog
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
+from services.dynamic_voice import DynamicVoiceManager
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +249,36 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
     assert start_call["started_at"].tzinfo is UTC
 
     assert sorted(started_watchdogs) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_on_ready_tracks_dynamic_channel_via_name_before_rebuild() -> None:
+    """Dynamic channels are tracked by name even before rebuild_state() populates the manager."""
+    member_in_dynamic = _FakeMember(5)
+
+    # Channel whose name matches the dynamic pattern but is NOT yet in manager state
+    dynamic_channel = _FakeVoiceChannel(601, "Test Duo #1", [member_in_dynamic])
+    guild = _FakeGuild(200, [dynamic_channel])
+
+    repo = _FakeRepo()
+
+    # Use a real DynamicVoiceManager with empty state (simulates pre-rebuild condition)
+    empty_manager = DynamicVoiceManager()
+    assert not empty_manager.is_tracked(dynamic_channel.id)  # confirm state is empty
+
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigService(),  # type: ignore[arg-type]
+        dynamic_voice=empty_manager,
+    )
+
+    await cog.on_ready()
+
+    # Session must be started as tracked because the name pattern matches
+    assert len(repo.started_calls) == 1
+    assert repo.started_calls[0]["discord_id"] == 5
+    assert repo.started_calls[0]["is_tracked"] is True
 
 
 def test_render_ranked_message_is_capped_to_discord_limit() -> None:
