@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 import pytest
 
-from cogs.orders import ORDER_WINDOW, OrdersCog, normalize_order_item, order_acceptance_probability
+from cogs.orders import ALWAYS_YES_HOURS, ORDER_WINDOW, OrdersCog, normalize_order_item, order_acceptance_probability
 
 
 class _FakeGuild:
@@ -13,14 +13,20 @@ class _FakeGuild:
 
 
 class _FakeAuthor:
-    def __init__(self, author_id: int) -> None:
+    def __init__(self, author_id: int, *, roles: list["_FakeRole"] | None = None) -> None:
         self.id = author_id
+        self.roles = roles or []
+
+
+class _FakeRole:
+    def __init__(self, name: str) -> None:
+        self.name = name
 
 
 class _FakeContext:
-    def __init__(self, author_id: int = 10) -> None:
+    def __init__(self, author_id: int = 10, *, roles: list[_FakeRole] | None = None) -> None:
         self.guild = _FakeGuild()
-        self.author = _FakeAuthor(author_id)
+        self.author = _FakeAuthor(author_id, roles=roles)
         self.sent: list[tuple[Optional[str], Any]] = []
 
     async def send(self, content: Optional[str] = None, *, file: Any = None) -> None:
@@ -54,11 +60,11 @@ def test_normalize_order_item() -> None:
 
 def test_order_acceptance_probability_boundaries() -> None:
     assert order_acceptance_probability("coffee", 0.0) == 1.0
-    assert order_acceptance_probability("tea", 3.0) == 1.0
-    assert order_acceptance_probability("juice", 10.0) == 1.0
-    assert order_acceptance_probability("tea", 0.0) == pytest.approx(0.40)
-    assert order_acceptance_probability("tea", 1.0) == pytest.approx(0.60)
-    assert order_acceptance_probability("tea", 2.0) == pytest.approx(0.80)
+    assert order_acceptance_probability("tea", ALWAYS_YES_HOURS) == 1.0
+    assert order_acceptance_probability("juice", ALWAYS_YES_HOURS + 1.0) == 1.0
+    assert order_acceptance_probability("tea", 0.0) == pytest.approx(0.10)
+    assert order_acceptance_probability("tea", 7.0) == pytest.approx(0.40)
+    assert order_acceptance_probability("tea", 14.0) == pytest.approx(0.70)
 
 
 @pytest.mark.asyncio
@@ -123,12 +129,12 @@ async def test_order_coffee_always_accepts_at_zero_hours(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_order_three_hours_always_accepts_non_coffee(tmp_path: Path) -> None:
+async def test_order_weekly_target_always_accepts_non_coffee(tmp_path: Path) -> None:
     _write_asset(tmp_path, "tea")
     ctx = _FakeContext(author_id=10)
     cog = OrdersCog(
         bot=object(),  # type: ignore[arg-type]
-        repo=_FakeRepo({10: 3 * 3600.0}),  # type: ignore[arg-type]
+        repo=_FakeRepo({10: ALWAYS_YES_HOURS * 3600.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.99,
     )
@@ -139,6 +145,66 @@ async def test_order_three_hours_always_accepts_non_coffee(tmp_path: Path) -> No
     assert content is not None
     assert "accepts your tea order" in content
     assert file is not None
+
+
+@pytest.mark.asyncio
+async def test_order_can_send_png_asset(tmp_path: Path) -> None:
+    item_dir = tmp_path / "juice"
+    item_dir.mkdir(parents=True)
+    (item_dir / "juice.png").write_bytes(b"fake png bytes")
+    ctx = _FakeContext(author_id=10)
+    cog = OrdersCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
+        assets_root=tmp_path,
+        rng=lambda: 0.0,
+    )
+
+    await cog.order.callback(cog, ctx, "juice")  # type: ignore[union-attr]
+
+    content, file = ctx.sent[0]
+    assert content is not None
+    assert "accepts your juice order" in content
+    assert file is not None
+
+
+@pytest.mark.asyncio
+async def test_order_guest_or_coach_role_prefers_user_added_png_assets(tmp_path: Path) -> None:
+    item_dir = tmp_path / "tea"
+    item_dir.mkdir(parents=True)
+    (item_dir / "tea-generated.webp").write_bytes(b"fake webp bytes")
+    (item_dir / "tea-user-added.png").write_bytes(b"fake png bytes")
+    ctx = _FakeContext(author_id=10, roles=[_FakeRole("Guest")])
+    cog = OrdersCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
+        assets_root=tmp_path,
+        rng=lambda: 0.0,
+    )
+
+    await cog.order.callback(cog, ctx, "tea")  # type: ignore[union-attr]
+
+    _, file = ctx.sent[0]
+    assert file is not None
+    assert file.filename == "tea-user-added.png"
+
+
+@pytest.mark.asyncio
+async def test_order_coach_role_falls_back_when_no_user_added_assets(tmp_path: Path) -> None:
+    _write_asset(tmp_path, "juice")
+    ctx = _FakeContext(author_id=10, roles=[_FakeRole("Coach")])
+    cog = OrdersCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
+        assets_root=tmp_path,
+        rng=lambda: 0.0,
+    )
+
+    await cog.order.callback(cog, ctx, "juice")  # type: ignore[union-attr]
+
+    _, file = ctx.sent[0]
+    assert file is not None
+    assert file.filename == "juice-1.webp"
 
 
 @pytest.mark.asyncio
