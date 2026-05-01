@@ -27,6 +27,23 @@ SENSITIVE_QUERY_MARKERS: tuple[str, ...] = (
 )
 
 
+def _parse_int_env(name: str, *, default: int, minimum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+    if value < minimum:
+        logger.warning("Invalid %s=%r; minimum is %s, using %s", name, raw, minimum, minimum)
+        return minimum
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class CFUserInfo:
     handle: str
@@ -104,9 +121,9 @@ class CodeforcesClientBase(abc.ABC):
 class CodeforcesClient(CodeforcesClientBase):
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
-        self._cache_ttl_seconds = max(0, int(os.getenv("CACHE_TTL_SECONDS", "60")))
-        self._timeout_seconds = max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")))
-        self._max_retries = max(1, int(os.getenv("CF_MAX_RETRIES", "3")))
+        self._cache_ttl_seconds = _parse_int_env("CACHE_TTL_SECONDS", default=60, minimum=0)
+        self._timeout_seconds = _parse_int_env("REQUEST_TIMEOUT_SECONDS", default=20, minimum=5)
+        self._max_retries = _parse_int_env("CF_MAX_RETRIES", default=3, minimum=1)
         self._cache: dict[str, tuple[float, dict]] = {}
 
     def _cache_get(self, cache_key: str) -> Optional[dict]:

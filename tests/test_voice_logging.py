@@ -8,7 +8,8 @@ from typing import Any
 import pytest
 
 import cogs.voice_logging as voice_logging_module
-from cogs.voice_logging import VoiceLoggingCog
+from cogs.voice_logging import VoiceLoggingCog, WorkConfirmationResult
+from db.repository import CoachConfig
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 from services.dynamic_voice import DynamicVoiceManager
 
@@ -86,10 +87,31 @@ class _FakeContext:
 
 
 class _FakeMember:
-    def __init__(self, member_id: int, *, is_bot: bool = False) -> None:
+    def __init__(
+        self,
+        member_id: int,
+        *,
+        is_bot: bool = False,
+        name: str | None = None,
+        display_name: str | None = None,
+    ) -> None:
         self.id = member_id
         self.bot = is_bot
+        self.name = name or f"user-{member_id}"
+        self.display_name = display_name or self.name
+        self.global_name = None
         self.guild: _FakeGuild | None = None
+        self.voice: _FakeVoiceState | None = None
+        self.sent_messages: list[str] = []
+        self.move_calls: list[tuple[Any, str | None]] = []
+
+    async def send(self, message: str, **kwargs: Any) -> Any:
+        self.sent_messages.append(message)
+        return None
+
+    async def move_to(self, channel: Any, *, reason: str | None = None) -> None:
+        self.move_calls.append((channel, reason))
+        self.voice = None
 
 
 class _FakeVoiceChannel:
@@ -100,14 +122,29 @@ class _FakeVoiceChannel:
 
 
 class _FakeGuild:
-    def __init__(self, guild_id: int, channels: list[_FakeVoiceChannel]) -> None:
+    def __init__(
+        self,
+        guild_id: int,
+        channels: list[_FakeVoiceChannel],
+        extra_members: list[_FakeMember] | None = None,
+    ) -> None:
         self.id = guild_id
+        self.name = f"guild-{guild_id}"
         self.voice_channels = channels
+        self.members: list[_FakeMember] = []
         self._members: dict[int, _FakeMember] = {}
         for channel in channels:
             for member in channel.members:
-                member.guild = self
-                self._members[member.id] = member
+                member.voice = _FakeVoiceState(channel)
+                self._add_member(member)
+        for member in extra_members or []:
+            self._add_member(member)
+
+    def _add_member(self, member: _FakeMember) -> None:
+        member.guild = self
+        self._members[member.id] = member
+        if member not in self.members:
+            self.members.append(member)
 
     def get_member(self, member_id: int) -> _FakeMember | None:
         return self._members.get(member_id)
@@ -175,6 +212,30 @@ class _FakeConfigService:
         return ""
 
 
+class _FakeFastConfigService(_FakeConfigService):
+    async def get(self, guild_id: int) -> Any:
+        class _Config:
+            voice_check_interval_seconds = 0
+            voice_confirm_timeout_seconds = 60
+
+        return _Config()
+
+
+class _FakeCoachSecretary:
+    def __init__(self, coach_id: int | None) -> None:
+        self._coach_id = coach_id
+
+    async def get_config(self, guild_id: int) -> CoachConfig | None:
+        if self._coach_id is None:
+            return None
+        return CoachConfig(
+            guild_id=guild_id,
+            coach_id=self._coach_id,
+            waiting_room_id=1,
+            coach_channel_id=2,
+        )
+
+
 @pytest.mark.asyncio
 async def test_watchdog_cleanup_is_identity_safe() -> None:
     cog = VoiceLoggingCog(
@@ -204,6 +265,64 @@ async def test_watchdog_cleanup_is_identity_safe() -> None:
             await old_task
         with contextlib.suppress(asyncio.CancelledError):
             await new_task
+
+
+@pytest.mark.asyncio
+async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session() -> None:
+    member = _FakeMember(10, display_name="Worker")
+    coach = _FakeMember(20, display_name="Coach")
+    solo_channel = _FakeVoiceChannel(501, "Solo Room A", [member])
+    guild = _FakeGuild(100, [solo_channel], extra_members=[coach])
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeFastConfigService(),  # type: ignore[arg-type]
+        coach_secretary=_FakeCoachSecretary(coach.id),  # type: ignore[arg-type]
+    )
+
+    async def _dm_failed(_: Any, __: int) -> WorkConfirmationResult:
+        return WorkConfirmationResult.DM_FAILED
+
+    cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
+
+    await cog._watchdog_loop(guild.id, member.id)
+
+    assert len(coach.sent_messages) == 1
+    assert "Worker" in coach.sent_messages[0]
+    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+
+
+@pytest.mark.asyncio
+async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config() -> None:
+    member = _FakeMember(11, display_name="SoloUser")
+    fallback = _FakeMember(30, name="__reda", display_name="__reda")
+    solo_channel = _FakeVoiceChannel(502, "Solo Room B", [member])
+    guild = _FakeGuild(101, [solo_channel], extra_members=[fallback])
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeFastConfigService(),  # type: ignore[arg-type]
+        coach_secretary=_FakeCoachSecretary(None),  # type: ignore[arg-type]
+    )
+
+    async def _dm_failed(_: Any, __: int) -> WorkConfirmationResult:
+        return WorkConfirmationResult.DM_FAILED
+
+    cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
+
+    await cog._watchdog_loop(guild.id, member.id)
+
+    assert len(fallback.sent_messages) == 1
+    assert "SoloUser" in fallback.sent_messages[0]
+    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
 
 
 @pytest.mark.asyncio

@@ -1,14 +1,56 @@
 from __future__ import annotations
 
 import abc
+from collections import defaultdict
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Protocol
+from typing import Any, Iterable, Optional, Protocol
 
 import asyncpg
 
 logger = logging.getLogger(__name__)
+
+
+def _voice_session_lock_key(guild_id: int, discord_id: int) -> int:
+    raw = f"{guild_id}:{discord_id}".encode("ascii")
+    digest = hashlib.blake2b(raw, digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def _merge_voice_intervals(rows: Iterable[Any]) -> dict[int, float]:
+    intervals_by_user: dict[int, list[tuple[datetime, datetime]]] = defaultdict(list)
+    for row in rows:
+        discord_id = int(row["discord_id"])
+        start = row["start_ts"]
+        end = row["end_ts"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            continue
+        if end <= start:
+            continue
+        intervals_by_user[discord_id].append((start, end))
+
+    totals: dict[int, float] = {}
+    for discord_id, intervals in intervals_by_user.items():
+        intervals.sort(key=lambda interval: interval[0])
+        current_start, current_end = intervals[0]
+        total_seconds = 0.0
+
+        for start, end in intervals[1:]:
+            if start <= current_end:
+                if end > current_end:
+                    current_end = end
+                continue
+
+            total_seconds += (current_end - current_start).total_seconds()
+            current_start, current_end = start, end
+
+        total_seconds += (current_end - current_start).total_seconds()
+        if total_seconds > 0:
+            totals[discord_id] = total_seconds
+
+    return totals
 
 
 @dataclass(slots=True)
@@ -602,7 +644,7 @@ class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
     _SCHEMA_LOCK_KEY = 3_310_920_014_991
-    _LATEST_SCHEMA_VERSION = 5
+    _LATEST_SCHEMA_VERSION = 6
 
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
@@ -664,6 +706,7 @@ class UserRepository(UserRepositoryBase):
             3: self._migration_003_enforce_integrity_constraints,
             4: self._migration_004_add_platform_to_sent_reminders,
             5: self._migration_005_rename_is_solo_to_is_tracked,
+            6: self._migration_006_enforce_single_open_voice_session,
         }
 
         if current_version > self._LATEST_SCHEMA_VERSION:
@@ -870,12 +913,20 @@ class UserRepository(UserRepositoryBase):
             WHERE ended_at IS NULL
             """
         )
-        await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
-            ON voice_sessions (guild_id, is_tracked, started_at)
-            """
-        )
+        if await self._column_exists(conn, "voice_sessions", "is_tracked"):
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
+                ON voice_sessions (guild_id, is_tracked, started_at)
+                """
+            )
+        elif await self._column_exists(conn, "voice_sessions", "is_solo"):
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_voice_sessions_solo_started
+                ON voice_sessions (guild_id, is_solo, started_at)
+                """
+            )
         await conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_gym_problem_tags_problem
@@ -993,6 +1044,26 @@ class UserRepository(UserRepositoryBase):
         )
         return row is not None
 
+    async def _column_exists(
+        self,
+        conn: asyncpg.Connection,
+        table_name: str,
+        column_name: str,
+    ) -> bool:
+        row = await conn.fetchval(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = $1
+              AND column_name = $2
+            LIMIT 1
+            """,
+            table_name,
+            column_name,
+        )
+        return row is not None
+
     async def _migration_004_add_platform_to_sent_reminders(self, conn: asyncpg.Connection) -> None:
         # Add platform column (default existing rows to 'codeforces').
         await conn.execute(
@@ -1027,18 +1098,59 @@ class UserRepository(UserRepositoryBase):
     async def _migration_005_rename_is_solo_to_is_tracked(self, conn: asyncpg.Connection) -> None:
         # Rename the is_solo column to is_tracked to reflect that keyword-matched
         # (non-solo) channels also set this flag.
-        await conn.execute(
-            """
-            ALTER TABLE voice_sessions
-            RENAME COLUMN is_solo TO is_tracked
-            """
-        )
+        has_solo = await self._column_exists(conn, "voice_sessions", "is_solo")
+        has_tracked = await self._column_exists(conn, "voice_sessions", "is_tracked")
+        if has_solo and not has_tracked:
+            await conn.execute(
+                """
+                ALTER TABLE voice_sessions
+                RENAME COLUMN is_solo TO is_tracked
+                """
+            )
+            has_tracked = True
+        elif has_solo and has_tracked:
+            logger.warning("voice_sessions has both is_solo and is_tracked; leaving columns unchanged")
+
         # Drop the old index (created in migration 002) and recreate under the new name.
         await conn.execute("DROP INDEX IF EXISTS idx_voice_sessions_solo_started")
+        if has_tracked:
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
+                ON voice_sessions (guild_id, is_tracked, started_at)
+                """
+            )
+
+    async def _migration_006_enforce_single_open_voice_session(self, conn: asyncpg.Connection) -> None:
         await conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started
-            ON voice_sessions (guild_id, is_tracked, started_at)
+            WITH ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY guild_id, discord_id
+                        ORDER BY started_at DESC, id DESC
+                    ) AS rn,
+                    FIRST_VALUE(started_at) OVER (
+                        PARTITION BY guild_id, discord_id
+                        ORDER BY started_at DESC, id DESC
+                    ) AS kept_started_at
+                FROM voice_sessions
+                WHERE ended_at IS NULL
+            )
+            UPDATE voice_sessions v
+            SET ended_at = GREATEST(v.started_at, ranked.kept_started_at)
+            FROM ranked
+            WHERE v.id = ranked.id
+              AND ranked.rn > 1
+              AND v.ended_at IS NULL
+            """
+        )
+        await conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_voice_sessions_one_open_per_member
+            ON voice_sessions (guild_id, discord_id)
+            WHERE ended_at IS NULL
             """
         )
 
@@ -1344,20 +1456,37 @@ class UserRepository(UserRepositoryBase):
     ) -> None:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO voice_sessions (
-                    guild_id, discord_id, channel_id, channel_name, is_tracked, started_at
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _voice_session_lock_key(guild_id, discord_id),
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
-                """,
-                guild_id,
-                discord_id,
-                channel_id,
-                channel_name,
-                is_tracked,
-                started_at,
-            )
+                await conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET ended_at = GREATEST(started_at, $3)
+                    WHERE guild_id = $1
+                      AND discord_id = $2
+                      AND ended_at IS NULL
+                    """,
+                    guild_id,
+                    discord_id,
+                    started_at,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO voice_sessions (
+                        guild_id, discord_id, channel_id, channel_name, is_tracked, started_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    guild_id,
+                    discord_id,
+                    channel_id,
+                    channel_name,
+                    is_tracked,
+                    started_at,
+                )
 
     async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
         assert self._pool is not None, "Call init() first"
@@ -1424,21 +1553,13 @@ class UserRepository(UserRepositoryBase):
                 rows = await conn.fetch(
                     """
                     SELECT discord_id,
-                           SUM(
-                               EXTRACT(
-                                   EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
-                               )
-                           ) AS seconds
+                           started_at AS start_ts,
+                           LEAST(COALESCE(ended_at, $2), $2) AS end_ts
                     FROM voice_sessions
                     WHERE guild_id = $1
                       AND is_tracked = TRUE
                       AND started_at < $2
-                    GROUP BY discord_id
-                    HAVING SUM(
-                               EXTRACT(
-                                   EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
-                               )
-                           ) > 0
+                      AND COALESCE(ended_at, $2) > started_at
                     """,
                     guild_id,
                     now,
@@ -1447,32 +1568,19 @@ class UserRepository(UserRepositoryBase):
                 rows = await conn.fetch(
                     """
                     SELECT discord_id,
-                           SUM(
-                               EXTRACT(
-                                   EPOCH FROM (
-                                       LEAST(COALESCE(ended_at, $3), $3) - GREATEST(started_at, $2)
-                                   )
-                               )
-                           ) AS seconds
+                           GREATEST(started_at, $2) AS start_ts,
+                           LEAST(COALESCE(ended_at, $3), $3) AS end_ts
                     FROM voice_sessions
                     WHERE guild_id = $1
                       AND is_tracked = TRUE
                       AND started_at < $3
                       AND COALESCE(ended_at, $3) > $2
-                    GROUP BY discord_id
-                    HAVING SUM(
-                               EXTRACT(
-                                   EPOCH FROM (
-                                       LEAST(COALESCE(ended_at, $3), $3) - GREATEST(started_at, $2)
-                                   )
-                               )
-                           ) > 0
                     """,
                     guild_id,
                     since,
                     now,
                 )
-        return {row["discord_id"]: float(row["seconds"]) for row in rows}
+        return _merge_voice_intervals(rows)
 
     async def get_tracked_voice_summary(
         self,
@@ -1482,62 +1590,15 @@ class UserRepository(UserRepositoryBase):
         week_since: datetime,
         month_since: datetime,
     ) -> dict[int, dict[str, float]]:
-        assert self._pool is not None, "Call init() first"
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    discord_id,
-                    SUM(
-                        EXTRACT(
-                            EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
-                        )
-                    ) AS all_time_seconds,
-                    SUM(
-                        CASE
-                            WHEN COALESCE(ended_at, $2) > $3 THEN
-                                EXTRACT(
-                                    EPOCH FROM (
-                                        LEAST(COALESCE(ended_at, $2), $2) - GREATEST(started_at, $3)
-                                    )
-                                )
-                            ELSE 0
-                        END
-                    ) AS week_seconds,
-                    SUM(
-                        CASE
-                            WHEN COALESCE(ended_at, $2) > $4 THEN
-                                EXTRACT(
-                                    EPOCH FROM (
-                                        LEAST(COALESCE(ended_at, $2), $2) - GREATEST(started_at, $4)
-                                    )
-                                )
-                            ELSE 0
-                        END
-                    ) AS month_seconds
-                FROM voice_sessions
-                WHERE guild_id = $1
-                  AND is_tracked = TRUE
-                  AND started_at < $2
-                GROUP BY discord_id
-                HAVING SUM(
-                           EXTRACT(
-                               EPOCH FROM (LEAST(COALESCE(ended_at, $2), $2) - started_at)
-                           )
-                       ) > 0
-                """,
-                guild_id,
-                now,
-                week_since,
-                month_since,
-            )
-
+        all_time = await self.get_tracked_voice_totals(guild_id, now=now)
+        week = await self.get_tracked_voice_totals(guild_id, now=now, since=week_since)
+        month = await self.get_tracked_voice_totals(guild_id, now=now, since=month_since)
         summary: dict[int, dict[str, float]] = {}
-        for row in rows:
-            summary[row["discord_id"]] = {
-                "week": float(row["week_seconds"] or 0.0),
-                "month": float(row["month_seconds"] or 0.0),
-                "all_time": float(row["all_time_seconds"] or 0.0),
+        for discord_id in all_time:
+            summary[discord_id] = {
+                "week": week.get(discord_id, 0.0),
+                "month": month.get(discord_id, 0.0),
+                "all_time": all_time[discord_id],
             }
         return summary
 

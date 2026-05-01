@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
+import services.contest_reminder as contest_reminder_module
 from services.contest_reminder import Contest, ContestReminderService
 
 
@@ -56,6 +58,29 @@ class _FakeTextChannel:
     async def send(self, message: str) -> None:
         await asyncio.sleep(0.02)
         self.messages.append(message)
+
+
+class _FakeBot:
+    def __init__(self, channel: _FakeTextChannel) -> None:
+        self._channel = channel
+
+    def get_channel(self, channel_id: int) -> _FakeTextChannel | None:
+        if channel_id == self._channel.id:
+            return self._channel
+        return None
+
+
+class _FakeProvider:
+    def __init__(self, platform: str, contests: list[Contest]) -> None:
+        self._platform = platform
+        self._contests = contests
+
+    @property
+    def platform(self) -> str:
+        return self._platform
+
+    async def fetch_upcoming(self, session: Any) -> list[Contest]:
+        return list(self._contests)
 
 
 def _service(repo: _PersistentReminderRepo) -> ContestReminderService:
@@ -210,5 +235,53 @@ async def test_atcoder_contest_dedupe_independent_from_codeforces() -> None:
     assert channel.messages == [
         "[Reminder] CF 100 starts in 1h",
         "[Reminder] AC 100 starts in 1h",
+    ]
+    assert repo.mark_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_tick_sends_codeforces_div_reminders_only_and_keeps_atcoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(contest_reminder_module.discord, "TextChannel", _FakeTextChannel)
+
+    repo = _PersistentReminderRepo()
+    channel = _FakeTextChannel(2468)
+    starts_soon = int((datetime.now(tz=UTC) + timedelta(hours=24) - timedelta(seconds=30)).timestamp())
+    cf_div = Contest(
+        platform="codeforces",
+        contest_id="1",
+        name="Codeforces Round 1 (Div. 2)",
+        start_time_seconds=starts_soon,
+    )
+    cf_non_div = Contest(
+        platform="codeforces",
+        contest_id="2",
+        name="Codeforces Kotlin Heroes Practice",
+        start_time_seconds=starts_soon,
+    )
+    atcoder = Contest(
+        platform="atcoder",
+        contest_id="abc999",
+        name="AtCoder Beginner Contest 999",
+        start_time_seconds=starts_soon,
+    )
+    service = ContestReminderService(
+        session=object(),  # type: ignore[arg-type]
+        bot=_FakeBot(channel),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        providers=[
+            _FakeProvider("codeforces", [cf_div, cf_non_div]),
+            _FakeProvider("atcoder", [atcoder]),
+        ],
+        poll_seconds=300,
+    )
+    service._enabled_channels.add((123, channel.id))
+
+    await service._tick()
+
+    assert channel.messages == [
+        "[Reminder] Codeforces Round 1 (Div. 2) starts in 24h",
+        "[Reminder] AtCoder Beginner Contest 999 starts in 24h",
     ]
     assert repo.mark_calls == 2

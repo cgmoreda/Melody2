@@ -102,6 +102,24 @@ async def test_cf_client_maps_http_error_to_typed_exception() -> None:
     assert "user.info?handles=tourist" in error.requested_url
 
 
+def test_cf_client_invalid_env_values_fall_back_with_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "not-an-int")
+    monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("CF_MAX_RETRIES", "bad")
+
+    client = CodeforcesClient(_FakeSession([]))  # type: ignore[arg-type]
+
+    assert client._cache_ttl_seconds == 60
+    assert client._timeout_seconds == 5
+    assert client._max_retries == 3
+    assert "Invalid CACHE_TTL_SECONDS" in caplog.text
+    assert "Invalid REQUEST_TIMEOUT_SECONDS" in caplog.text
+    assert "Invalid CF_MAX_RETRIES" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_cf_client_maps_non_ok_payload_to_typed_exception() -> None:
     payload = {"status": "FAILED", "comment": "limit exceeded"}

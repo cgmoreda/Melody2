@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import discord
@@ -14,6 +15,7 @@ from services.guild_config import GuildConfigService
 from services.voice_service import VoiceService
 
 if TYPE_CHECKING:
+    from services.coach_secretary import CoachSecretaryBase
     from services.dynamic_voice import DynamicVoiceManager
 
 _VOICE_SERVICE = VoiceService()
@@ -30,6 +32,12 @@ def _rank_prefix(rank: int) -> str:
 
 def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
     return channel is not None and _VOICE_SERVICE.is_solo_channel_name(channel.name)
+
+
+class WorkConfirmationResult(Enum):
+    CONFIRMED = "confirmed"
+    TIMED_OUT = "timed_out"
+    DM_FAILED = "dm_failed"
 
 
 class WorkConfirmationView(discord.ui.View):
@@ -58,11 +66,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         repo: VoiceFeatureRepository,
         config_service: GuildConfigService,
         dynamic_voice: Optional[DynamicVoiceManager] = None,
+        coach_secretary: Optional[CoachSecretaryBase] = None,
     ) -> None:
         self.bot = bot
         self._repo = repo
         self._config = config_service
         self._dynamic_voice = dynamic_voice
+        self._coach_secretary = coach_secretary
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
         self._tracked_keywords_cache: dict[int, list[str]] = {}
@@ -288,32 +298,37 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if not _is_solo_channel(voice_channel):
                     break
 
-                confirmed = await self._ask_still_working(member, config.voice_confirm_timeout_seconds)
-                if confirmed is True or confirmed is None:
+                confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds)
+                if confirmation is WorkConfirmationResult.CONFIRMED:
                     continue
+
+                if confirmation is WorkConfirmationResult.DM_FAILED:
+                    await self._notify_watchdog_dm_failure(guild, member)
 
                 disconnected = False
                 if member.voice is not None:
                     try:
-                        await member.move_to(None, reason="No response to solo-channel work check")
+                        await member.move_to(None, reason="Failed or missed solo-channel work check")
                         disconnected = True
                     except (discord.Forbidden, discord.HTTPException):
                         disconnected = False
 
                 if not disconnected:
-                    try:
-                        await member.send(
-                            "You did not confirm in time. I could not disconnect you due to missing permissions."
-                        )
-                    except discord.Forbidden:
-                        pass
+                    if confirmation is WorkConfirmationResult.TIMED_OUT:
+                        try:
+                            await member.send(
+                                "You did not confirm in time. I could not disconnect you due to missing permissions."
+                            )
+                        except discord.Forbidden:
+                            pass
                     continue
 
                 await self._repo.close_open_voice_sessions(guild.id, member.id, datetime.now(tz=UTC))
-                try:
-                    await member.send("You were disconnected because you did not confirm in time.")
-                except discord.Forbidden:
-                    pass
+                if confirmation is WorkConfirmationResult.TIMED_OUT:
+                    try:
+                        await member.send("You were disconnected because you did not confirm in time.")
+                    except discord.Forbidden:
+                        pass
                 break
         except asyncio.CancelledError:
             pass
@@ -322,7 +337,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             if task is not None:
                 self._clear_watchdog_if_current(member_id, task)
 
-    async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> Optional[bool]:
+    async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> WorkConfirmationResult:
         view = WorkConfirmationView(member.id, timeout_seconds)
         timeout_minutes = max(1, timeout_seconds // 60)
         prompt = (
@@ -331,12 +346,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         )
         try:
             message = await member.send(prompt, view=view)
-        except discord.Forbidden:
-            return None
+        except (discord.Forbidden, discord.HTTPException):
+            return WorkConfirmationResult.DM_FAILED
 
         await view.wait()
         if view.confirmed:
-            return True
+            return WorkConfirmationResult.CONFIRMED
 
         for child in view.children:
             child.disabled = True
@@ -344,7 +359,51 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             await message.edit(content="No response received in time.", view=view)
         except discord.HTTPException:
             pass
-        return False
+        return WorkConfirmationResult.TIMED_OUT
+
+    async def _resolve_watchdog_alert_recipient(self, guild: discord.Guild) -> Optional[discord.Member]:
+        if self._coach_secretary is not None:
+            try:
+                config = await self._coach_secretary.get_config(guild.id)
+            except Exception:
+                logger.exception("Failed loading coach config for solo watchdog alert in guild %s", guild.id)
+                config = None
+            if config is not None:
+                coach = guild.get_member(config.coach_id)
+                if coach is not None and not getattr(coach, "bot", False):
+                    return coach
+
+        for member in getattr(guild, "members", ()):
+            if getattr(member, "bot", False):
+                continue
+            names = (
+                getattr(member, "name", ""),
+                getattr(member, "display_name", ""),
+                getattr(member, "global_name", ""),
+            )
+            if any(isinstance(name, str) and name.casefold() == "__reda" for name in names):
+                return member
+        return None
+
+    async def _notify_watchdog_dm_failure(self, guild: discord.Guild, member: discord.Member) -> None:
+        recipient = await self._resolve_watchdog_alert_recipient(guild)
+        if recipient is None:
+            logger.warning("No coach or __reda fallback found for solo watchdog alert in guild %s", guild.id)
+            return
+
+        guild_name = getattr(guild, "name", str(guild.id))
+        member_name = getattr(member, "display_name", str(member.id))
+        try:
+            await recipient.send(
+                f"I could not DM {member_name} ({member.id}) for the solo-channel work check "
+                f"in {guild_name}. Disconnecting them and closing the session."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning(
+                "Failed sending solo watchdog alert to %s in guild %s",
+                getattr(recipient, "id", "unknown"),
+                guild.id,
+            )
 
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
@@ -812,12 +871,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
 async def setup(bot: commands.Bot) -> None:
     dynamic_voice: Optional[DynamicVoiceManager] = getattr(bot, "dynamic_voice", None)
+    coach_secretary: Optional[CoachSecretaryBase] = getattr(bot, "coach_secretary", None)
     await bot.add_cog(
         VoiceLoggingCog(
             bot,
             getattr(bot, "user_repo"),
             getattr(bot, "guild_config"),
             dynamic_voice=dynamic_voice,
+            coach_secretary=coach_secretary,
         )
     )
 

@@ -40,10 +40,14 @@ class MelodyBot(commands.Bot):
         self._tree_synced = False
 
     async def setup_hook(self) -> None:
-        await _setup_services(self)
-        for extension in EXTENSIONS:
-            await self.load_extension(extension)
-            logger.info("Loaded extension %s", extension)
+        try:
+            await _setup_services(self)
+            for extension in EXTENSIONS:
+                await self.load_extension(extension)
+                logger.info("Loaded extension %s", extension)
+        except Exception:
+            await _teardown_services(self)
+            raise
 
     async def on_ready(self) -> None:
         if self.user is not None:
@@ -79,49 +83,74 @@ def create_bot() -> MelodyBot:
 
 async def _setup_services(bot: commands.Bot) -> None:
     """Instantiate shared services and attach them to the bot instance."""
-    session = aiohttp.ClientSession()
-    bot.http_session = session  # type: ignore[attr-defined]
-
-    bot.cf_client = CodeforcesClient(session)  # type: ignore[attr-defined]
-    bot.role_assigner = RoleAssigner()  # type: ignore[attr-defined]
-
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is not set")
 
-    repo = UserRepository(database_url)
-    await repo.init()
-    bot.user_repo = repo  # type: ignore[attr-defined]
+    session: aiohttp.ClientSession | None = None
+    repo: UserRepository | None = None
+    reminder: ContestReminderService | None = None
 
-    poll_raw = os.getenv("CF_REMINDER_POLL_SECONDS", "300")
     try:
-        poll_seconds = int(poll_raw)
-    except ValueError:
-        poll_seconds = 300
+        session = aiohttp.ClientSession()
+        bot.http_session = session  # type: ignore[attr-defined]
 
-    reminder = ContestReminderService(
-        session=session,
-        bot=bot,
-        repo=repo,
-        providers=[CodeforcesProvider(), AtCoderProvider()],
-        poll_seconds=poll_seconds,
-    )
-    await reminder.initialize()
-    reminder.start()
-    bot.contest_reminder = reminder  # type: ignore[attr-defined]
-    logger.info("Contest reminder service started")
+        bot.cf_client = CodeforcesClient(session)  # type: ignore[attr-defined]
+        bot.role_assigner = RoleAssigner()  # type: ignore[attr-defined]
 
-    secretary = CoachSecretary(repo)
-    bot.coach_secretary = secretary  # type: ignore[attr-defined]
-    logger.info("Coach secretary service ready")
+        repo = UserRepository(database_url)
+        await repo.init()
+        bot.user_repo = repo  # type: ignore[attr-defined]
 
-    guild_config = GuildConfigService(repo)
-    bot.guild_config = guild_config  # type: ignore[attr-defined]
-    logger.info("Guild config service ready")
+        poll_raw = os.getenv("CF_REMINDER_POLL_SECONDS", "300")
+        try:
+            poll_seconds = int(poll_raw)
+        except ValueError:
+            poll_seconds = 300
 
-    dynamic_voice = DynamicVoiceManager()
-    bot.dynamic_voice = dynamic_voice  # type: ignore[attr-defined]
-    logger.info("Dynamic voice manager ready")
+        reminder = ContestReminderService(
+            session=session,
+            bot=bot,
+            repo=repo,
+            providers=[CodeforcesProvider(), AtCoderProvider()],
+            poll_seconds=poll_seconds,
+        )
+        await reminder.initialize()
+        reminder.start()
+        bot.contest_reminder = reminder  # type: ignore[attr-defined]
+        logger.info("Contest reminder service started")
+
+        secretary = CoachSecretary(repo)
+        bot.coach_secretary = secretary  # type: ignore[attr-defined]
+        logger.info("Coach secretary service ready")
+
+        guild_config = GuildConfigService(repo)
+        bot.guild_config = guild_config  # type: ignore[attr-defined]
+        logger.info("Guild config service ready")
+
+        dynamic_voice = DynamicVoiceManager()
+        bot.dynamic_voice = dynamic_voice  # type: ignore[attr-defined]
+        logger.info("Dynamic voice manager ready")
+    except Exception:
+        if reminder is not None:
+            await reminder.stop()
+        if repo is not None:
+            await repo.close()
+        if session is not None:
+            await session.close()
+        for attr in (
+            "contest_reminder",
+            "dynamic_voice",
+            "guild_config",
+            "coach_secretary",
+            "user_repo",
+            "role_assigner",
+            "cf_client",
+            "http_session",
+        ):
+            if hasattr(bot, attr):
+                delattr(bot, attr)
+        raise
 
 
 async def _teardown_services(bot: commands.Bot) -> None:
@@ -137,6 +166,19 @@ async def _teardown_services(bot: commands.Bot) -> None:
     session: aiohttp.ClientSession | None = getattr(bot, "http_session", None)
     if session is not None:
         await session.close()
+
+    for attr in (
+        "contest_reminder",
+        "dynamic_voice",
+        "guild_config",
+        "coach_secretary",
+        "user_repo",
+        "role_assigner",
+        "cf_client",
+        "http_session",
+    ):
+        if hasattr(bot, attr):
+            delattr(bot, attr)
 
 
 def main() -> None:

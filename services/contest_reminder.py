@@ -214,8 +214,8 @@ class ContestReminderService:
             return []
 
         if platform == "codeforces":
-            contests = [contest for contest in contests if _is_div_contest_name(contest.name)]
-            
+            contests = [contest for contest in contests if _is_auto_reminder_contest(contest)]
+
         contests.sort(key=lambda contest: contest.start_time_seconds)
         return contests[: max(1, limit)]
 
@@ -243,6 +243,7 @@ class ContestReminderService:
             if contests is not None:
                 all_contests.extend(contests)
 
+        all_contests = [contest for contest in all_contests if _is_auto_reminder_contest(contest)]
         if not all_contests:
             return
 
@@ -440,3 +441,9 @@ class ContestReminderService:
 def _is_div_contest_name(name: str) -> bool:
     lowered = name.lower()
     return "div." in lowered or "div " in lowered
+
+
+def _is_auto_reminder_contest(contest: Contest) -> bool:
+    if contest.platform != "codeforces":
+        return True
+    return _is_div_contest_name(contest.name)
