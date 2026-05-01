@@ -106,7 +106,7 @@ async def test_order_accepts_and_sends_random_asset(tmp_path: Path) -> None:
     assert len(ctx.sent) == 1
     content, file = ctx.sent[0]
     assert content is not None
-    assert "Fine, tea." in content
+    assert "Melody slides the tea over" in content
     assert file is not None
     assert repo.calls[0]["now"] - repo.calls[0]["since"] == ORDER_WINDOW
 
@@ -148,7 +148,7 @@ async def test_order_coffee_always_accepts_at_zero_hours(tmp_path: Path) -> None
 
     content, file = ctx.sent[0]
     assert content is not None
-    assert "Fine, coffee." in content
+    assert "Melody slides the coffee over" in content
     assert file is not None
 
 
@@ -190,7 +190,7 @@ async def test_order_can_send_png_asset(tmp_path: Path) -> None:
 
     content, file = ctx.sent[0]
     assert content is not None
-    assert "Fine, juice." in content
+    assert "Melody slides the juice over" in content
     assert file is not None
 
 
