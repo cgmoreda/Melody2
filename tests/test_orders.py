@@ -5,7 +5,15 @@ from typing import Any, Optional
 
 import pytest
 
-from cogs.orders import ALWAYS_YES_HOURS, ORDER_WINDOW, OrdersCog, normalize_order_item, order_acceptance_probability
+from cogs.orders import (
+    ALWAYS_YES_HOURS,
+    ORDER_RESPONSE_MESSAGES,
+    ORDER_WINDOW,
+    OrdersCog,
+    normalize_order_item,
+    order_acceptance_probability,
+    order_message_level,
+)
 
 
 class _FakeGuild:
@@ -67,6 +75,19 @@ def test_order_acceptance_probability_boundaries() -> None:
     assert order_acceptance_probability("tea", 14.0) == pytest.approx(0.70)
 
 
+def test_order_response_message_pools_have_five_messages_per_level() -> None:
+    assert set(ORDER_RESPONSE_MESSAGES) == set(range(1, 11))
+    assert all(len(messages) == 5 for messages in ORDER_RESPONSE_MESSAGES.values())
+
+
+def test_order_message_level_boundaries() -> None:
+    assert order_message_level(0.0) == 1
+    assert order_message_level(7.0) == 4
+    assert order_message_level(14.0) == 7
+    assert order_message_level(ALWAYS_YES_HOURS) == 10
+    assert order_message_level(0.0, force_cutest=True) == 10
+
+
 @pytest.mark.asyncio
 async def test_order_accepts_and_sends_random_asset(tmp_path: Path) -> None:
     _write_asset(tmp_path, "tea")
@@ -77,6 +98,7 @@ async def test_order_accepts_and_sends_random_asset(tmp_path: Path) -> None:
         repo=repo,  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.0,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "tea")  # type: ignore[union-attr]
@@ -84,7 +106,7 @@ async def test_order_accepts_and_sends_random_asset(tmp_path: Path) -> None:
     assert len(ctx.sent) == 1
     content, file = ctx.sent[0]
     assert content is not None
-    assert "accepts your tea order" in content
+    assert "Fine, tea." in content
     assert file is not None
     assert repo.calls[0]["now"] - repo.calls[0]["since"] == ORDER_WINDOW
 
@@ -98,6 +120,7 @@ async def test_order_refuses_non_coffee_below_probability_without_file(tmp_path:
         repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.99,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "juice")  # type: ignore[union-attr]
@@ -118,13 +141,14 @@ async def test_order_coffee_always_accepts_at_zero_hours(tmp_path: Path) -> None
         repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.99,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "coffe")  # type: ignore[union-attr]
 
     content, file = ctx.sent[0]
     assert content is not None
-    assert "accepts your coffee order" in content
+    assert "Fine, coffee." in content
     assert file is not None
 
 
@@ -137,13 +161,14 @@ async def test_order_weekly_target_always_accepts_non_coffee(tmp_path: Path) -> 
         repo=_FakeRepo({10: ALWAYS_YES_HOURS * 3600.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.99,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "tea")  # type: ignore[union-attr]
 
     content, file = ctx.sent[0]
     assert content is not None
-    assert "accepts your tea order" in content
+    assert "Of course, sweetheart." in content
     assert file is not None
 
 
@@ -158,13 +183,14 @@ async def test_order_can_send_png_asset(tmp_path: Path) -> None:
         repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.0,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "juice")  # type: ignore[union-attr]
 
     content, file = ctx.sent[0]
     assert content is not None
-    assert "accepts your juice order" in content
+    assert "Fine, juice." in content
     assert file is not None
 
 
@@ -180,11 +206,14 @@ async def test_order_guest_or_coach_role_prefers_user_added_png_assets(tmp_path:
         repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
         assets_root=tmp_path,
         rng=lambda: 0.0,
+        message_picker=lambda messages: messages[0],
     )
 
     await cog.order.callback(cog, ctx, "tea")  # type: ignore[union-attr]
 
-    _, file = ctx.sent[0]
+    content, file = ctx.sent[0]
+    assert content is not None
+    assert "Of course, sweetheart." in content
     assert file is not None
     assert file.filename == "tea-user-added.png"
 
