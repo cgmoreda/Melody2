@@ -38,12 +38,6 @@ def _has_guest_role(member: discord.Member) -> bool:
     return any(role.name.strip().casefold() == "guest" for role in getattr(member, "roles", ()))
 
 
-def _tahzeeq_member_label(member: discord.Member) -> str:
-    if _has_guest_role(member):
-        return discord.utils.escape_mentions(member.display_name)
-    return member.mention
-
-
 class WorkConfirmationResult(Enum):
     CONFIRMED = "confirmed"
     TIMED_OUT = "timed_out"
@@ -516,13 +510,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 members_by_id: dict[int, discord.Member] = {}
                 for role in matching_roles:
                     for member in role.members:
-                        if member.bot:
+                        if member.bot or _has_guest_role(member):
                             continue
                         members_by_id[member.id] = member
                 members = list(members_by_id.values())
                 if not members:
                     await ctx.send(
-                        f"No non-bot members found in roles matching `{training_substring}`."
+                        f"No non-guest members found in roles matching `{training_substring}`."
                     )
                     return
 
@@ -551,7 +545,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     deficit = max(0.0, minimum_hours - worked_hours)
                     scolding = self._pick_scolding(minimum_hours=minimum_hours, worked_hours=worked_hours)
                     lines.append(
-                        f"{_tahzeeq_member_label(member)} - worked {_hours(worked)} (short by {deficit:.2f}h). "
+                        f"{member.mention} - worked {_hours(worked)} (short by {deficit:.2f}h). "
                         f"{scolding}"
                     )
 

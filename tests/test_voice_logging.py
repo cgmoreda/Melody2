@@ -495,7 +495,7 @@ def _make_cog_for_leaderboard(
 
 
 @pytest.mark.asyncio
-async def test_voicehours_tahzeeq_does_not_mention_guest_role_members() -> None:
+async def test_voicehours_tahzeeq_excludes_guest_role_members() -> None:
     regular_member = _FakeMemberWithBot(1, display_name="Regular User")
     guest_member = _FakeMemberWithBot(2, display_name="Guest User")
     training_role = _FakeRole("Training Arc", [regular_member, guest_member])
@@ -514,7 +514,7 @@ async def test_voicehours_tahzeeq_does_not_mention_guest_role_members() -> None:
     output = "\n".join(ctx.sent_messages)
     assert "<@1>" in output
     assert "<@2>" not in output
-    assert "Guest User - worked" in output
+    assert "Guest User" not in output
 
 
 @pytest.mark.asyncio
