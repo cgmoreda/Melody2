@@ -34,6 +34,16 @@ def _is_solo_channel(channel: Optional[discord.abc.GuildChannel]) -> bool:
     return channel is not None and _VOICE_SERVICE.is_solo_channel_name(channel.name)
 
 
+def _has_guest_role(member: discord.Member) -> bool:
+    return any(role.name.strip().casefold() == "guest" for role in getattr(member, "roles", ()))
+
+
+def _tahzeeq_member_label(member: discord.Member) -> str:
+    if _has_guest_role(member):
+        return discord.utils.escape_mentions(member.display_name)
+    return member.mention
+
+
 class WorkConfirmationResult(Enum):
     CONFIRMED = "confirmed"
     TIMED_OUT = "timed_out"
@@ -541,7 +551,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     deficit = max(0.0, minimum_hours - worked_hours)
                     scolding = self._pick_scolding(minimum_hours=minimum_hours, worked_hours=worked_hours)
                     lines.append(
-                        f"{member.mention} - worked {_hours(worked)} (short by {deficit:.2f}h). "
+                        f"{_tahzeeq_member_label(member)} - worked {_hours(worked)} (short by {deficit:.2f}h). "
                         f"{scolding}"
                     )
 

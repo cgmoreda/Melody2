@@ -23,12 +23,23 @@ class _FakeRole:
     def __init__(self, name: str, members: list[_FakeMemberWithBot]) -> None:
         self.name = name
         self.members = members
+        for member in members:
+            member.roles.append(self)
 
 
 class _FakeMemberWithBot:
-    def __init__(self, member_id: int, *, bot: bool = False) -> None:
+    def __init__(
+        self,
+        member_id: int,
+        *,
+        bot: bool = False,
+        display_name: str | None = None,
+    ) -> None:
         self.id = member_id
         self.bot = bot
+        self.display_name = display_name or f"user-{member_id}"
+        self.mention = f"<@{member_id}>"
+        self.roles: list[_FakeRole] = []
 
 
 class _FakeGuildWithRoles:
@@ -209,6 +220,13 @@ class _FakeConfigService:
         return _Config()
 
     async def get_text(self, guild_id: int, key: str) -> str:
+        return ""
+
+
+class _FakeTahzeeqConfigService(_FakeConfigServiceWithMaxLines):
+    async def get_text(self, guild_id: int, key: str) -> str:
+        if key == "training_role_substring":
+            return "Training"
         return ""
 
 
@@ -474,6 +492,29 @@ def _make_cog_for_leaderboard(
         repo=repo,  # type: ignore[arg-type]
         config_service=config_service,  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.asyncio
+async def test_voicehours_tahzeeq_does_not_mention_guest_role_members() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guest_member = _FakeMemberWithBot(2, display_name="Guest User")
+    training_role = _FakeRole("Training Arc", [regular_member, guest_member])
+    _FakeRole("Guest", [guest_member])
+    guild = _FakeGuildWithRoles(20, [training_role])
+    repo = _FakeRepoWithTotals(totals={})
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTahzeeqConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(cog, ctx, "tahzeeq", "2", "last", "1", "days")  # type: ignore[union-attr]
+
+    output = "\n".join(ctx.sent_messages)
+    assert "<@1>" in output
+    assert "<@2>" not in output
+    assert "Guest User - worked" in output
 
 
 @pytest.mark.asyncio
