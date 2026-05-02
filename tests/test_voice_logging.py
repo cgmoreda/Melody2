@@ -122,7 +122,7 @@ class _FakeMember:
 
     async def move_to(self, channel: Any, *, reason: str | None = None) -> None:
         self.move_calls.append((channel, reason))
-        self.voice = None
+        self.voice = _FakeVoiceState(channel) if channel is not None else None
 
 
 class _FakeVoiceChannel:
@@ -138,10 +138,12 @@ class _FakeGuild:
         guild_id: int,
         channels: list[_FakeVoiceChannel],
         extra_members: list[_FakeMember] | None = None,
+        afk_channel: _FakeVoiceChannel | None = None,
     ) -> None:
         self.id = guild_id
         self.name = f"guild-{guild_id}"
         self.voice_channels = channels
+        self.afk_channel = afk_channel
         self.members: list[_FakeMember] = []
         self._members: dict[int, _FakeMember] = {}
         for channel in channels:
@@ -290,7 +292,8 @@ async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session(
     member = _FakeMember(10, display_name="Worker")
     coach = _FakeMember(20, display_name="Coach")
     solo_channel = _FakeVoiceChannel(501, "Solo Room A", [member])
-    guild = _FakeGuild(100, [solo_channel], extra_members=[coach])
+    afk_channel = _FakeVoiceChannel(599, "AFK", [])
+    guild = _FakeGuild(100, [solo_channel, afk_channel], extra_members=[coach], afk_channel=afk_channel)
     repo = _FakeRepo()
     cog = VoiceLoggingCog(
         bot=_FakeBot([guild]),  # type: ignore[arg-type]
@@ -308,7 +311,7 @@ async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session(
 
     assert len(coach.sent_messages) == 1
     assert "Worker" in coach.sent_messages[0]
-    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
@@ -319,7 +322,8 @@ async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config()
     member = _FakeMember(11, display_name="SoloUser")
     fallback = _FakeMember(30, name="__reda", display_name="__reda")
     solo_channel = _FakeVoiceChannel(502, "Solo Room B", [member])
-    guild = _FakeGuild(101, [solo_channel], extra_members=[fallback])
+    afk_channel = _FakeVoiceChannel(598, "AFK", [])
+    guild = _FakeGuild(101, [solo_channel, afk_channel], extra_members=[fallback], afk_channel=afk_channel)
     repo = _FakeRepo()
     cog = VoiceLoggingCog(
         bot=_FakeBot([guild]),  # type: ignore[arg-type]
@@ -337,10 +341,34 @@ async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config()
 
     assert len(fallback.sent_messages) == 1
     assert "SoloUser" in fallback.sent_messages[0]
-    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
+
+
+@pytest.mark.asyncio
+async def test_watchdog_disconnects_when_no_afk_channel_is_configured() -> None:
+    member = _FakeMember(12, display_name="SoloUser")
+    solo_channel = _FakeVoiceChannel(503, "Solo Room C", [member])
+    guild = _FakeGuild(102, [solo_channel])
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeFastConfigService(),  # type: ignore[arg-type]
+    )
+
+    async def _timed_out(_: Any, __: int) -> WorkConfirmationResult:
+        return WorkConfirmationResult.TIMED_OUT
+
+    cog._ask_still_working = _timed_out  # type: ignore[method-assign]
+
+    await cog._watchdog_loop(guild.id, member.id)
+
+    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert member.sent_messages == ["You were disconnected because you did not confirm in time."]
+    assert len(repo.closed_calls) == 1
 
 
 @pytest.mark.asyncio

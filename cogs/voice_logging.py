@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import discord
 from discord.ext import commands
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 _VOICE_SERVICE = VoiceService()
 logger = logging.getLogger(__name__)
+SoloRemovalAction = Literal["afk", "disconnect"]
 
 
 def _hours(seconds: float) -> str:
@@ -309,19 +310,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if confirmation is WorkConfirmationResult.DM_FAILED:
                     await self._notify_watchdog_dm_failure(guild, member)
 
-                disconnected = False
+                removal_action: SoloRemovalAction | None = None
                 if member.voice is not None:
-                    try:
-                        await member.move_to(None, reason="Failed or missed solo-channel work check")
-                        disconnected = True
-                    except (discord.Forbidden, discord.HTTPException):
-                        disconnected = False
+                    removal_action = await self._move_member_out_of_solo_check(member)
 
-                if not disconnected:
+                if removal_action is None:
                     if confirmation is WorkConfirmationResult.TIMED_OUT:
                         try:
                             await member.send(
-                                "You did not confirm in time. I could not disconnect you due to missing permissions."
+                                "You did not confirm in time. I could not move you to AFK or disconnect you due to missing permissions."
                             )
                         except discord.Forbidden:
                             pass
@@ -330,7 +327,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await self._repo.close_open_voice_sessions(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
                     try:
-                        await member.send("You were disconnected because you did not confirm in time.")
+                        if removal_action == "afk":
+                            await member.send("You were moved to AFK because you did not confirm in time.")
+                        else:
+                            await member.send("You were disconnected because you did not confirm in time.")
                     except discord.Forbidden:
                         pass
                 break
@@ -340,6 +340,22 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             task = asyncio.current_task()
             if task is not None:
                 self._clear_watchdog_if_current(member_id, task)
+
+    @staticmethod
+    async def _move_member_out_of_solo_check(member: discord.Member) -> SoloRemovalAction | None:
+        target_channel = member.guild.afk_channel
+        if target_channel is not None:
+            try:
+                await member.move_to(target_channel, reason="Failed or missed solo-channel work check")
+                return "afk"
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        try:
+            await member.move_to(None, reason="Failed or missed solo-channel work check")
+            return "disconnect"
+        except (discord.Forbidden, discord.HTTPException):
+            return None
 
     async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> WorkConfirmationResult:
         view = WorkConfirmationView(member.id, timeout_seconds)
