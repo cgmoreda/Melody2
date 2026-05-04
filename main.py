@@ -11,6 +11,7 @@ from services.cf_client import CodeforcesClient
 from services.coach_secretary import CoachSecretary
 from services.atcoder_client import AtCoderProvider
 from services.contest_reminder import CodeforcesProvider, ContestReminderService
+from services.daily_sheet_reminder import DailySheetReminderService
 from services.dynamic_voice import DynamicVoiceManager
 from services.guild_config import GuildConfigService
 from services.role_assigner import RoleAssigner
@@ -26,6 +27,7 @@ load_dotenv()
 EXTENSIONS: tuple[str, ...] = (
     "cogs.help",
     "cogs.verification",
+    "cogs.daily_sheets",
     "cogs.config",
     "cogs.gym",
     "cogs.coach_secretary",
@@ -91,6 +93,7 @@ async def _setup_services(bot: commands.Bot) -> None:
     session: aiohttp.ClientSession | None = None
     repo: UserRepository | None = None
     reminder: ContestReminderService | None = None
+    daily_sheet_reminder: DailySheetReminderService | None = None
 
     try:
         session = aiohttp.ClientSession()
@@ -121,6 +124,11 @@ async def _setup_services(bot: commands.Bot) -> None:
         bot.contest_reminder = reminder  # type: ignore[attr-defined]
         logger.info("Contest reminder service started")
 
+        daily_sheet_reminder = DailySheetReminderService(bot=bot, repo=repo)
+        daily_sheet_reminder.start()
+        bot.daily_sheet_reminder = daily_sheet_reminder  # type: ignore[attr-defined]
+        logger.info("Daily sheet reminder service started")
+
         secretary = CoachSecretary(repo)
         bot.coach_secretary = secretary  # type: ignore[attr-defined]
         logger.info("Coach secretary service ready")
@@ -133,6 +141,8 @@ async def _setup_services(bot: commands.Bot) -> None:
         bot.dynamic_voice = dynamic_voice  # type: ignore[attr-defined]
         logger.info("Dynamic voice manager ready")
     except Exception:
+        if daily_sheet_reminder is not None:
+            await daily_sheet_reminder.stop()
         if reminder is not None:
             await reminder.stop()
         if repo is not None:
@@ -141,6 +151,7 @@ async def _setup_services(bot: commands.Bot) -> None:
             await session.close()
         for attr in (
             "contest_reminder",
+            "daily_sheet_reminder",
             "dynamic_voice",
             "guild_config",
             "coach_secretary",
@@ -160,6 +171,10 @@ async def _teardown_services(bot: commands.Bot) -> None:
     if reminder is not None:
         await reminder.stop()
 
+    daily_sheet_reminder: DailySheetReminderService | None = getattr(bot, "daily_sheet_reminder", None)
+    if daily_sheet_reminder is not None:
+        await daily_sheet_reminder.stop()
+
     repo: UserRepository | None = getattr(bot, "user_repo", None)
     if repo is not None:
         await repo.close()
@@ -170,6 +185,7 @@ async def _teardown_services(bot: commands.Bot) -> None:
 
     for attr in (
         "contest_reminder",
+        "daily_sheet_reminder",
         "dynamic_voice",
         "guild_config",
         "coach_secretary",

@@ -5,7 +5,7 @@ from collections import defaultdict
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Iterable, Optional, Protocol
 
 import asyncpg
@@ -144,6 +144,16 @@ class PendingVerification:
     expires_at: datetime
 
 
+@dataclass(slots=True)
+class DailySheetReminderConfig:
+    guild_id: int
+    channel_id: int
+    remind_hour_utc: int
+    remind_minute_utc: int
+    message: str
+    last_sent_on: Optional[date]
+
+
 class VerificationReadRepository(Protocol):
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         ...
@@ -207,6 +217,31 @@ class ReminderRepository(Protocol):
         ...
 
     async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
+        ...
+
+
+class DailySheetReminderRepository(Protocol):
+    async def upsert_daily_sheet_reminder(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        remind_hour_utc: int,
+        remind_minute_utc: int,
+        message: str,
+    ) -> None:
+        ...
+
+    async def delete_daily_sheet_reminder(self, guild_id: int) -> bool:
+        ...
+
+    async def get_daily_sheet_reminder(self, guild_id: int) -> Optional[DailySheetReminderConfig]:
+        ...
+
+    async def list_daily_sheet_reminders(self) -> list[DailySheetReminderConfig]:
+        ...
+
+    async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
         ...
 
 
@@ -458,6 +493,34 @@ class UserRepositoryBase(abc.ABC):
         """Delete old persisted reminder dispatch rows and return deleted row count."""
 
     @abc.abstractmethod
+    async def upsert_daily_sheet_reminder(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        remind_hour_utc: int,
+        remind_minute_utc: int,
+        message: str,
+    ) -> None:
+        """Create or replace the daily sheets reminder config for one guild."""
+
+    @abc.abstractmethod
+    async def delete_daily_sheet_reminder(self, guild_id: int) -> bool:
+        """Delete the daily sheets reminder config for one guild."""
+
+    @abc.abstractmethod
+    async def get_daily_sheet_reminder(self, guild_id: int) -> Optional[DailySheetReminderConfig]:
+        """Return the daily sheets reminder config for one guild, if set."""
+
+    @abc.abstractmethod
+    async def list_daily_sheet_reminders(self) -> list[DailySheetReminderConfig]:
+        """Return every configured daily sheets reminder."""
+
+    @abc.abstractmethod
+    async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        """Mark one guild's daily sheets reminder as sent for the given date."""
+
+    @abc.abstractmethod
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         """Return coach config for a guild, or None."""
 
@@ -644,7 +707,7 @@ class UserRepository(UserRepositoryBase):
     """Concrete Postgres implementation using asyncpg."""
 
     _SCHEMA_LOCK_KEY = 3_310_920_014_991
-    _LATEST_SCHEMA_VERSION = 6
+    _LATEST_SCHEMA_VERSION = 7
 
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
@@ -707,6 +770,7 @@ class UserRepository(UserRepositoryBase):
             4: self._migration_004_add_platform_to_sent_reminders,
             5: self._migration_005_rename_is_solo_to_is_tracked,
             6: self._migration_006_enforce_single_open_voice_session,
+            7: self._migration_007_add_daily_sheet_reminders,
         }
 
         if current_version > self._LATEST_SCHEMA_VERSION:
@@ -1154,6 +1218,20 @@ class UserRepository(UserRepositoryBase):
             """
         )
 
+    async def _migration_007_add_daily_sheet_reminders(self, conn: asyncpg.Connection) -> None:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_sheet_reminders (
+                guild_id BIGINT PRIMARY KEY,
+                channel_id BIGINT NOT NULL,
+                remind_hour_utc SMALLINT NOT NULL CHECK (remind_hour_utc BETWEEN 0 AND 23),
+                remind_minute_utc SMALLINT NOT NULL CHECK (remind_minute_utc BETWEEN 0 AND 59),
+                message TEXT NOT NULL,
+                last_sent_on DATE
+            )
+            """
+        )
+
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
@@ -1394,6 +1472,123 @@ class UserRepository(UserRepositoryBase):
             return int(result.split()[-1])
         except (ValueError, IndexError):
             return 0
+
+    async def upsert_daily_sheet_reminder(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        remind_hour_utc: int,
+        remind_minute_utc: int,
+        message: str,
+    ) -> None:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO daily_sheet_reminders (
+                    guild_id,
+                    channel_id,
+                    remind_hour_utc,
+                    remind_minute_utc,
+                    message,
+                    last_sent_on
+                )
+                VALUES ($1, $2, $3, $4, $5, NULL)
+                ON CONFLICT (guild_id)
+                DO UPDATE SET channel_id = EXCLUDED.channel_id,
+                              remind_hour_utc = EXCLUDED.remind_hour_utc,
+                              remind_minute_utc = EXCLUDED.remind_minute_utc,
+                              message = EXCLUDED.message,
+                              last_sent_on = NULL
+                """,
+                guild_id,
+                channel_id,
+                remind_hour_utc,
+                remind_minute_utc,
+                message,
+            )
+
+    async def delete_daily_sheet_reminder(self, guild_id: int) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM daily_sheet_reminders
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        return result.endswith("1")
+
+    async def get_daily_sheet_reminder(self, guild_id: int) -> Optional[DailySheetReminderConfig]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT guild_id,
+                       channel_id,
+                       remind_hour_utc,
+                       remind_minute_utc,
+                       message,
+                       last_sent_on
+                FROM daily_sheet_reminders
+                WHERE guild_id = $1
+                """,
+                guild_id,
+            )
+        if row is None:
+            return None
+        return DailySheetReminderConfig(
+            guild_id=row["guild_id"],
+            channel_id=row["channel_id"],
+            remind_hour_utc=row["remind_hour_utc"],
+            remind_minute_utc=row["remind_minute_utc"],
+            message=row["message"],
+            last_sent_on=row["last_sent_on"],
+        )
+
+    async def list_daily_sheet_reminders(self) -> list[DailySheetReminderConfig]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT guild_id,
+                       channel_id,
+                       remind_hour_utc,
+                       remind_minute_utc,
+                       message,
+                       last_sent_on
+                FROM daily_sheet_reminders
+                ORDER BY guild_id
+                """
+            )
+        return [
+            DailySheetReminderConfig(
+                guild_id=row["guild_id"],
+                channel_id=row["channel_id"],
+                remind_hour_utc=row["remind_hour_utc"],
+                remind_minute_utc=row["remind_minute_utc"],
+                message=row["message"],
+                last_sent_on=row["last_sent_on"],
+            )
+            for row in rows
+        ]
+
+    async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE daily_sheet_reminders
+                SET last_sent_on = $2
+                WHERE guild_id = $1
+                  AND (last_sent_on IS NULL OR last_sent_on < $2)
+                """,
+                guild_id,
+                sent_on,
+            )
+        return result.endswith("1")
 
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         assert self._pool is not None, "Call init() first"

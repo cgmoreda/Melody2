@@ -162,10 +162,11 @@ async def test_init_new_database_runs_all_migrations_in_order(monkeypatch: pytes
     repo = await _run_init_with_fake_conn(monkeypatch, conn)
 
     assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
-    assert conn.schema_version_updates == [0, 1, 2, 3, 4, 5, 6]
+    assert conn.schema_version_updates == [0, 1, 2, 3, 4, 5, 6, 7]
 
     assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS schema_version")
     assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS verified_users")
+    assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS daily_sheet_reminders")
     assert _contains_statement(
         conn.executed_statements,
         "CREATE INDEX IF NOT EXISTS idx_voice_sessions_tracked_started",
@@ -200,7 +201,7 @@ async def test_init_upgrade_from_version_one_skips_base_schema(monkeypatch: pyte
     repo = await _run_init_with_fake_conn(monkeypatch, conn)
 
     assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
-    assert conn.schema_version_updates == [2, 3, 4, 5, 6]
+    assert conn.schema_version_updates == [2, 3, 4, 5, 6, 7]
     assert not _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS verified_users")
     assert _contains_statement(
         conn.executed_statements,
@@ -221,11 +222,25 @@ async def test_init_upgrade_from_version_four_renames_solo_column_once(monkeypat
     repo = await _run_init_with_fake_conn(monkeypatch, conn)
 
     assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
-    assert conn.schema_version_updates == [5, 6]
+    assert conn.schema_version_updates == [5, 6, 7]
     assert "is_tracked" in conn.columns_by_table["voice_sessions"]
     assert "is_solo" not in conn.columns_by_table["voice_sessions"]
     assert _contains_statement(conn.executed_statements, "RENAME COLUMN is_solo TO is_tracked")
     assert "uq_voice_sessions_one_open_per_member" in conn.existing_indexes
+
+
+@pytest.mark.asyncio
+async def test_init_upgrade_from_version_six_only_adds_daily_sheet_reminders(monkeypatch: pytest.MonkeyPatch) -> None:
+    conn = _FakeConnection(
+        schema_version=6,
+        existing_indexes={"uq_voice_sessions_one_open_per_member"},
+    )
+    repo = await _run_init_with_fake_conn(monkeypatch, conn)
+
+    assert conn.schema_version == repo._LATEST_SCHEMA_VERSION
+    assert conn.schema_version_updates == [7]
+    assert _contains_statement(conn.executed_statements, "CREATE TABLE IF NOT EXISTS daily_sheet_reminders")
+    assert not _contains_statement(conn.executed_statements, "UPDATE voice_sessions v SET ended_at")
 
 
 @pytest.mark.asyncio
