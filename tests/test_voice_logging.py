@@ -826,6 +826,105 @@ async def test_timesheet_top_limit_max_range_renders_limited_users(
 
 
 @pytest.mark.asyncio
+async def test_voicehours_max_day_suffix_top_limit_renders_limited_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 20, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 5)]
+    guild = _FakeGuildWithRoles(38, [_FakeRole("Training Arc", members)])
+    day_start = datetime(2026, 1, 10, 5, 0, tzinfo=cairo)
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": member.id,
+                "start_ts": day_start.astimezone(UTC),
+                "end_ts": (day_start + timedelta(hours=5 - member.id)).astimezone(UTC),
+            }
+            for member in members
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+        "top",
+        "3",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Day" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" in output
+    assert "User 4" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
+async def test_timesheet_max_range_suffix_top_limit_renders_limited_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 4)]
+    guild = _FakeGuildWithRoles(39, [_FakeRole("Training Arc", members)])
+    start = datetime(2026, 1, 10, 6, 0, tzinfo=cairo)
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": member.id,
+                "start_ts": start.astimezone(UTC),
+                "end_ts": (start + timedelta(hours=4 - member.id)).astimezone(UTC),
+            }
+            for member in members
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "max",
+        "range",
+        "3",
+        "hours",
+        "last",
+        "1",
+        "week",
+        "top",
+        "2",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Range" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
 async def test_voicehours_top_limit_regular_leaderboard_still_uses_totals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -893,6 +992,60 @@ async def test_voicehours_top_max_requires_numeric_limit() -> None:
     )
 
     assert ctx.sent_messages == ["`limit` must be a positive integer."]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_max_suffix_top_requires_numeric_limit() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(40, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+        "top",
+        "x",
+    )
+
+    assert ctx.sent_messages == ["`limit` must be a positive integer."]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_max_rejects_prefix_and_suffix_top_limits() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(41, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "5",
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+        "top",
+        "3",
+    )
+
+    assert ctx.sent_messages == ["`top` limit can appear before or after `max`, not both."]
 
 
 @pytest.mark.asyncio

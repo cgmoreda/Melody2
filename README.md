@@ -87,8 +87,9 @@ Voice logging:
 - `!voicehours max month last <amount> months`
 - `!voicehours max range <amount> <hour|day|week|month> last <lookback_amount> <hour|day|week|month>`
 - `!voicehours top <limit> max <day|week|month|range> ...`
+- `!voicehours max <day|week|month|range> ... top <limit>`
 - Same `max ...` syntax is available through `!timesheet max ...`
-- Same `top <limit> max ...` syntax is available through `!timesheet top ...`
+- Same `top <limit> max ...` and `max ... top <limit>` syntax is available through `!timesheet`
 - `!voicehours track list`
 - `!voicehours track add <keyword>`
 - `!voicehours track remove <keyword>`

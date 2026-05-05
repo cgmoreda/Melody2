@@ -334,6 +334,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             "Usage:\n"
             "`!timesheet last <days> days`\n"
             "`!timesheet top <limit> max <day/week/month/range> ...`\n"
+            "`!timesheet max <day/week/month/range> ... top <limit>`\n"
             "`!timesheet max day last <amount> <day/week/month>`\n"
             "`!timesheet max week last <amount> <week/month>`\n"
             "`!timesheet max month last <amount> months`\n"
@@ -349,6 +350,19 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         if limit <= 0:
             raise ValueError("`limit` must be greater than 0.")
         return min(limit, 100)
+
+    @classmethod
+    def _split_trailing_top_limit(
+        cls,
+        args: tuple[str, ...],
+        *,
+        existing_limit: Optional[int] = None,
+    ) -> tuple[tuple[str, ...], Optional[int]]:
+        if len(args) < 2 or args[-2].strip().lower() != "top":
+            return args, existing_limit
+        if existing_limit is not None:
+            raise ValueError("`top` limit can appear before or after `max`, not both.")
+        return args[:-2], cls._parse_top_limit(args[-1])
 
     async def _send_training_timesheet(
         self,
@@ -413,6 +427,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     ) -> None:
         assert ctx.guild is not None
         try:
+            args, max_lines = self._split_trailing_top_limit(args, existing_limit=max_lines)
             request = self._voice_service.parse_max_tokens(args)
         except ValueError as err:
             await ctx.send(str(err))
@@ -687,6 +702,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
         - `!voicehours timesheet last <days> days`
         - `!voicehours max <day/week/month/range> ...`
+        - `!voicehours top <limit> max <day/week/month/range> ...`
+        - `!voicehours max <day/week/month/range> ... top <limit>`
         - `!voicehours track list`
         - `!voicehours track add <keyword>`
         - `!voicehours track remove <keyword>`

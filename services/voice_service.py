@@ -92,7 +92,8 @@ class VoiceService:
         "`max day last <amount> <day/week/month>`\n"
         "`max week last <amount> <week/month>`\n"
         "`max month last <amount> months`\n"
-        "`max range <amount> <hour/day/week/month> last <lookback_amount> <hour/day/week/month>`"
+        "`max range <amount> <hour/day/week/month> last <lookback_amount> <hour/day/week/month>`\n"
+        "`max <day/week/month/range> ... top <limit>`"
     )
 
     @staticmethod
