@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -724,6 +724,175 @@ async def test_voicehours_max_range_reports_training_members_sorted_by_best_wind
     assert "2.00h" in output
     assert repo.interval_calls[0][1] == datetime(2026, 1, 3, 5, 0, tzinfo=cairo).astimezone(UTC)
     assert repo.interval_calls[0][2] == fixed_now
+
+
+@pytest.mark.asyncio
+async def test_voicehours_top_limit_max_day_renders_limited_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 20, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 5)]
+    guild = _FakeGuildWithRoles(34, [_FakeRole("Training Arc", members)])
+    day_start = datetime(2026, 1, 10, 5, 0, tzinfo=cairo)
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": member.id,
+                "start_ts": day_start.astimezone(UTC),
+                "end_ts": (day_start + timedelta(hours=5 - member.id)).astimezone(UTC),
+            }
+            for member in members
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "3",
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Day" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" in output
+    assert "User 4" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
+async def test_timesheet_top_limit_max_range_renders_limited_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 4)]
+    guild = _FakeGuildWithRoles(35, [_FakeRole("Training Arc", members)])
+    start = datetime(2026, 1, 10, 6, 0, tzinfo=cairo)
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": member.id,
+                "start_ts": start.astimezone(UTC),
+                "end_ts": (start + timedelta(hours=4 - member.id)).astimezone(UTC),
+            }
+            for member in members
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "2",
+        "max",
+        "range",
+        "3",
+        "hours",
+        "last",
+        "1",
+        "week",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Range" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_top_limit_regular_leaderboard_still_uses_totals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 5)]
+    guild = _FakeGuildWithRoles(36, [_FakeRole("Training Arc", members)])
+    repo = _FakeRepoWithTotals(
+        totals={
+            1: 4 * 3600.0,
+            2: 3 * 3600.0,
+            3: 2 * 3600.0,
+            4: 3600.0,
+        }
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "3",
+        "last",
+        "1",
+        "week",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Top Tracked Voice Hours" in output
+    assert "Max Tracked Voice" not in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" in output
+    assert "User 4" not in output
+    assert repo.interval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voicehours_top_max_requires_numeric_limit() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(37, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "x",
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+    )
+
+    assert ctx.sent_messages == ["`limit` must be a positive integer."]
 
 
 @pytest.mark.asyncio

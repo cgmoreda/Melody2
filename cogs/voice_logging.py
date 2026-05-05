@@ -333,11 +333,22 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return (
             "Usage:\n"
             "`!timesheet last <days> days`\n"
+            "`!timesheet top <limit> max <day/week/month/range> ...`\n"
             "`!timesheet max day last <amount> <day/week/month>`\n"
             "`!timesheet max week last <amount> <week/month>`\n"
             "`!timesheet max month last <amount> months`\n"
             "`!timesheet max range <amount> <hour/day/week/month> last <lookback_amount> <hour/day/week/month>`"
         )
+
+    @staticmethod
+    def _parse_top_limit(raw: str) -> int:
+        try:
+            limit = int(raw)
+        except ValueError as exc:
+            raise ValueError("`limit` must be a positive integer.") from exc
+        if limit <= 0:
+            raise ValueError("`limit` must be greater than 0.")
+        return min(limit, 100)
 
     async def _send_training_timesheet(
         self,
@@ -398,6 +409,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         config: object,
         now: datetime,
         handle_by_discord_id: dict[int, str],
+        max_lines: Optional[int] = None,
     ) -> None:
         assert ctx.guild is not None
         try:
@@ -440,7 +452,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         content = self._render_ranked_message(
             title=title,
             lines=lines,
-            max_lines=config.voicehours_max_lines,
+            max_lines=max_lines if max_lines is not None else config.voicehours_max_lines,
             overflow_label="users",
         )
         await send_context_text_chunks(ctx, content)
@@ -475,6 +487,24 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 config=config,
                 now=now,
                 handle_by_discord_id=handle_by_discord_id,
+            )
+            return
+        if mode == "top":
+            if len(args) < 3 or args[2].strip().lower() != "max":
+                await ctx.send(self._timesheet_usage())
+                return
+            try:
+                limit = self._parse_top_limit(args[1])
+            except ValueError as err:
+                await ctx.send(str(err))
+                return
+            await self._send_training_max_report(
+                ctx,
+                args[3:],
+                config=config,
+                now=now,
+                handle_by_discord_id=handle_by_discord_id,
+                max_lines=limit,
             )
             return
 
@@ -693,9 +723,35 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             if mode == "top":
                 limit = config.voicehours_max_lines
                 remaining = args[1:]
+                parsed_explicit_limit = False
+                limit_token: Optional[str] = None
                 if remaining and remaining[0].isdigit():
-                    limit = max(1, min(int(remaining[0]), 100))
+                    limit_token = remaining[0]
+                    limit = max(1, min(int(limit_token), 100))
                     remaining = remaining[1:]
+                    parsed_explicit_limit = True
+                elif remaining and remaining[0].strip().lower() == "max":
+                    await ctx.send("Usage: `!voicehours top <limit> max <day/week/month/range> ...`")
+                    return
+                elif len(remaining) >= 2 and remaining[1].strip().lower() == "max":
+                    await ctx.send("`limit` must be a positive integer.")
+                    return
+
+                if parsed_explicit_limit and remaining and remaining[0].strip().lower() == "max":
+                    try:
+                        limit = self._parse_top_limit(limit_token or "")
+                    except ValueError as err:
+                        await ctx.send(str(err))
+                        return
+                    await self._send_training_max_report(
+                        ctx,
+                        remaining[1:],
+                        config=config,
+                        now=now,
+                        handle_by_discord_id=handle_by_discord_id,
+                        max_lines=limit,
+                    )
+                    return
 
                 try:
                     since, label = self._parse_window_tokens(now=now, tokens=tuple(remaining))
