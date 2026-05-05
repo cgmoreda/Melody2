@@ -52,6 +52,7 @@ Reminders:
 - `!reminder status [#channel]`
 - `!reminder next [codeforces|atcoder]`
 - `!dailysheets set <HH:MM UTC> [#channel] [message]` (aliases: `!dailyreminder`, `!sheets`)
+- `!dailysheets set [#channel] <HH:MM UTC> [message]`
 - `!dailysheets status`
 - `!dailysheets disable`
 
@@ -80,6 +81,10 @@ Voice logging:
 - `!voicehours roles [last <x> <hour|day|week|month>]`
 - `!voicehours unis [last <x> <hour|day|week|month>]`
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
+- `!voicehours last <x> <hour|day|week|month> top <limit>`
+- `!voicehours last <x> <hour|day|week|month> user <@member>`
+- `!voicehours last <x> <hour|day|week|month> role <@role>`
+- `!voicehours last <x> <hour|day|week|month> tahzeeq <x>`
 - `!voicehours timesheet last <days> days`
 - `!timesheet last <days> days`
 - `!voicehours max day last <amount> <day|week|month>`
@@ -97,6 +102,7 @@ Voice logging:
 Gym:
 - `!gym` (interactive panel)
 - `!gald [contest_id] [teams] [force]`
+- `!gald force teams <contest_id>`
 
 Text config keys:
 - `training_role_substring` (default: `training arc`)

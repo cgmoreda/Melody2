@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Literal, Optional
@@ -10,6 +11,13 @@ import discord
 from discord.ext import commands
 
 from db.repository import VoiceFeatureRepository
+from services.command_parser import (
+    CommandParseError,
+    extract_single_clause,
+    normalize_token,
+    parse_positive_float,
+    parse_positive_int,
+)
 from services.discord_output import send_context_lines_chunks, send_context_text_chunks, split_lines_chunks
 from services.guild_config import GuildConfigService
 from services.voice_service import VoiceService
@@ -21,6 +29,39 @@ if TYPE_CHECKING:
 _VOICE_SERVICE = VoiceService()
 logger = logging.getLogger(__name__)
 SoloRemovalAction = Literal["afk", "disconnect"]
+VoiceHoursAction = Literal[
+    "leaderboard",
+    "top",
+    "tahzeeq",
+    "me",
+    "user",
+    "role",
+    "roles",
+    "unis",
+    "timesheet",
+    "max",
+    "track",
+]
+TimesheetAction = Literal["last", "max"]
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceHoursCommandRequest:
+    action: VoiceHoursAction
+    window_tokens: tuple[str, ...] = ()
+    top_limit: Optional[int] = None
+    target_token: Optional[str] = None
+    minimum_hours: Optional[float] = None
+    timesheet_tokens: tuple[str, ...] = ()
+    max_tokens: tuple[str, ...] = ()
+    track_tokens: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TimesheetCommandRequest:
+    action: TimesheetAction
+    tokens: tuple[str, ...]
+    max_lines: Optional[int] = None
 
 
 def _hours(seconds: float) -> str:
@@ -246,6 +287,150 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return self._voice_service.parse_window_tokens(now=now, tokens=tokens)
 
     @staticmethod
+    def _voicehours_unknown_message() -> str:
+        return (
+            "Unknown mode.\n"
+            "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, "
+            "`top`, `timesheet`, `max`, `track`.\n"
+            "Example: `!voicehours top 20 last 2 weeks`"
+        )
+
+    @classmethod
+    def _extract_top_clause(
+        cls,
+        tokens: tuple[str, ...],
+        *,
+        require_value: bool,
+    ) -> tuple[bool, Optional[int], tuple[str, ...]]:
+        found = False
+        limit: Optional[int] = None
+        remaining: list[str] = []
+        index = 0
+        non_limit_followers = {"last", "me", "user", "role", "roles", "teams", "unis", "tahzeeq"}
+
+        while index < len(tokens):
+            if normalize_token(tokens[index]) != "top":
+                remaining.append(tokens[index])
+                index += 1
+                continue
+
+            if found:
+                raise CommandParseError("Only one `top` clause is allowed.")
+            found = True
+            if index + 1 >= len(tokens):
+                if require_value:
+                    raise CommandParseError("`limit` must be a positive integer.")
+                index += 1
+                continue
+
+            next_token = tokens[index + 1]
+            if not require_value and normalize_token(next_token) in non_limit_followers:
+                index += 1
+                continue
+
+            limit = cls._parse_top_limit(next_token)
+            index += 2
+
+        return found, limit, tuple(remaining)
+
+    @classmethod
+    def _parse_timesheet_request(cls, args: tuple[str, ...]) -> TimesheetCommandRequest:
+        if not args:
+            raise CommandParseError(cls._timesheet_usage())
+
+        has_top, limit, remaining = cls._extract_top_clause(args, require_value=True)
+        if not remaining:
+            raise CommandParseError(cls._timesheet_usage())
+
+        mode = normalize_token(remaining[0])
+        if mode == "last":
+            if has_top:
+                raise CommandParseError(cls._timesheet_usage())
+            return TimesheetCommandRequest(action="last", tokens=remaining)
+        if mode == "max":
+            return TimesheetCommandRequest(action="max", tokens=remaining[1:], max_lines=limit)
+
+        raise CommandParseError(cls._timesheet_usage())
+
+    @classmethod
+    def _parse_voicehours_request(
+        cls,
+        args: tuple[str, ...],
+        *,
+        default_top_limit: int,
+    ) -> VoiceHoursCommandRequest:
+        if not args:
+            raise CommandParseError(cls._voicehours_unknown_message())
+
+        first = normalize_token(args[0])
+        if first == "track":
+            return VoiceHoursCommandRequest(action="track", track_tokens=args[1:])
+        if first == "timesheet":
+            return VoiceHoursCommandRequest(action="timesheet", timesheet_tokens=args[1:])
+
+        normalized = [normalize_token(arg) for arg in args]
+        if "max" in normalized:
+            has_top, limit, remaining = cls._extract_top_clause(args, require_value=True)
+            if not has_top:
+                limit = None
+            if not remaining or normalize_token(remaining[0]) != "max":
+                raise CommandParseError(VoiceService.MAX_USAGE)
+            return VoiceHoursCommandRequest(action="max", max_tokens=remaining[1:], top_limit=limit)
+
+        last_clause, remaining = extract_single_clause(
+            args,
+            {"last"},
+            3,
+            name="last",
+            incomplete_message="Usage: `... [last <x> <hour/day/week/month>]`",
+        )
+        has_top, limit, remaining = cls._extract_top_clause(remaining, require_value=False)
+        window_tokens = last_clause.tokens if last_clause is not None else ()
+        if has_top and limit is None:
+            limit = default_top_limit
+
+        normalized_remaining = tuple(normalize_token(arg) for arg in remaining)
+        if not remaining:
+            return VoiceHoursCommandRequest(
+                action="top" if has_top else "leaderboard",
+                window_tokens=window_tokens,
+                top_limit=limit,
+            )
+
+        if has_top:
+            raise CommandParseError("Usage: `!voicehours top [limit] [last <x> <hour/day/week/month>]`")
+
+        if normalized_remaining == ("me",):
+            return VoiceHoursCommandRequest(action="me", window_tokens=window_tokens)
+        if normalized_remaining and normalized_remaining[0] == "user" and len(remaining) != 2:
+            raise CommandParseError("Usage: `!voicehours user <@member> [last <x> <hour/day/week/month>]`")
+        if len(remaining) == 2 and normalized_remaining[0] == "user":
+            return VoiceHoursCommandRequest(action="user", target_token=remaining[1], window_tokens=window_tokens)
+        if normalized_remaining and normalized_remaining[0] == "role" and len(remaining) != 2:
+            raise CommandParseError("Usage: `!voicehours role <@role> [last <x> <hour/day/week/month>]`")
+        if len(remaining) == 2 and normalized_remaining[0] == "role":
+            return VoiceHoursCommandRequest(action="role", target_token=remaining[1], window_tokens=window_tokens)
+        if normalized_remaining in {("roles",), ("teams",)}:
+            return VoiceHoursCommandRequest(action="roles", window_tokens=window_tokens)
+        if normalized_remaining == ("unis",):
+            return VoiceHoursCommandRequest(action="unis", window_tokens=window_tokens)
+        if normalized_remaining and normalized_remaining[0] == "tahzeeq" and len(remaining) != 2:
+            raise CommandParseError("Usage: `!voicehours tahzeeq <x> [last <x> <hour/day/week/month>]`")
+        if len(remaining) == 2 and normalized_remaining[0] == "tahzeeq":
+            minimum_hours = parse_positive_float(
+                remaining[1],
+                "x",
+                number_message="`x` must be a number (hours).",
+            )
+            return VoiceHoursCommandRequest(
+                action="tahzeeq",
+                minimum_hours=minimum_hours,
+                window_tokens=window_tokens,
+            )
+
+        raise CommandParseError(cls._voicehours_unknown_message())
+
+    @staticmethod
     def _sorted_totals(totals: dict[int, float]) -> list[tuple[int, float]]:
         return _VOICE_SERVICE.sorted_totals(totals)
 
@@ -343,13 +528,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
     @staticmethod
     def _parse_top_limit(raw: str) -> int:
-        try:
-            limit = int(raw)
-        except ValueError as exc:
-            raise ValueError("`limit` must be a positive integer.") from exc
-        if limit <= 0:
-            raise ValueError("`limit` must be greater than 0.")
-        return min(limit, 100)
+        return min(parse_positive_int(raw, "limit"), 100)
 
     @classmethod
     def _split_trailing_top_limit(
@@ -481,49 +660,31 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         now: datetime,
         handle_by_discord_id: dict[int, str],
     ) -> None:
-        if not args:
-            await ctx.send(self._timesheet_usage())
+        try:
+            request = self._parse_timesheet_request(args)
+        except ValueError as err:
+            await ctx.send(str(err))
             return
 
-        mode = args[0].strip().lower()
-        if mode == "last":
+        if request.action == "last":
             await self._send_training_timesheet(
                 ctx,
-                args,
+                request.tokens,
                 config=config,
                 now=now,
                 handle_by_discord_id=handle_by_discord_id,
             )
             return
-        if mode == "max":
+        if request.action == "max":
             await self._send_training_max_report(
                 ctx,
-                args[1:],
+                request.tokens,
                 config=config,
                 now=now,
                 handle_by_discord_id=handle_by_discord_id,
+                max_lines=request.max_lines,
             )
             return
-        if mode == "top":
-            if len(args) < 3 or args[2].strip().lower() != "max":
-                await ctx.send(self._timesheet_usage())
-                return
-            try:
-                limit = self._parse_top_limit(args[1])
-            except ValueError as err:
-                await ctx.send(str(err))
-                return
-            await self._send_training_max_report(
-                ctx,
-                args[3:],
-                config=config,
-                now=now,
-                handle_by_discord_id=handle_by_discord_id,
-                max_lines=limit,
-            )
-            return
-
-        await ctx.send(self._timesheet_usage())
 
     async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
         try:
@@ -700,6 +861,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours roles [last <x> <hour/day/week/month>]`  (alias: teams)
         - `!voicehours unis [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
+        - `!voicehours last <x> <hour/day/week/month> top <limit>`
+        - `!voicehours last <x> <hour/day/week/month> user <@member>`
+        - `!voicehours last <x> <hour/day/week/month> role <@role>`
+        - `!voicehours last <x> <hour/day/week/month> tahzeeq <x>`
         - `!voicehours timesheet last <days> days`
         - `!voicehours max <day/week/month/range> ...`
         - `!voicehours top <limit> max <day/week/month/range> ...`
@@ -715,105 +880,68 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         handle_by_discord_id = await self._resolve_handles(ctx.guild)
 
         if args:
-            mode = args[0].lower()
+            try:
+                request = self._parse_voicehours_request(args, default_top_limit=config.voicehours_max_lines)
+            except ValueError as err:
+                await ctx.send(str(err))
+                return
 
-            if mode == "timesheet":
+            if request.action == "timesheet":
                 await self._handle_timesheet_command(
                     ctx,
-                    args[1:],
+                    request.timesheet_tokens,
                     config=config,
                     now=now,
                     handle_by_discord_id=handle_by_discord_id,
                 )
                 return
 
-            if mode == "max":
-                await self._handle_timesheet_command(
+            if request.action == "max":
+                await self._send_training_max_report(
                     ctx,
-                    args,
+                    request.max_tokens,
                     config=config,
                     now=now,
                     handle_by_discord_id=handle_by_discord_id,
+                    max_lines=request.top_limit,
                 )
                 return
 
-            if mode == "top":
-                limit = config.voicehours_max_lines
-                remaining = args[1:]
-                parsed_explicit_limit = False
-                limit_token: Optional[str] = None
-                if remaining and remaining[0].isdigit():
-                    limit_token = remaining[0]
-                    limit = max(1, min(int(limit_token), 100))
-                    remaining = remaining[1:]
-                    parsed_explicit_limit = True
-                elif remaining and remaining[0].strip().lower() == "max":
-                    await ctx.send("Usage: `!voicehours top <limit> max <day/week/month/range> ...`")
-                    return
-                elif len(remaining) >= 2 and remaining[1].strip().lower() == "max":
-                    await ctx.send("`limit` must be a positive integer.")
-                    return
+            if request.action == "track":
+                await self._handle_track(ctx, request.track_tokens)
+                return
 
-                if parsed_explicit_limit and remaining and remaining[0].strip().lower() == "max":
-                    try:
-                        limit = self._parse_top_limit(limit_token or "")
-                    except ValueError as err:
-                        await ctx.send(str(err))
-                        return
-                    await self._send_training_max_report(
-                        ctx,
-                        remaining[1:],
-                        config=config,
-                        now=now,
-                        handle_by_discord_id=handle_by_discord_id,
-                        max_lines=limit,
-                    )
-                    return
+            try:
+                since, label = self._parse_window_tokens(now=now, tokens=request.window_tokens)
+            except ValueError as err:
+                await ctx.send(str(err))
+                return
 
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(remaining))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-
+            if request.action in {"top", "leaderboard"}:
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 if not totals:
                     await ctx.send("No tracked-channel voice logs found for that period.")
                     return
 
                 lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                is_top = request.action == "top"
                 content = self._render_ranked_message(
-                    title=f"**Top Tracked Voice Hours ({label})**",
+                    title=f"**{'Top ' if is_top else ''}Tracked Voice Hours ({label})**",
                     lines=lines,
-                    max_lines=limit,
+                    max_lines=request.top_limit if is_top and request.top_limit is not None else config.voicehours_max_lines,
                     overflow_label="users",
                 )
-                rank_data = self._find_rank(totals, ctx.author.id)
-                if rank_data is not None:
-                    rank, seconds = rank_data
-                    content = f"{content}\nYour rank: **#{rank}** with **{_hours(seconds)}**"
+                if is_top:
+                    rank_data = self._find_rank(totals, ctx.author.id)
+                    if rank_data is not None:
+                        rank, seconds = rank_data
+                        content = f"{content}\nYour rank: **#{rank}** with **{_hours(seconds)}**"
                 await send_context_text_chunks(ctx, content)
                 return
 
-            if mode == "tahzeeq":
-                if len(args) < 2:
-                    await ctx.send("Usage: `!voicehours tahzeeq <x> [last <x> <hour/day/week/month>]`")
-                    return
-                try:
-                    minimum_hours = float(args[1])
-                except ValueError:
-                    await ctx.send("`x` must be a number (hours).")
-                    return
-                if minimum_hours <= 0:
-                    await ctx.send("`x` must be greater than 0.")
-                    return
-
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-
+            if request.action == "tahzeeq":
+                minimum_hours = request.minimum_hours
+                assert minimum_hours is not None
                 training_substring, matching_roles, members = await self._training_members(ctx.guild)
                 if not matching_roles:
                     await ctx.send(
@@ -862,13 +990,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await send_context_lines_chunks(ctx, lines)
                 return
 
-            if mode == "me":
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-
+            if request.action == "me":
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 rank_data = self._find_rank(totals, ctx.author.id)
                 if rank_data is None:
@@ -878,19 +1000,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await ctx.send(f"**{ctx.author.display_name}** in {label}: **{_hours(seconds)}** (rank **#{rank}**)")
                 return
 
-            if mode == "user":
-                if len(args) < 2:
-                    await ctx.send("Usage: `!voicehours user <@member> [last <x> <hour/day/week/month>]`")
-                    return
+            if request.action == "user":
+                assert request.target_token is not None
                 try:
-                    target_member = await commands.MemberConverter().convert(ctx, args[1])
+                    target_member = await commands.MemberConverter().convert(ctx, request.target_token)
                 except commands.BadArgument:
                     await ctx.send("Could not resolve that member.")
-                    return
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
                     return
 
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
@@ -900,19 +1015,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await ctx.send(f"**{target_member.display_name}** in {label}: **{_hours(seconds)}**{rank_text}")
                 return
 
-            if mode == "role":
-                if len(args) < 2:
-                    await ctx.send("Usage: `!voicehours role <@role> [last <x> <hour/day/week/month>]`")
-                    return
+            if request.action == "role":
+                assert request.target_token is not None
                 try:
-                    target_role = await commands.RoleConverter().convert(ctx, args[1])
+                    target_role = await commands.RoleConverter().convert(ctx, request.target_token)
                 except commands.BadArgument:
                     await ctx.send("Could not resolve that role.")
-                    return
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[2:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
                     return
 
                 all_totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
@@ -934,13 +1042,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
-            if mode in {"roles", "teams"}:
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-
+            if request.action == "roles":
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 team_roles = [
                     role
@@ -976,13 +1078,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 )
                 return
 
-            if mode == "unis":
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args[1:]))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-
+            if request.action == "unis":
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 uni_roles = [
                     role
@@ -1017,40 +1113,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     ),
                 )
                 return
-
-            if mode == "last":
-                try:
-                    since, label = self._parse_window_tokens(now=now, tokens=tuple(args))
-                except ValueError as err:
-                    await ctx.send(str(err))
-                    return
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
-                if not totals:
-                    await ctx.send("No tracked-channel voice logs found for that period.")
-                    return
-                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
-                await send_context_text_chunks(
-                    ctx,
-                    self._render_ranked_message(
-                        title=f"**Tracked Voice Hours ({label})**",
-                        lines=lines,
-                        max_lines=config.voicehours_max_lines,
-                        overflow_label="users",
-                    ),
-                )
-                return
-
-            if mode == "track":
-                await self._handle_track(ctx, args[1:])
-                return
-
-            await ctx.send(
-                "Unknown mode.\n"
-                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, "
-                "`top`, `timesheet`, `max`, `track`.\n"
-                "Example: `!voicehours top 20 last 2 weeks`"
-            )
-            return
 
         week_since = now - timedelta(days=7)
         month_since = now - timedelta(days=30)

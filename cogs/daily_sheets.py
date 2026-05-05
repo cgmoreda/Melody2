@@ -6,6 +6,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
+from services.command_parser import CommandParseError, join_free_text
 from services.daily_sheet_reminder import (
     DEFAULT_DAILY_SHEET_MESSAGE,
     DailySheetReminderService,
@@ -14,6 +15,10 @@ from services.daily_sheet_reminder import (
 )
 
 logger = logging.getLogger(__name__)
+DAILY_SHEETS_SET_USAGE = (
+    "Usage: **!dailysheets set <HH:MM UTC> [#channel] [message]**\n"
+    "or **!dailysheets set [#channel] <HH:MM UTC> [message]**"
+)
 
 
 class DailySheetsCog(commands.Cog, name="DailySheets"):
@@ -32,19 +37,17 @@ class DailySheetsCog(commands.Cog, name="DailySheets"):
     async def dailysheets_set(
         self,
         ctx: commands.Context,
-        time_utc: str,
-        channel: Optional[discord.TextChannel] = None,
-        *,
-        message: Optional[str] = None,
+        *args: str,
     ) -> None:
         """Set the daily sheets reminder time, channel, and optional message.
 
         Time is configured in UTC. Example:
         `!dailysheets set 20:30 #daily-sheets Please update your daily sheets.`
+        `!dailysheets set #daily-sheets 20:30 Please update your daily sheets.`
         """
         assert ctx.guild is not None
         try:
-            hour, minute = parse_utc_time(time_utc)
+            hour, minute, channel, message = await self._parse_set_args(ctx, args)
         except ValueError as exc:
             await ctx.send(str(exc))
             return
@@ -60,7 +63,7 @@ class DailySheetsCog(commands.Cog, name="DailySheets"):
                 channel_id=target.id,
                 remind_hour_utc=hour,
                 remind_minute_utc=minute,
-                message=message or DEFAULT_DAILY_SHEET_MESSAGE,
+                message=message,
             )
         except ValueError as exc:
             await ctx.send(str(exc))
@@ -110,13 +113,89 @@ class DailySheetsCog(commands.Cog, name="DailySheets"):
             return
         await ctx.send("Daily sheets reminder was not configured.")
 
+    @staticmethod
+    def _try_parse_utc_time(raw: str) -> Optional[tuple[int, int]]:
+        try:
+            return parse_utc_time(raw)
+        except ValueError:
+            return None
+
+    async def _resolve_text_channel_arg(
+        self,
+        ctx: commands.Context,
+        raw: str,
+    ) -> Optional[discord.TextChannel]:
+        assert ctx.guild is not None
+        token = raw.strip()
+        if token.startswith("<#") and token.endswith(">"):
+            channel_id_text = token[2:-1]
+            if channel_id_text.isdigit():
+                channel = ctx.guild.get_channel(int(channel_id_text))
+                if isinstance(channel, discord.TextChannel):
+                    return channel
+
+        if token.startswith("#"):
+            channel_name = token[1:].casefold()
+            for channel in getattr(ctx.guild, "text_channels", ()):
+                if getattr(channel, "name", "").casefold() == channel_name and isinstance(channel, discord.TextChannel):
+                    return channel
+
+        try:
+            channel = await commands.TextChannelConverter().convert(ctx, raw)
+        except (commands.BadArgument, AttributeError):
+            return None
+        if isinstance(channel, discord.TextChannel):
+            return channel
+        return None
+
+    async def _parse_set_args(
+        self,
+        ctx: commands.Context,
+        args: tuple[str, ...],
+    ) -> tuple[int, int, Optional[discord.TextChannel], str]:
+        if not args:
+            raise CommandParseError(DAILY_SHEETS_SET_USAGE)
+
+        first_time = self._try_parse_utc_time(args[0])
+        if first_time is not None:
+            if len(args) > 1 and self._try_parse_utc_time(args[1]) is not None:
+                raise CommandParseError("Only one `time` clause is allowed.")
+            channel = await self._resolve_text_channel_arg(ctx, args[1]) if len(args) > 1 else None
+            message_start = 2 if channel is not None else 1
+            return (
+                first_time[0],
+                first_time[1],
+                channel,
+                join_free_text(args[message_start:]) or DEFAULT_DAILY_SHEET_MESSAGE,
+            )
+
+        channel = await self._resolve_text_channel_arg(ctx, args[0])
+        if channel is None:
+            parse_utc_time(args[0])
+            raise CommandParseError(DAILY_SHEETS_SET_USAGE)
+        if len(args) < 2:
+            raise CommandParseError(DAILY_SHEETS_SET_USAGE)
+
+        second_time = self._try_parse_utc_time(args[1])
+        if second_time is None:
+            parse_utc_time(args[1])
+            raise CommandParseError(DAILY_SHEETS_SET_USAGE)
+        if len(args) > 2 and self._try_parse_utc_time(args[2]) is not None:
+            raise CommandParseError("Only one `time` clause is allowed.")
+        return (
+            second_time[0],
+            second_time[1],
+            channel,
+            join_free_text(args[2:]) or DEFAULT_DAILY_SHEET_MESSAGE,
+        )
+
     @dailysheets_set.error
     async def dailysheets_set_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You need the **Manage Server** permission to change daily sheets reminders.")
             return
         if isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send("Usage: **!dailysheets set <HH:MM UTC> [#channel] [message]**")
+            await ctx.send(DAILY_SHEETS_SET_USAGE)
             return
         raise error
 

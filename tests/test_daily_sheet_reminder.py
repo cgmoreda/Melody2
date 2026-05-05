@@ -5,6 +5,8 @@ from typing import Optional
 
 import pytest
 
+import cogs.daily_sheets as daily_sheets_cog_module
+from cogs.daily_sheets import DailySheetsCog
 from db.repository import DailySheetReminderConfig
 import services.daily_sheet_reminder as daily_sheet_module
 from services.daily_sheet_reminder import DailySheetReminderService, parse_utc_time
@@ -68,8 +70,10 @@ class _FakeRepo:
 
 
 class _FakeTextChannel:
-    def __init__(self, channel_id: int) -> None:
+    def __init__(self, channel_id: int, name: str = "daily") -> None:
         self.id = channel_id
+        self.name = name
+        self.mention = f"#{name}"
         self.sent: list[str] = []
 
     async def send(self, message: str) -> None:
@@ -82,6 +86,27 @@ class _FakeBot:
 
     def get_channel(self, channel_id: int) -> Optional[_FakeTextChannel]:
         return self._channels.get(channel_id)
+
+
+class _FakeGuild:
+    id = 1
+
+    def __init__(self, channels: list[_FakeTextChannel]) -> None:
+        self.text_channels = channels
+        self._channels = {channel.id: channel for channel in channels}
+
+    def get_channel(self, channel_id: int) -> Optional[_FakeTextChannel]:
+        return self._channels.get(channel_id)
+
+
+class _FakeContext:
+    def __init__(self, guild: _FakeGuild, channel: _FakeTextChannel) -> None:
+        self.guild = guild
+        self.channel = channel
+        self.sent: list[str] = []
+
+    async def send(self, message: str, **kwargs: object) -> None:
+        self.sent.append(message)
 
 
 def test_parse_utc_time_accepts_hh_mm_and_rejects_invalid_values() -> None:
@@ -177,5 +202,38 @@ async def test_set_reminder_persists_clean_message() -> None:
             "remind_hour_utc": 9,
             "remind_minute_utc": 5,
             "message": "Update the sheet.",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dailysheets_set_accepts_channel_before_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daily_sheets_cog_module.discord, "TextChannel", _FakeTextChannel)
+    repo = _FakeRepo()
+    service = DailySheetReminderService(bot=_FakeBot({}), repo=repo)  # type: ignore[arg-type]
+    cog = DailySheetsCog(service)
+    default_channel = _FakeTextChannel(1, "general")
+    target_channel = _FakeTextChannel(2, "daily")
+    guild = _FakeGuild([default_channel, target_channel])
+    ctx = _FakeContext(guild, default_channel)
+
+    await cog.dailysheets_set.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "#daily",
+        "20:30",
+        "Please",
+        "update",
+        "sheets",
+    )
+
+    assert ctx.sent == ["Daily sheets reminder set in #daily at `20:30 UTC`."]
+    assert repo.upserts == [
+        {
+            "guild_id": 1,
+            "channel_id": 2,
+            "remind_hour_utc": 20,
+            "remind_minute_utc": 30,
+            "message": "Please update sheets",
         }
     ]

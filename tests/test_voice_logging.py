@@ -925,6 +925,55 @@ async def test_timesheet_max_range_suffix_top_limit_renders_limited_users(
 
 
 @pytest.mark.asyncio
+async def test_timesheet_max_day_suffix_top_limit_renders_limited_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 20, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 5)]
+    guild = _FakeGuildWithRoles(48, [_FakeRole("Training Arc", members)])
+    day_start = datetime(2026, 1, 10, 5, 0, tzinfo=cairo)
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": member.id,
+                "start_ts": day_start.astimezone(UTC),
+                "end_ts": (day_start + timedelta(hours=5 - member.id)).astimezone(UTC),
+            }
+            for member in members
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "max",
+        "day",
+        "last",
+        "3",
+        "week",
+        "top",
+        "3",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Day" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" in output
+    assert "User 4" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
 async def test_voicehours_top_limit_regular_leaderboard_still_uses_totals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -966,6 +1015,152 @@ async def test_voicehours_top_limit_regular_leaderboard_still_uses_totals(
     assert "User 3" in output
     assert "User 4" not in output
     assert repo.interval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voicehours_window_before_top_limit_uses_regular_leaderboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 5)]
+    guild = _FakeGuildWithRoles(42, [_FakeRole("Training Arc", members)])
+    repo = _FakeRepoWithTotals(
+        totals={
+            1: 4 * 3600.0,
+            2: 3 * 3600.0,
+            3: 2 * 3600.0,
+            4: 3600.0,
+        }
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "last",
+        "1",
+        "week",
+        "top",
+        "3",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Top Tracked Voice Hours" in output
+    assert "User 1" in output
+    assert "User 2" in output
+    assert "User 3" in output
+    assert "User 4" not in output
+    assert "... and 1 more users" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_window_before_user_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    target_member = _FakeMemberWithBot(2, display_name="Target User")
+    guild = _FakeGuildWithRoles(43, [_FakeRole("Training Arc", [target_member])])
+    repo = _FakeRepoWithTotals(totals={2: 3600.0})
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    async def _fake_convert(self: object, ctx: object, argument: str) -> _FakeMemberWithBot:
+        assert argument == "<@2>"
+        return target_member
+
+    monkeypatch.setattr(voice_logging_module.commands.MemberConverter, "convert", _fake_convert)
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "last",
+        "1",
+        "week",
+        "user",
+        "<@2>",
+    )
+
+    assert ctx.sent_messages == ["**Target User** in last 1 week: **1.00h** (rank **#1**)"]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_window_before_role_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    members = [_FakeMemberWithBot(1, display_name="Role User"), _FakeMemberWithBot(2, display_name="Other User")]
+    target_role = _FakeRole("Training Arc", members)
+    guild = _FakeGuildWithRoles(44, [target_role])
+    repo = _FakeRepoWithTotals(totals={1: 3600.0, 2: 1800.0})
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    async def _fake_convert(self: object, ctx: object, argument: str) -> _FakeRole:
+        assert argument == "<@&10>"
+        return target_role
+
+    monkeypatch.setattr(voice_logging_module.commands.RoleConverter, "convert", _fake_convert)
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "last",
+        "1",
+        "week",
+        "role",
+        "<@&10>",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Tracked Voice Hours for Training Arc (last 1 week)" in output
+    assert "Role User" in output
+    assert "Other User" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_window_before_tahzeeq_mode() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(45, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(totals={}),  # type: ignore[arg-type]
+        config_service=_FakeTahzeeqConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "last",
+        "1",
+        "week",
+        "tahzeeq",
+        "2",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Tahzeeq Report (last 1 week)" in output
+    assert "<@1>" in output
+    assert "Target: **2.00h**" in output
 
 
 @pytest.mark.asyncio
@@ -1045,7 +1240,58 @@ async def test_voicehours_max_rejects_prefix_and_suffix_top_limits() -> None:
         "3",
     )
 
-    assert ctx.sent_messages == ["`top` limit can appear before or after `max`, not both."]
+    assert ctx.sent_messages == ["Only one `top` clause is allowed."]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_rejects_duplicate_top_clauses() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(46, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "top",
+        "3",
+        "last",
+        "1",
+        "week",
+        "top",
+        "2",
+    )
+
+    assert ctx.sent_messages == ["Only one `top` clause is allowed."]
+
+
+@pytest.mark.asyncio
+async def test_voicehours_rejects_duplicate_last_windows() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(47, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "last",
+        "1",
+        "week",
+        "last",
+        "2",
+        "weeks",
+    )
+
+    assert ctx.sent_messages == ["Only one `last` clause is allowed."]
 
 
 @pytest.mark.asyncio

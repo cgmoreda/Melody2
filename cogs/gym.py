@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 import discord
 from discord.ext import commands
 
 from db.repository import GymFeatureRepository, VerifiedUser
+from services.command_parser import CommandParseError, normalize_token
 from services.discord_output import send_context_lines_chunks, send_interaction_lines_chunks, send_interaction_text_chunks
 from services.cf_client import CFRequestError, CodeforcesClientBase
 from services.gym_service import GymService, normalize_problem_index, normalize_tag, problem_ref
 from services.guild_config import GuildConfigService
+
+
+@dataclass(frozen=True, slots=True)
+class GaldCommandRequest:
+    contest_id: Optional[int] = None
+    include_teams: bool = False
+    force: bool = False
+
 
 COMMON_TAGS: tuple[str, ...] = (
     "implementation",
@@ -462,6 +472,33 @@ class GymCog(commands.Cog, name="Gyms"):
     async def _gym_quality_summary(self, guild_id: int, contest_id: int) -> dict[str, float]:
         return await self._gym_service.gym_quality_summary(guild_id, contest_id)
 
+    @staticmethod
+    def _parse_gald_args(args: tuple[str, ...]) -> GaldCommandRequest:
+        contest_id: Optional[int] = None
+        include_teams = False
+        force = False
+
+        for raw in args:
+            token = normalize_token(raw)
+            if token.isdigit():
+                if contest_id is not None:
+                    raise CommandParseError("Only one `contest_id` is allowed.")
+                contest_id = int(token)
+                continue
+            if token in {"team", "teams", "alltypes", "include-teams"}:
+                if include_teams:
+                    raise CommandParseError("Only one `teams` flag is allowed.")
+                include_teams = True
+                continue
+            if token in {"force", "refresh"}:
+                if force:
+                    raise CommandParseError("Only one `force` flag is allowed.")
+                force = True
+                continue
+            raise CommandParseError("Usage: `!gald [contest_id] [teams] [force]`")
+
+        return GaldCommandRequest(contest_id=contest_id, include_teams=include_teams, force=force)
+
     @commands.command(
         name="gym",
         brief="Open gym panel for contest management, tags, and ratings.",
@@ -520,7 +557,8 @@ class GymCog(commands.Cog, name="Gyms"):
             "- `!gald`\n"
             "- `!gald 2062`\n"
             "- `!gald teams`\n"
-            "- `!gald 2062 teams force`"
+            "- `!gald 2062 teams force`\n"
+            "- `!gald force teams 2062`"
         ),
     )
     @commands.guild_only()
@@ -528,29 +566,17 @@ class GymCog(commands.Cog, name="Gyms"):
         """List trainees with zero solved gym problems."""
         assert ctx.guild is not None
 
-        contest_id: Optional[int] = None
-        include_teams = False
-        force = False
-
-        for raw in args:
-            token = raw.strip().lower()
-            if token.isdigit() and contest_id is None:
-                contest_id = int(token)
-                continue
-            if token in {"team", "teams", "alltypes", "include-teams"}:
-                include_teams = True
-                continue
-            if token in {"force", "refresh"}:
-                force = True
-                continue
-            await ctx.send("Usage: `!gald [contest_id] [teams] [force]`")
+        try:
+            request = self._parse_gald_args(args)
+        except ValueError as err:
+            await ctx.send(str(err))
             return
 
         gyms = await self._repo.list_gym_contests(ctx.guild.id)
-        if contest_id is not None:
-            gyms = [gym for gym in gyms if gym.contest_id == contest_id]
+        if request.contest_id is not None:
+            gyms = [gym for gym in gyms if gym.contest_id == request.contest_id]
 
-        if not include_teams:
+        if not request.include_teams:
             gyms = [gym for gym in gyms if gym.gym_type == "individual"]
 
         if not gyms:
@@ -563,7 +589,7 @@ class GymCog(commands.Cog, name="Gyms"):
             return
 
         verified_by_id = await self._verified_map(ctx.guild.id)
-        cache_note = "force(10m)" if force else "normal(1h cache)"
+        cache_note = "force(10m)" if request.force else "normal(1h cache)"
 
         for gym in gyms:
             try:
@@ -572,7 +598,7 @@ class GymCog(commands.Cog, name="Gyms"):
                     gym.contest_id,
                     training_members,
                     verified_by_id,
-                    force=force,
+                    force=request.force,
                 )
             except CFRequestError as exc:
                 await ctx.send(self._cf_error_message(exc))
