@@ -1,155 +1,292 @@
 # Melody2 Discord Bot
 
-Melody2 is a Discord bot for Codeforces communities. It provides:
-- Codeforces account verification and rating-role updates
-- Contest reminder channels (Codeforces + AtCoder) with restart-safe dedupe
-- Daily sheets reminders for training accountability
-- Voice logging (solo sessions + watchdog checks) plus dynamic voice channel management
-- Gym management, tags, rating votes, and GALD trainee tracking
-- Coach secretary waiting-room routing
-- Per-guild command/text configuration
+Melody2 is a production Discord bot for competitive-programming training communities. It combines Codeforces account verification, contest reminders, training accountability, voice-hour tracking, gym management, and coach workflow automation in one server-scoped bot.
+
+The bot uses the `!` command prefix and stores persistent state in PostgreSQL. Database migrations run automatically on startup.
+
+## Features
+
+### Codeforces And AtCoder
+- Codeforces handle verification with persisted pending-verification state.
+- Rating refresh and Discord role assignment based on Codeforces max rating.
+- Live profile, statistics, and latest-round rating-change reports.
+- Codeforces and AtCoder contest reminders with restart-safe deduplication.
+
+### Training Operations
+- Daily sheet reminders per guild and channel.
+- Voice-hour tracking for solo channels and configured tracked-channel keywords.
+- Training timesheets and max voice-hour reports with Egypt-day boundaries.
+- Trainee accountability reports for minimum voice-hour targets.
+
+### Gym Management
+- Interactive gym panel for adding, deleting, and resetting gym contests.
+- Individual and team gym support.
+- Problem tags, problem rating votes, and gym quality votes.
+- GALD reports for trainees with zero solved gym problems.
+
+### Discord Workflow
+- Coach secretary setup for waiting-room routing.
+- Dynamic voice channel management.
+- Per-guild command limits and text configuration.
+- Output chunking and truncation for Discord message/embed limits.
 
 ## Requirements
-- Python 3.11+
+
+- Python 3.11 or newer
 - PostgreSQL
+- Discord bot token with these privileged intents enabled:
+  - Message Content Intent
+  - Server Members Intent
+  - Voice States Intent
 
-## Environment Variables
-Set these in `.env`:
+## Configuration
 
-- `DISCORD_TOKEN` (required): Discord bot token
-- `DATABASE_URL` (required): PostgreSQL connection URL
-- `CF_REMINDER_POLL_SECONDS` (optional, default `300`): reminder poll interval, clamped to `300..600`
-- `CACHE_TTL_SECONDS` (optional, default `60`): Codeforces response cache TTL
-- `REQUEST_TIMEOUT_SECONDS` (optional, default `20`): per-request timeout for Codeforces API calls
-- `CF_MAX_RETRIES` (optional, default `3`): retry count for Codeforces API calls
+Create a `.env` file in the repository root:
 
-## Install
-```bash
-pip install -r requirements.txt
+```env
+DISCORD_TOKEN=your-discord-bot-token
+DATABASE_URL=postgresql://user:password@host:5432/database
 ```
 
-## Run
+Optional environment variables:
+
+| Variable | Default | Description |
+| --- | ---: | --- |
+| `CF_REMINDER_POLL_SECONDS` | `300` | Contest reminder poll interval. Clamped to `300..600`. |
+| `CACHE_TTL_SECONDS` | `60` | Codeforces response cache TTL. |
+| `REQUEST_TIMEOUT_SECONDS` | `20` | Per-request Codeforces API timeout. |
+| `CF_MAX_RETRIES` | `3` | Codeforces API retry count. |
+
+## Installation
+
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Linux/macOS:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+## Running The Bot
+
 ```bash
 python main.py
 ```
 
-## Commands
-Core:
-- `!help [command]`
-- `!ping`
+On startup, Melody2 will:
 
-Verification and Codeforces:
-- `!verify <handle>`
-- `!confirm`
-- `!updaterating` (alias: `!update`)
-- `!whois <handle>`
-- `!stats <handle>`
-- `!roundchanges` (alias: `!lastround`)
+1. Connect to PostgreSQL.
+2. Apply any pending schema migrations.
+3. Start contest reminders and daily sheet reminder loops.
+4. Load all Discord cogs.
+5. Sync the Discord app command tree.
 
-Reminders:
-- `!reminder enable [#channel]`
-- `!reminder disable [#channel]`
-- `!reminder status [#channel]`
-- `!reminder next [codeforces|atcoder]`
-- `!dailysheets set <HH:MM UTC> [#channel] [message]` (aliases: `!dailyreminder`, `!sheets`)
-- `!dailysheets set [#channel] <HH:MM UTC> [message]`
-- `!dailysheets status`
-- `!dailysheets disable`
+## Command Reference
 
-Config:
-- `!config show`
-- `!config keys`
-- `!config set <key> <int>`
-- `!config reset [key|all]`
-- `!config text show`
-- `!config text keys`
-- `!config text set <key> <value>`
-- `!config text reset [key|all]`
+### Core
 
-Coach secretary:
-- `!coach setup @CoachUser "Waiting Room" "Coach Room"`
-- `!coach reset`
-- `!coach config`
+| Command | Description |
+| --- | --- |
+| `!help [command]` | Show bot help or command-specific help. |
+| `!ping` | Confirm the bot is responsive. |
 
-Voice logging:
-- `!voicehours` (alias: `!solohours`)
-- `!voicehours last <x> <hour|day|week|month>`
-- `!voicehours tahzeeq <x> [last <x> <hour|day|week|month>]`
-- `!voicehours me [last <x> <hour|day|week|month>]`
-- `!voicehours user <@member> [last <x> <hour|day|week|month>]`
-- `!voicehours role <@role> [last <x> <hour|day|week|month>]`
-- `!voicehours roles [last <x> <hour|day|week|month>]`
-- `!voicehours unis [last <x> <hour|day|week|month>]`
-- `!voicehours top [limit] [last <x> <hour|day|week|month>]`
-- `!voicehours last <x> <hour|day|week|month> top <limit>`
-- `!voicehours last <x> <hour|day|week|month> user <@member>`
-- `!voicehours last <x> <hour|day|week|month> role <@role>`
-- `!voicehours last <x> <hour|day|week|month> tahzeeq <x>`
-- `!voicehours timesheet last <days> days`
-- `!timesheet last <days> days`
-- `!voicehours max day last <amount> <day|week|month>`
-- `!voicehours max week last <amount> <week|month>`
-- `!voicehours max month last <amount> months`
-- `!voicehours max range <amount> <hour|day|week|month> last <lookback_amount> <hour|day|week|month>`
-- `!voicehours top <limit> max <day|week|month|range> ...`
-- `!voicehours max <day|week|month|range> ... top <limit>`
-- Same `max ...` syntax is available through `!timesheet max ...`
-- Same `top <limit> max ...` and `max ... top <limit>` syntax is available through `!timesheet`
-- `!voicehours track list`
-- `!voicehours track add <keyword>`
-- `!voicehours track remove <keyword>`
+### Verification And Codeforces
 
-Gym:
-- `!gym` (interactive panel)
-- `!gald [contest_id] [teams] [force]`
-- `!gald force teams <contest_id>`
+| Command | Description |
+| --- | --- |
+| `!verify <handle>` | Start Codeforces account verification. |
+| `!confirm` | Confirm verification after setting the generated code on Codeforces. |
+| `!updaterating` / `!update` | Refresh linked Codeforces rating and role. |
+| `!whois <handle>` | Show a live Codeforces profile summary. |
+| `!stats <handle>` | Show contest and submission statistics. |
+| `!roundchanges` / `!lastround` | Show latest round rating changes for verified members. |
+
+### Reminders
+
+| Command | Description |
+| --- | --- |
+| `!reminder enable [#channel]` | Enable contest reminders in a channel. |
+| `!reminder disable [#channel]` | Disable contest reminders in a channel. |
+| `!reminder status [#channel]` | Show reminder status for a channel. |
+| `!reminder next [codeforces\|atcoder]` | Preview upcoming contests. |
+| `!dailysheets set <HH:MM UTC> [#channel] [message]` | Configure the daily sheet reminder. |
+| `!dailysheets set [#channel] <HH:MM UTC> [message]` | Configure the same reminder with channel before time. |
+| `!dailysheets status` | Show the configured daily sheet reminder. |
+| `!dailysheets disable` | Disable the daily sheet reminder. |
+
+Aliases for daily sheets: `!dailyreminder`, `!sheets`.
+
+### Guild Configuration
+
+| Command | Description |
+| --- | --- |
+| `!config show` | Show current numeric and text config values. |
+| `!config keys` | List numeric config keys and valid ranges. |
+| `!config set <key> <int>` | Set a numeric config value. |
+| `!config reset [key\|all]` | Reset one or all numeric config values. |
+| `!config text show` | Show text config values. |
+| `!config text keys` | List text config keys. |
+| `!config text set <key> <value>` | Set a text config value. |
+| `!config text reset [key\|all]` | Reset one or all text config values. |
+
+Config keys:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `reminder_preview_limit` | `3` | Upcoming contests shown by `!reminder next`. |
+| `roundchanges_max_lines` | `30` | Maximum rows shown by `!roundchanges`. |
+| `voicehours_max_lines` | `35` | Maximum rows shown by voice-hour reports. |
+| `voice_check_interval_seconds` | `900` | Seconds between solo-channel work checks. |
+| `voice_confirm_timeout_seconds` | `180` | Seconds a user has to confirm they are still working. |
 
 Text config keys:
-- `training_role_substring` (default: `training arc`)
-- `coach_role_substring` (default: `coach`)
-- `voice_tracked_keywords` (default: empty; comma-separated channel keywords)
 
-## Operational Notes
-- Verification pending state is persisted in DB and expires after 15 minutes. A restart does not drop pending verification requests.
-- Reminder dedupe is persisted in DB (`sent_reminders`) and guarded in-memory for fast repeats in-process. Startup cleanup removes old dedupe rows (retention window: 120 days).
-- Daily sheets reminders are persisted per guild and send once per UTC day at or after the configured time.
-- Voice startup reconciliation closes stale open tracked sessions left from downtime and recreates missing sessions for currently active tracked members.
-- Solo watchdog tasks are race-safe: replacing a task for the same member does not let an old task clear the new map entry.
-- Gym participation uses caching: default freshness 1 hour, or 10 minutes when `force` is used.
-- High-volume outputs are chunked/truncated to stay within Discord limits (message `2000`, embed description `4096`, field value `1024`).
-- Codeforces API failures are typed (`timeout`, `network`, `http`, `non_ok`, `parse`) and surfaced with endpoint/status context.
+| Key | Default | Description |
+| --- | --- | --- |
+| `training_role_substring` | `training arc` | Substring used to detect trainee roles. |
+| `coach_role_substring` | `coach` | Substring used to detect coach roles. |
+| `voice_tracked_keywords` | empty | Comma-separated channel keywords that count toward voice hours. |
 
-## Database Migrations / Upgrades
-- Schema versioning is tracked in table `schema_version` (single row, id `1`).
-- Migrations are applied automatically during `UserRepository.init()` in order.
-- Current schema version is `7`.
-- Migration highlights:
-  - v1: base schema creation
-  - v2: lookup/performance indexes
-  - v3: integrity constraints and cleanup
-  - v4: sent reminder platform support + text contest IDs
-  - v5: rename voice session tracking flag to `is_tracked`
-  - v6: enforce one open voice session per guild member
-  - v7: daily sheets reminder configuration
-- v3 adds:
-  - case-insensitive unique handle-per-guild index on `verified_users`
-  - gym child-table foreign keys to `gym_contests (guild_id, contest_id)` with `ON DELETE CASCADE`
-  - pre-constraint cleanup for duplicate handles and orphan gym child rows
-- v4 adds:
-  - `platform` column on `sent_reminders` and expands primary key to include platform
-  - `contest_id` stored as text to support non-numeric IDs
-- v5 adds:
-  - `voice_sessions.is_tracked` (renamed from `is_solo`) to cover keyword-tracked channels
-- v6 adds:
-  - cleanup for duplicate open voice sessions and a partial unique index preventing more than one open session per guild member
-- v7 adds:
-  - `daily_sheet_reminders` for one persisted daily sheets reminder per guild
-- Upgrades are in-place on startup; no manual SQL steps are normally required.
+### Coach Secretary
 
-## Tests
-Run:
+| Command | Description |
+| --- | --- |
+| `!coach setup @CoachUser "Waiting Room" "Coach Room"` | Configure coach routing. |
+| `!coach reset` | Remove coach routing configuration. |
+| `!coach config` | Show current coach routing configuration. |
+
+### Voice Hours
+
+Voice time is counted for:
+
+- Channels named like solo channels.
+- Channels containing any configured `voice_tracked_keywords`.
+- Open tracked sessions, clipped to the requested report window.
+
+Timesheet and max reports use `Africa/Cairo`; a training day starts at 05:00 Egypt time.
+
+| Command | Description |
+| --- | --- |
+| `!voicehours` / `!solohours` | Show all-time, last-week, and last-month tracked voice summary. |
+| `!voicehours last <x> <hour\|day\|week\|month>` | Show tracked voice hours for a window. |
+| `!voicehours me [last <x> <unit>]` | Show your own tracked hours and rank. |
+| `!voicehours user <@member> [last <x> <unit>]` | Show one member's tracked hours. |
+| `!voicehours role <@role> [last <x> <unit>]` | Show tracked hours for one role. |
+| `!voicehours roles [last <x> <unit>]` / `!voicehours teams ...` | Show team-role standings. |
+| `!voicehours unis [last <x> <unit>]` | Show university-role standings. |
+| `!voicehours top [limit] [last <x> <unit>]` | Show top tracked-hour users. |
+| `!voicehours last <x> <unit> top <limit>` | Same top report with the window first. |
+| `!voicehours tahzeeq <hours> [last <x> <unit>]` | List trainees below a target number of hours. |
+| `!voicehours last <x> <unit> tahzeeq <hours>` | Same accountability report with the window first. |
+
+### Voice Timesheets And Max Reports
+
+| Command | Description |
+| --- | --- |
+| `!voicehours timesheet last <days> days` | Show a daily training-role timesheet. |
+| `!timesheet last <days> days` | Same timesheet via the shorter command. |
+| `!voicehours max day last <amount> <day\|week\|month>` | Best fixed Egypt-day bucket in the lookback. |
+| `!voicehours max week last <amount> <week\|month>` | Best rolling 7-day window in the lookback. |
+| `!voicehours max month last <amount> months` | Best rolling 30-day window in the lookback. |
+| `!voicehours max range <amount> <hour\|day\|week\|month> last <lookback_amount> <hour\|day\|week\|month>` | Best custom rolling window in the lookback. |
+| `!voicehours top <limit> max <day\|week\|month\|range> ...` | Limit max-report rows with `top` before `max`. |
+| `!voicehours max <day\|week\|month\|range> ... top <limit>` | Limit max-report rows with `top` after the max query. |
+
+The same `max`, `top <limit> max`, and `max ... top <limit>` forms are available through `!timesheet`.
+
+Limits:
+
+- `timesheet last <days>` is capped at 31 days.
+- Max-report lookback is capped at 12 months.
+- Month windows are treated as 30 days.
+
+### Voice Tracking Keywords
+
+| Command | Description |
+| --- | --- |
+| `!voicehours track list` | Show configured tracked-channel keywords. |
+| `!voicehours track add <keyword>` | Add a tracked-channel keyword. |
+| `!voicehours track remove <keyword>` | Remove a tracked-channel keyword. |
+
+### Gym
+
+| Command | Description |
+| --- | --- |
+| `!gym` | Open the interactive gym panel. |
+| `!gald [contest_id] [teams] [force]` | List trainees with zero solved gym problems. |
+| `!gald force teams <contest_id>` | Same GALD report with arguments in any supported order. |
+
+## Operational Behavior
+
+- Pending Codeforces verification expires after 15 minutes and survives restarts.
+- Contest reminder dedupe is persisted in PostgreSQL and protected in memory for fast repeats.
+- Daily sheet reminders are persisted per guild and sent once per UTC day at or after the configured time.
+- Voice startup reconciliation closes stale open tracked sessions and recreates missing sessions for currently active tracked members.
+- Solo-channel watchdog tasks are race-safe and clean up correctly when replaced.
+- Gym participation uses a 1-hour cache by default, or a 10-minute freshness window when `force` is used.
+- High-volume output is chunked or truncated to stay within Discord limits.
+- Codeforces API failures are typed and surfaced with endpoint/status context.
+
+## Database Migrations
+
+Schema versioning is tracked in `schema_version` and applied automatically during startup. No manual SQL is normally required for upgrades.
+
+Current schema version: `7`
+
+| Version | Summary |
+| ---: | --- |
+| `1` | Base schema creation. |
+| `2` | Lookup and performance indexes. |
+| `3` | Integrity constraints and duplicate/orphan cleanup. |
+| `4` | Reminder platform support and text contest IDs. |
+| `5` | Renamed voice session tracking flag to `is_tracked`. |
+| `6` | Enforced one open voice session per guild member. |
+| `7` | Added daily sheet reminder configuration. |
+
+Migration notes:
+
+- v3 adds a case-insensitive unique handle-per-guild index and gym child-table foreign keys with `ON DELETE CASCADE`.
+- v4 expands `sent_reminders` with `platform` and stores `contest_id` as text.
+- v5 changes `voice_sessions.is_solo` to `voice_sessions.is_tracked`.
+- v6 closes duplicate open voice sessions and adds a partial unique index for open sessions.
+- v7 adds one persisted daily sheet reminder per guild.
+
+## Testing
+
+Run the full test suite before deployment:
+
 ```bash
 python -m pytest -q
 ```
 
-Current tests cover verification lifecycle, reminder dedupe persistence, voice watchdog/reconciliation behavior, dynamic voice access rules, gym rating logic, output size guards, CF error mapping, help metadata, and migration upgrade paths.
+Coverage includes:
+
+- Codeforces verification lifecycle and pending-state persistence.
+- Contest reminder dedupe persistence.
+- Daily sheet reminder persistence.
+- Voice watchdog, startup reconciliation, dynamic voice rules, timesheets, and max reports.
+- Gym participation, quality/rating logic, and command parsing.
+- Discord output size guards.
+- Codeforces error mapping.
+- Help metadata and migration upgrade paths.
+
+## Production Checklist
+
+Before deploying:
+
+1. Confirm `.env` contains `DISCORD_TOKEN` and `DATABASE_URL`.
+2. Confirm the Discord application has Message Content, Server Members, and Voice States intents enabled.
+3. Confirm PostgreSQL is reachable from the host.
+4. Run `python -m pytest -q`.
+5. Start the bot with `python main.py` or the host process manager.
+6. Check logs for successful extension loading, migration completion, reminder startup, and bot readiness.
