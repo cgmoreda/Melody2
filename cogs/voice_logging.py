@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import discord
 from discord.ext import commands
@@ -285,6 +285,201 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     def _pick_scolding(*, minimum_hours: float, worked_hours: float) -> str:
         return _VOICE_SERVICE.pick_scolding(minimum_hours=minimum_hours, worked_hours=worked_hours)
 
+    async def _training_members(
+        self,
+        guild: discord.Guild,
+    ) -> tuple[str, list[discord.Role], list[discord.Member]]:
+        training_substring = await self._config.get_text(guild.id, "training_role_substring")
+        training_key = training_substring.casefold().strip()
+        matching_roles = [
+            role
+            for role in guild.roles
+            if training_key
+            and training_key in role.name.casefold()
+            and role.name != "@everyone"
+        ]
+
+        members_by_id: dict[int, discord.Member] = {}
+        for role in matching_roles:
+            for member in role.members:
+                if getattr(member, "bot", False) or _has_guest_role(member):
+                    continue
+                members_by_id[member.id] = member
+
+        members = sorted(
+            members_by_id.values(),
+            key=lambda member: (member.display_name.casefold(), member.id),
+        )
+        return training_substring, matching_roles, members
+
+    @staticmethod
+    def _label_lookup(
+        guild: discord.Guild,
+        handle_by_discord_id: dict[int, str],
+    ) -> Callable[[int], Optional[str]]:
+        def lookup(discord_id: int) -> Optional[str]:
+            handle = handle_by_discord_id.get(discord_id)
+            if handle is not None:
+                return handle
+            member = guild.get_member(discord_id)
+            if member is not None:
+                return member.display_name
+            return None
+
+        return lookup
+
+    @staticmethod
+    def _timesheet_usage() -> str:
+        return (
+            "Usage:\n"
+            "`!timesheet last <days> days`\n"
+            "`!timesheet max day last <amount> <day/week/month>`\n"
+            "`!timesheet max week last <amount> <week/month>`\n"
+            "`!timesheet max month last <amount> months`\n"
+            "`!timesheet max range <amount> <hour/day/week/month> last <lookback_amount> <hour/day/week/month>`"
+        )
+
+    async def _send_training_timesheet(
+        self,
+        ctx: commands.Context,
+        args: tuple[str, ...],
+        *,
+        config: object,
+        now: datetime,
+        handle_by_discord_id: dict[int, str],
+    ) -> None:
+        assert ctx.guild is not None
+        try:
+            days = self._voice_service.parse_timesheet_days(args)
+        except ValueError as err:
+            await ctx.send(str(err))
+            return
+
+        training_substring, matching_roles, members = await self._training_members(ctx.guild)
+        if not matching_roles:
+            await ctx.send(
+                f"No role found matching training substring `{training_substring}`.\n"
+                "Use `!config text set training_role_substring <value>` to adjust it."
+            )
+            return
+        if not members:
+            await ctx.send(f"No non-guest members found in roles matching `{training_substring}`.")
+            return
+
+        window = self._voice_service.timesheet_window(now=now, days=days)
+        intervals = await self._repo.get_tracked_voice_intervals(
+            ctx.guild.id,
+            since=window.since_utc,
+            now=window.until_utc,
+        )
+        report = self._voice_service.build_timesheet_report(
+            intervals=intervals,
+            user_ids=[member.id for member in members],
+            now=now,
+            days=days,
+        )
+        lines = self._voice_service.timesheet_lines(
+            report=report,
+            label_lookup=self._label_lookup(ctx.guild, handle_by_discord_id),
+        )
+        content = self._render_ranked_message(
+            title=f"**Training Voice Timesheet ({report.window.label}, Egypt day 05:00)**",
+            lines=lines,
+            max_lines=config.voicehours_max_lines,
+            overflow_label="users",
+        )
+        await send_context_text_chunks(ctx, content)
+
+    async def _send_training_max_report(
+        self,
+        ctx: commands.Context,
+        args: tuple[str, ...],
+        *,
+        config: object,
+        now: datetime,
+        handle_by_discord_id: dict[int, str],
+    ) -> None:
+        assert ctx.guild is not None
+        try:
+            request = self._voice_service.parse_max_tokens(args)
+        except ValueError as err:
+            await ctx.send(str(err))
+            return
+
+        training_substring, matching_roles, members = await self._training_members(ctx.guild)
+        if not matching_roles:
+            await ctx.send(
+                f"No role found matching training substring `{training_substring}`.\n"
+                "Use `!config text set training_role_substring <value>` to adjust it."
+            )
+            return
+        if not members:
+            await ctx.send(f"No non-guest members found in roles matching `{training_substring}`.")
+            return
+
+        since_utc, until_utc = self._voice_service.max_lookback_window(now=now, request=request)
+        intervals = await self._repo.get_tracked_voice_intervals(
+            ctx.guild.id,
+            since=since_utc,
+            now=until_utc,
+        )
+        report = self._voice_service.build_max_report(
+            intervals=intervals,
+            user_ids=[member.id for member in members],
+            now=now,
+            request=request,
+        )
+        lines = self._voice_service.max_report_lines(
+            report=report,
+            label_lookup=self._label_lookup(ctx.guild, handle_by_discord_id),
+        )
+        title = (
+            f"**Max Tracked Voice {request.mode.title()} "
+            f"({request.window_label}, {request.lookback_label}, Egypt time)**"
+        )
+        content = self._render_ranked_message(
+            title=title,
+            lines=lines,
+            max_lines=config.voicehours_max_lines,
+            overflow_label="users",
+        )
+        await send_context_text_chunks(ctx, content)
+
+    async def _handle_timesheet_command(
+        self,
+        ctx: commands.Context,
+        args: tuple[str, ...],
+        *,
+        config: object,
+        now: datetime,
+        handle_by_discord_id: dict[int, str],
+    ) -> None:
+        if not args:
+            await ctx.send(self._timesheet_usage())
+            return
+
+        mode = args[0].strip().lower()
+        if mode == "last":
+            await self._send_training_timesheet(
+                ctx,
+                args,
+                config=config,
+                now=now,
+                handle_by_discord_id=handle_by_discord_id,
+            )
+            return
+        if mode == "max":
+            await self._send_training_max_report(
+                ctx,
+                args[1:],
+                config=config,
+                now=now,
+                handle_by_discord_id=handle_by_discord_id,
+            )
+            return
+
+        await ctx.send(self._timesheet_usage())
+
     async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
         try:
             while True:
@@ -425,6 +620,22 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 guild.id,
             )
 
+    @commands.command(name="timesheet")
+    @commands.guild_only()
+    async def timesheet(self, ctx: commands.Context, *args: str) -> None:
+        """Show training-role tracked voice timesheets and max voice-hour windows."""
+        assert ctx.guild is not None
+        config = await self._config.get(ctx.guild.id)
+        now = datetime.now(tz=UTC)
+        handle_by_discord_id = await self._resolve_handles(ctx.guild)
+        await self._handle_timesheet_command(
+            ctx,
+            args,
+            config=config,
+            now=now,
+            handle_by_discord_id=handle_by_discord_id,
+        )
+
     @commands.command(name="voicehours", aliases=["solohours"])
     @commands.guild_only()
     async def voicehours(self, ctx: commands.Context, *args: str) -> None:
@@ -444,6 +655,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours roles [last <x> <hour/day/week/month>]`  (alias: teams)
         - `!voicehours unis [last <x> <hour/day/week/month>]`
         - `!voicehours top [limit] [last <x> <hour/day/week/month>]`
+        - `!voicehours timesheet last <days> days`
+        - `!voicehours max <day/week/month/range> ...`
         - `!voicehours track list`
         - `!voicehours track add <keyword>`
         - `!voicehours track remove <keyword>`
@@ -456,6 +669,26 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
         if args:
             mode = args[0].lower()
+
+            if mode == "timesheet":
+                await self._handle_timesheet_command(
+                    ctx,
+                    args[1:],
+                    config=config,
+                    now=now,
+                    handle_by_discord_id=handle_by_discord_id,
+                )
+                return
+
+            if mode == "max":
+                await self._handle_timesheet_command(
+                    ctx,
+                    args,
+                    config=config,
+                    now=now,
+                    handle_by_discord_id=handle_by_discord_id,
+                )
+                return
 
             if mode == "top":
                 limit = config.voicehours_max_lines
@@ -508,12 +741,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(str(err))
                     return
 
-                training_substring = await self._config.get_text(ctx.guild.id, "training_role_substring")
-                matching_roles = [
-                    role for role in ctx.guild.roles
-                    if training_substring.lower().strip() in role.name.lower()
-                    and role.name != "@everyone"
-                ]
+                training_substring, matching_roles, members = await self._training_members(ctx.guild)
                 if not matching_roles:
                     await ctx.send(
                         f"No role found matching training substring `{training_substring}`.\n"
@@ -523,13 +751,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
                 threshold_seconds = minimum_hours * 3600.0
-                members_by_id: dict[int, discord.Member] = {}
-                for role in matching_roles:
-                    for member in role.members:
-                        if member.bot or _has_guest_role(member):
-                            continue
-                        members_by_id[member.id] = member
-                members = list(members_by_id.values())
                 if not members:
                     await ctx.send(
                         f"No non-guest members found in roles matching `{training_substring}`."
@@ -752,7 +973,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             await ctx.send(
                 "Unknown mode.\n"
-                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, `top`, `track`.\n"
+                "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, "
+                "`top`, `timesheet`, `max`, `track`.\n"
                 "Example: `!voicehours top 20 last 2 weeks`"
             )
             return

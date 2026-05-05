@@ -22,9 +22,14 @@ def _voice_session_lock_key(guild_id: int, discord_id: int) -> int:
 def _merge_voice_intervals(rows: Iterable[Any]) -> dict[int, float]:
     intervals_by_user: dict[int, list[tuple[datetime, datetime]]] = defaultdict(list)
     for row in rows:
-        discord_id = int(row["discord_id"])
-        start = row["start_ts"]
-        end = row["end_ts"]
+        try:
+            discord_id = int(row["discord_id"])
+            start = row["start_ts"]
+            end = row["end_ts"]
+        except (KeyError, TypeError):
+            discord_id = int(row.discord_id)
+            start = row.start_ts
+            end = row.end_ts
         if not isinstance(start, datetime) or not isinstance(end, datetime):
             continue
         if end <= start:
@@ -142,6 +147,13 @@ class PendingVerification:
     verification_code: str
     created_at: datetime
     expires_at: datetime
+
+
+@dataclass(slots=True)
+class TrackedVoiceInterval:
+    discord_id: int
+    start_ts: datetime
+    end_ts: datetime
 
 
 @dataclass(slots=True)
@@ -284,6 +296,15 @@ class VoiceRepository(Protocol):
         now: datetime,
         since: Optional[datetime] = None,
     ) -> dict[int, float]:
+        ...
+
+    async def get_tracked_voice_intervals(
+        self,
+        guild_id: int,
+        *,
+        since: datetime,
+        now: datetime,
+    ) -> list[TrackedVoiceInterval]:
         ...
 
     async def get_tracked_voice_summary(
@@ -565,6 +586,16 @@ class UserRepositoryBase(abc.ABC):
         since: Optional[datetime] = None,
     ) -> dict[int, float]:
         """Return total tracked-channel voice time in seconds per user."""
+
+    @abc.abstractmethod
+    async def get_tracked_voice_intervals(
+        self,
+        guild_id: int,
+        *,
+        since: datetime,
+        now: datetime,
+    ) -> list[TrackedVoiceInterval]:
+        """Return clipped tracked voice intervals for one guild and UTC range."""
 
     @abc.abstractmethod
     async def get_tracked_voice_summary(
@@ -1743,39 +1774,61 @@ class UserRepository(UserRepositoryBase):
         since: Optional[datetime] = None,
     ) -> dict[int, float]:
         assert self._pool is not None, "Call init() first"
+        if since is not None:
+            return _merge_voice_intervals(
+                await self.get_tracked_voice_intervals(guild_id, since=since, now=now)
+            )
+
         async with self._pool.acquire() as conn:
-            if since is None:
-                rows = await conn.fetch(
-                    """
-                    SELECT discord_id,
-                           started_at AS start_ts,
-                           LEAST(COALESCE(ended_at, $2), $2) AS end_ts
-                    FROM voice_sessions
-                    WHERE guild_id = $1
-                      AND is_tracked = TRUE
-                      AND started_at < $2
-                      AND COALESCE(ended_at, $2) > started_at
-                    """,
-                    guild_id,
-                    now,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT discord_id,
-                           GREATEST(started_at, $2) AS start_ts,
-                           LEAST(COALESCE(ended_at, $3), $3) AS end_ts
-                    FROM voice_sessions
-                    WHERE guild_id = $1
-                      AND is_tracked = TRUE
-                      AND started_at < $3
-                      AND COALESCE(ended_at, $3) > $2
-                    """,
-                    guild_id,
-                    since,
-                    now,
-                )
+            rows = await conn.fetch(
+                """
+                SELECT discord_id,
+                       started_at AS start_ts,
+                       LEAST(COALESCE(ended_at, $2), $2) AS end_ts
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND is_tracked = TRUE
+                  AND started_at < $2
+                  AND COALESCE(ended_at, $2) > started_at
+                """,
+                guild_id,
+                now,
+            )
         return _merge_voice_intervals(rows)
+
+    async def get_tracked_voice_intervals(
+        self,
+        guild_id: int,
+        *,
+        since: datetime,
+        now: datetime,
+    ) -> list[TrackedVoiceInterval]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT discord_id,
+                       GREATEST(started_at, $2) AS start_ts,
+                       LEAST(COALESCE(ended_at, $3), $3) AS end_ts
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND is_tracked = TRUE
+                  AND started_at < $3
+                  AND COALESCE(ended_at, $3) > $2
+                ORDER BY discord_id, start_ts
+                """,
+                guild_id,
+                since,
+                now,
+            )
+        return [
+            TrackedVoiceInterval(
+                discord_id=int(row["discord_id"]),
+                start_ts=row["start_ts"],
+                end_ts=row["end_ts"],
+            )
+            for row in rows
+        ]
 
     async def get_tracked_voice_summary(
         self,

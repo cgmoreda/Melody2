@@ -80,6 +80,13 @@ Voice logging:
 - `!voicehours roles [last <x> <hour|day|week|month>]`
 - `!voicehours unis [last <x> <hour|day|week|month>]`
 - `!voicehours top [limit] [last <x> <hour|day|week|month>]`
+- `!voicehours timesheet last <days> days`
+- `!timesheet last <days> days`
+- `!voicehours max day last <amount> <day|week|month>`
+- `!voicehours max week last <amount> <week|month>`
+- `!voicehours max month last <amount> months`
+- `!voicehours max range <amount> <hour|day|week|month> last <lookback_amount> <hour|day|week|month>`
+- Same `max ...` syntax is available through `!timesheet max ...`
 - `!voicehours track list`
 - `!voicehours track add <keyword>`
 - `!voicehours track remove <keyword>`

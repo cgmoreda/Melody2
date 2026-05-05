@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -12,6 +13,7 @@ from cogs.voice_logging import VoiceLoggingCog, WorkConfirmationResult
 from db.repository import CoachConfig
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 from services.dynamic_voice import DynamicVoiceManager
+from services.voice_service import VoiceService
 
 
 # ---------------------------------------------------------------------------
@@ -47,15 +49,25 @@ class _FakeGuildWithRoles:
         self.id = guild_id
         self.roles = roles
         self.voice_channels: list[Any] = []
+        self._members: dict[int, _FakeMemberWithBot] = {}
+        for role in roles:
+            for member in role.members:
+                self._members[member.id] = member
 
-    def get_member(self, member_id: int) -> None:
-        return None
+    def get_member(self, member_id: int) -> _FakeMemberWithBot | None:
+        return self._members.get(member_id)
 
 
 class _FakeRepoWithTotals:
-    def __init__(self, totals: dict[int, float] | None = None) -> None:
+    def __init__(
+        self,
+        totals: dict[int, float] | None = None,
+        intervals: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._totals = totals or {}
+        self._intervals = intervals or []
         self._open_tracked_by_guild: dict[int, set[int]] = {}
+        self.interval_calls: list[tuple[int, datetime, datetime]] = []
 
     async def get_all(self, guild_id: int) -> list[Any]:
         return []
@@ -67,6 +79,16 @@ class _FakeRepoWithTotals:
 
     async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
         return set()
+
+    async def get_tracked_voice_intervals(
+        self,
+        guild_id: int,
+        *,
+        since: datetime,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        self.interval_calls.append((guild_id, since, now))
+        return list(self._intervals)
 
 
 class _FakeConfigServiceWithMaxLines:
@@ -222,6 +244,26 @@ class _FakeConfigService:
         return _Config()
 
     async def get_text(self, guild_id: int, key: str) -> str:
+        return ""
+
+
+class _FakeTrainingConfigService(_FakeConfigServiceWithMaxLines):
+    def __init__(self, *, max_lines: int = 50) -> None:
+        self._max_lines = max_lines
+
+    async def get(self, guild_id: int) -> Any:
+        max_lines = self._max_lines
+
+        class _Config:
+            voice_check_interval_seconds = 3600
+            voice_confirm_timeout_seconds = 60
+            voicehours_max_lines = max_lines
+
+        return _Config()
+
+    async def get_text(self, guild_id: int, key: str) -> str:
+        if key == "training_role_substring":
+            return "Training"
         return ""
 
 
@@ -522,6 +564,17 @@ def _make_cog_for_leaderboard(
     )
 
 
+def _freeze_voice_logging_now(monkeypatch: pytest.MonkeyPatch, fixed_now: datetime) -> None:
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(voice_logging_module, "datetime", _FixedDateTime)
+
+
 @pytest.mark.asyncio
 async def test_voicehours_tahzeeq_excludes_guest_role_members() -> None:
     regular_member = _FakeMemberWithBot(1, display_name="Regular User")
@@ -543,6 +596,150 @@ async def test_voicehours_tahzeeq_excludes_guest_role_members() -> None:
     assert "<@1>" in output
     assert "<@2>" not in output
     assert "Guest User" not in output
+
+
+@pytest.mark.asyncio
+async def test_timesheet_last_filters_training_members_and_includes_zero_hour_trainees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 10, 8, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    zero_member = _FakeMemberWithBot(2, display_name="Zero User")
+    guest_member = _FakeMemberWithBot(3, display_name="Guest User")
+    bot_member = _FakeMemberWithBot(4, display_name="Bot User", bot=True)
+    training_role = _FakeRole("Training Arc", [regular_member, zero_member, guest_member, bot_member])
+    _FakeRole("Guest", [guest_member])
+    guild = _FakeGuildWithRoles(30, [training_role])
+    intervals = [
+        {
+            "discord_id": regular_member.id,
+            "start_ts": datetime(2026, 1, 10, 5, 0, tzinfo=cairo).astimezone(UTC),
+            "end_ts": datetime(2026, 1, 10, 7, 0, tzinfo=cairo).astimezone(UTC),
+        },
+        {
+            "discord_id": guest_member.id,
+            "start_ts": datetime(2026, 1, 10, 5, 0, tzinfo=cairo).astimezone(UTC),
+            "end_ts": datetime(2026, 1, 10, 8, 0, tzinfo=cairo).astimezone(UTC),
+        },
+        {
+            "discord_id": bot_member.id,
+            "start_ts": datetime(2026, 1, 10, 5, 0, tzinfo=cairo).astimezone(UTC),
+            "end_ts": datetime(2026, 1, 10, 8, 0, tzinfo=cairo).astimezone(UTC),
+        },
+    ]
+    repo = _FakeRepoWithTotals(intervals=intervals)
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(cog, ctx, "last", "2", "days")  # type: ignore[union-attr]
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Training Voice Timesheet" in output
+    assert "Regular User" in output
+    assert "Zero User" in output
+    assert "Guest User" not in output
+    assert "Bot User" not in output
+    assert repo.interval_calls[0][1] == datetime(2026, 1, 9, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert repo.interval_calls[0][2] == fixed_now
+
+
+@pytest.mark.asyncio
+async def test_timesheet_output_respects_voicehours_max_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    _freeze_voice_logging_now(monkeypatch, datetime(2026, 1, 10, 8, 0, tzinfo=cairo).astimezone(UTC))
+
+    members = [_FakeMemberWithBot(index, display_name=f"User {index}") for index in range(1, 4)]
+    training_role = _FakeRole("Training Arc", members)
+    guild = _FakeGuildWithRoles(31, [training_role])
+    repo = _FakeRepoWithTotals()
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(max_lines=1),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(cog, ctx, "last", "1", "day")  # type: ignore[union-attr]
+
+    output = "\n".join(ctx.sent_messages)
+    assert "User 1" in output
+    assert "User 2" not in output
+    assert "... and 2 more users" in output
+
+
+@pytest.mark.asyncio
+async def test_voicehours_max_range_reports_training_members_sorted_by_best_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cairo = ZoneInfo("Africa/Cairo")
+    fixed_now = datetime(2026, 1, 10, 12, 0, tzinfo=cairo).astimezone(UTC)
+    _freeze_voice_logging_now(monkeypatch, fixed_now)
+
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    zero_member = _FakeMemberWithBot(2, display_name="Zero User")
+    training_role = _FakeRole("Training Arc", [regular_member, zero_member])
+    guild = _FakeGuildWithRoles(32, [training_role])
+    repo = _FakeRepoWithTotals(
+        intervals=[
+            {
+                "discord_id": regular_member.id,
+                "start_ts": datetime(2026, 1, 10, 6, 30, tzinfo=cairo).astimezone(UTC),
+                "end_ts": datetime(2026, 1, 10, 8, 30, tzinfo=cairo).astimezone(UTC),
+            }
+        ]
+    )
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.voicehours.callback(  # type: ignore[union-attr]
+        cog,
+        ctx,
+        "max",
+        "range",
+        "2",
+        "hours",
+        "last",
+        "1",
+        "week",
+    )
+
+    output = "\n".join(ctx.sent_messages)
+    assert "Max Tracked Voice Range" in output
+    assert "Regular User" in output
+    assert "Zero User" in output
+    assert output.index("Regular User") < output.index("Zero User")
+    assert "2.00h" in output
+    assert repo.interval_calls[0][1] == datetime(2026, 1, 3, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert repo.interval_calls[0][2] == fixed_now
+
+
+@pytest.mark.asyncio
+async def test_timesheet_max_range_requires_explicit_lookback() -> None:
+    regular_member = _FakeMemberWithBot(1, display_name="Regular User")
+    guild = _FakeGuildWithRoles(33, [_FakeRole("Training Arc", [regular_member])])
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepoWithTotals(),  # type: ignore[arg-type]
+        config_service=_FakeTrainingConfigService(),  # type: ignore[arg-type]
+    )
+
+    ctx = _FakeContext(guild)
+    await cog.timesheet.callback(cog, ctx, "max", "range", "2", "hours")  # type: ignore[union-attr]
+
+    assert ctx.sent_messages == [VoiceService.MAX_USAGE]
 
 
 @pytest.mark.asyncio
