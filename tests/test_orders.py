@@ -219,6 +219,27 @@ async def test_order_guest_or_coach_role_prefers_user_added_png_assets(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_order_guest_role_always_accepts_non_coffee(tmp_path: Path) -> None:
+    _write_asset(tmp_path, "juice")
+    ctx = _FakeContext(author_id=10, roles=[_FakeRole("Guest")])
+    cog = OrdersCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=_FakeRepo({10: 0.0}),  # type: ignore[arg-type]
+        assets_root=tmp_path,
+        rng=lambda: 0.99,
+        message_picker=lambda messages: messages[0],
+    )
+
+    await cog.order.callback(cog, ctx, "juice")  # type: ignore[union-attr]
+
+    content, file = ctx.sent[0]
+    assert content is not None
+    assert "Melody says no juice" not in content
+    assert "Of course, sweetheart." in content
+    assert file is not None
+
+
+@pytest.mark.asyncio
 async def test_order_coach_role_falls_back_when_no_user_added_assets(tmp_path: Path) -> None:
     _write_asset(tmp_path, "juice")
     ctx = _FakeContext(author_id=10, roles=[_FakeRole("Coach")])

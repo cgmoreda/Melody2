@@ -136,6 +136,13 @@ def _has_new_asset_priority_role(member: discord.abc.User) -> bool:
     return False
 
 
+def _has_guest_role(member: discord.abc.User) -> bool:
+    return any(
+        getattr(role, "name", "").strip().casefold() == "guest"
+        for role in getattr(member, "roles", ())
+    )
+
+
 class OrdersCog(commands.Cog, name="Orders"):
     def __init__(
         self,
@@ -173,8 +180,9 @@ class OrdersCog(commands.Cog, name="Orders"):
         )
         seconds = totals.get(ctx.author.id, 0.0)
         hours = seconds / 3600.0
+        guest_role = _has_guest_role(ctx.author)
         probability = order_acceptance_probability(normalized_item, hours)
-        accepted = probability >= 1.0 or self._rng() < probability
+        accepted = guest_role or probability >= 1.0 or self._rng() < probability
 
         if not accepted:
             await ctx.send(
