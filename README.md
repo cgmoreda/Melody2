@@ -1,6 +1,6 @@
 # Melody2 Discord Bot
 
-Melody2 is a production Discord bot for competitive-programming training communities. It combines Codeforces account verification, contest reminders, training accountability, voice-hour tracking, gym management, and coach workflow automation in one server-scoped bot.
+Melody2 is a production Discord bot for competitive-programming training communities. It combines Codeforces account verification, contest reminders, training accountability, voice-hour tracking, and coach workflow automation in one server-scoped bot.
 
 The bot uses the `!` command prefix and stores persistent state in PostgreSQL. Database migrations run automatically on startup.
 
@@ -17,12 +17,6 @@ The bot uses the `!` command prefix and stores persistent state in PostgreSQL. D
 - Voice-hour tracking for solo channels and configured tracked-channel keywords.
 - Training timesheets and max voice-hour reports with Egypt-day boundaries.
 - Trainee accountability reports for minimum voice-hour targets.
-
-### Gym Management
-- Interactive gym panel for adding, deleting, and resetting gym contests.
-- Individual and team gym support.
-- Problem tags, problem rating votes, and gym quality votes.
-- GALD reports for trainees with zero solved gym problems.
 
 ### Discord Workflow
 - Coach secretary setup for waiting-room routing.
@@ -218,14 +212,6 @@ Limits:
 | `!voicehours track add <keyword>` | Add a tracked-channel keyword. |
 | `!voicehours track remove <keyword>` | Remove a tracked-channel keyword. |
 
-### Gym
-
-| Command | Description |
-| --- | --- |
-| `!gym` | Open the interactive gym panel. |
-| `!gald [contest_id] [teams] [force]` | List trainees with zero solved gym problems. |
-| `!gald force teams <contest_id>` | Same GALD report with arguments in any supported order. |
-
 ## Operational Behavior
 
 - Pending Codeforces verification expires after 15 minutes and survives restarts.
@@ -233,7 +219,6 @@ Limits:
 - Daily sheet reminders are persisted per guild and sent once per UTC day at or after the configured time.
 - Voice startup reconciliation closes stale open tracked sessions and recreates missing sessions for currently active tracked members.
 - Solo-channel watchdog tasks are race-safe and clean up correctly when replaced.
-- Gym participation uses a 1-hour cache by default, or a 10-minute freshness window when `force` is used.
 - High-volume output is chunked or truncated to stay within Discord limits.
 - Codeforces API failures are typed and surfaced with endpoint/status context.
 
@@ -255,7 +240,7 @@ Current schema version: `7`
 
 Migration notes:
 
-- v3 adds a case-insensitive unique handle-per-guild index and gym child-table foreign keys with `ON DELETE CASCADE`.
+- v3 adds a case-insensitive unique handle-per-guild index and referential integrity cleanup.
 - v4 expands `sent_reminders` with `platform` and stores `contest_id` as text.
 - v5 changes `voice_sessions.is_solo` to `voice_sessions.is_tracked`.
 - v6 closes duplicate open voice sessions and adds a partial unique index for open sessions.
@@ -275,7 +260,6 @@ Coverage includes:
 - Contest reminder dedupe persistence.
 - Daily sheet reminder persistence.
 - Voice watchdog, startup reconciliation, dynamic voice rules, timesheets, and max reports.
-- Gym participation, quality/rating logic, and command parsing.
 - Discord output size guards.
 - Codeforces error mapping.
 - Help metadata and migration upgrade paths.
