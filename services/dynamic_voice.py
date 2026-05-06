@@ -100,7 +100,7 @@ class DynamicVoiceManager:
         info = self.get_tracked_info(channel.id)
         if info is None:
             return True  # not tracked → no restriction
-        if info.channel_type is ChannelType.SOLO:
+        if info.channel_type in (ChannelType.SOLO, ChannelType.DUO):
             return True
         # Only apply the creator shortcut when the creator is known (creator_id > 0).
         # creator_id == 0 is set by rebuild_state() when the creator could not be inferred
@@ -284,10 +284,10 @@ class DynamicVoiceManager:
     ) -> dict[discord.Role | discord.Member, discord.PermissionOverwrite]:
         """Build permission overwrites for a new dynamic channel.
 
-        Solo: no restrictions (inherits category permissions).
-        Duo/Team: deny @everyone connect, allow matching Team role.
+        Solo/Duo: no restrictions (inherits category permissions).
+        Team: deny @everyone connect, allow matching Team role.
         """
-        if channel_type is ChannelType.SOLO:
+        if channel_type in (ChannelType.SOLO, ChannelType.DUO):
             return {}  # inherit defaults
 
         overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}

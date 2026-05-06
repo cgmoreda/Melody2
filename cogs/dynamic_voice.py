@@ -47,7 +47,7 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
             if channel_type is not None:
                 await self._manager.handle_join(member, after.channel, channel_type)
             elif self._manager.is_tracked(after.channel.id):
-                # Enforce role-based access for duo/team channels
+                # Enforce role-based access for team channels
                 allowed = await self._manager.check_access(member, after.channel)
                 if not allowed:
                     try:
