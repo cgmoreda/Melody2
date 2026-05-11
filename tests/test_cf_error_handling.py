@@ -6,7 +6,8 @@ import aiohttp
 import pytest
 
 from cogs.verification import VerificationCog
-from services.cf_client import CFRequestError, CodeforcesClient
+from db.repository import GuildCommandConfig, VerifiedUser
+from services.cf_client import CFContestChange, CFRequestError, CodeforcesClient
 
 
 class _FakeResponse:
@@ -80,6 +81,73 @@ class _FakeCtx:
             self.messages.append(content)
 
 
+class _RoundChangesRepo:
+    async def get_all(self, guild_id: int) -> list[VerifiedUser]:
+        return [
+            VerifiedUser(discord_id=1, cf_handle="ok_handle", rating=1200, guild_id=guild_id),
+            VerifiedUser(discord_id=2, cf_handle="bad_handle", rating=1200, guild_id=guild_id),
+        ]
+
+
+class _RoundChangesConfig:
+    async def get(self, guild_id: int) -> GuildCommandConfig:
+        return GuildCommandConfig(
+            guild_id=guild_id,
+            reminder_preview_limit=3,
+            roundchanges_max_lines=10,
+            voicehours_max_lines=35,
+            voice_check_interval_seconds=900,
+            voice_confirm_timeout_seconds=180,
+        )
+
+
+class _RoundChangesCF:
+    async def get_rating_history(self, handle: str) -> list[CFContestChange]:
+        if handle == "bad_handle":
+            raise CFRequestError(
+                endpoint="user.rating",
+                failure_kind="network",
+                requested_url="https://codeforces.com/api/user.rating?handle=bad_handle",
+            )
+        return [
+            CFContestChange(
+                contest_id=1000,
+                contest_name="Round 1000",
+                rank=12,
+                old_rating=1200,
+                new_rating=1300,
+                handle=handle,
+            )
+        ]
+
+    async def get_user(self, handle: str) -> Any:
+        return None
+
+    async def get_recent_submissions(self, handle: str, count: int = 500) -> list[Any]:
+        return []
+
+
+class _RoundGuild:
+    id = 1
+
+    def get_member(self, discord_id: int) -> Any:
+        return None
+
+
+class _RoundCtx:
+    def __init__(self) -> None:
+        self.guild = _RoundGuild()
+        self.author = type("_Author", (), {"id": 10})()
+        self.messages: list[str] = []
+        self.embeds: list[Any] = []
+
+    async def send(self, content: Optional[str] = None, *, embed: Any = None) -> None:
+        if content is not None:
+            self.messages.append(content)
+        if embed is not None:
+            self.embeds.append(embed)
+
+
 @pytest.fixture(autouse=True)
 def _single_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CF_MAX_RETRIES", "1")
@@ -118,6 +186,31 @@ def test_cf_client_invalid_env_values_fall_back_with_warnings(
     assert "Invalid CACHE_TTL_SECONDS" in caplog.text
     assert "Invalid REQUEST_TIMEOUT_SECONDS" in caplog.text
     assert "Invalid CF_MAX_RETRIES" in caplog.text
+
+
+def test_cf_client_cache_evicts_least_recent_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("CF_CACHE_MAX_ENTRIES", "2")
+    client = CodeforcesClient(_FakeSession([]))  # type: ignore[arg-type]
+
+    client._cache_set("a", {"status": "OK", "result": ["a"]})
+    client._cache_set("b", {"status": "OK", "result": ["b"]})
+    assert client._cache_get("a") == {"status": "OK", "result": ["a"]}
+    client._cache_set("c", {"status": "OK", "result": ["c"]})
+
+    assert list(client._cache) == ["a", "c"]
+
+
+def test_cf_client_cache_prunes_expired_entries_on_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CACHE_TTL_SECONDS", "60")
+    monkeypatch.setenv("CF_CACHE_MAX_ENTRIES", "10")
+    client = CodeforcesClient(_FakeSession([]))  # type: ignore[arg-type]
+    client._cache["old"] = (0, {"status": "OK"})
+
+    client._cache_set("new", {"status": "OK"})
+
+    assert "old" not in client._cache
+    assert "new" in client._cache
 
 
 @pytest.mark.asyncio
@@ -203,3 +296,24 @@ async def test_verify_command_handles_not_found_distinct_from_transient_failures
 
     assert len(ctx.messages) == 1
     assert "Could not find Codeforces handle" in ctx.messages[0]
+
+
+@pytest.mark.asyncio
+async def test_roundchanges_continues_when_one_handle_history_fetch_fails() -> None:
+    ctx = _RoundCtx()
+    cog = VerificationCog(
+        cf_client=_RoundChangesCF(),  # type: ignore[arg-type]
+        role_assigner=object(),  # type: ignore[arg-type]
+        repo=_RoundChangesRepo(),  # type: ignore[arg-type]
+        config_service=_RoundChangesConfig(),  # type: ignore[arg-type]
+        reminder_service=None,
+    )
+
+    await cog.roundchanges.callback(cog, ctx)
+
+    assert ctx.messages == []
+    assert len(ctx.embeds) == 1
+    description = ctx.embeds[0].description
+    assert "ok_handle" in description
+    assert "bad_handle" not in description
+    assert "Skipped **1** verified user" in description

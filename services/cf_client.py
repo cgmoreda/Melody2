@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal, Optional
 from urllib.parse import urlencode
@@ -124,7 +125,8 @@ class CodeforcesClient(CodeforcesClientBase):
         self._cache_ttl_seconds = _parse_int_env("CACHE_TTL_SECONDS", default=60, minimum=0)
         self._timeout_seconds = _parse_int_env("REQUEST_TIMEOUT_SECONDS", default=20, minimum=5)
         self._max_retries = _parse_int_env("CF_MAX_RETRIES", default=3, minimum=1)
-        self._cache: dict[str, tuple[float, dict]] = {}
+        self._cache_max_entries = _parse_int_env("CF_CACHE_MAX_ENTRIES", default=1024, minimum=1)
+        self._cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 
     def _cache_get(self, cache_key: str) -> Optional[dict]:
         if self._cache_ttl_seconds <= 0:
@@ -136,12 +138,20 @@ class CodeforcesClient(CodeforcesClientBase):
         if expires_at < time.time():
             self._cache.pop(cache_key, None)
             return None
+        self._cache.move_to_end(cache_key)
         return payload
 
     def _cache_set(self, cache_key: str, payload: dict) -> None:
         if self._cache_ttl_seconds <= 0:
             return
+        now = time.time()
+        for key, (expires_at, _) in list(self._cache.items()):
+            if expires_at < now:
+                self._cache.pop(key, None)
         self._cache[cache_key] = (time.time() + self._cache_ttl_seconds, payload)
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > self._cache_max_entries:
+            self._cache.popitem(last=False)
 
     @staticmethod
     def _is_sensitive_param(param_name: str) -> bool:
