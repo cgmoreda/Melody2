@@ -84,9 +84,11 @@ class _FakeContext:
         self.guild = guild
         self.author = author
         self.sent_messages: list[str] = []
+        self.sent_kwargs: list[dict[str, Any]] = []
 
     async def send(self, message: str | None = None, **kwargs: Any) -> None:
         self.sent_messages.append(message or "")
+        self.sent_kwargs.append(kwargs)
 
 
 class _FakeSecretary:
@@ -234,6 +236,69 @@ async def test_summon_requires_coach_configuration() -> None:
 
     assert target.sent_messages == []
     assert ctx.sent_messages == ["Coach secretary is not configured. Use !coach setup first."]
+
+
+@pytest.mark.asyncio
+async def test_bomb_mentions_target_requested_number_of_times() -> None:
+    office = _FakeVoiceChannel(10, "Coach Office")
+    guild = _FakeGuild(100, [office])
+    coach = _FakeMember(1, display_name="Coach")
+    target = _FakeMember(2, display_name="Target")
+    secretary = _FakeSecretary(
+        CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=99, coach_channel_id=office.id)
+    )
+    cog = CoachSecretaryCog(
+        bot=object(),  # type: ignore[arg-type]
+        secretary=secretary,  # type: ignore[arg-type]
+    )
+    ctx = _FakeContext(guild, coach)
+
+    await cog.bomb.callback(cog, ctx, target, 3)  # type: ignore[union-attr]
+
+    assert ctx.sent_messages == [target.mention, target.mention, target.mention]
+    assert [kwargs["allowed_mentions"].to_dict() for kwargs in ctx.sent_kwargs] == [
+        {"parse": ["users"]},
+        {"parse": ["users"]},
+        {"parse": ["users"]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bomb_rejects_non_configured_coach() -> None:
+    office = _FakeVoiceChannel(10, "Coach Office")
+    guild = _FakeGuild(100, [office])
+    author = _FakeMember(2, display_name="Not Coach")
+    target = _FakeMember(3, display_name="Target")
+    cog = CoachSecretaryCog(
+        bot=object(),  # type: ignore[arg-type]
+        secretary=_FakeSecretary(
+            CoachConfig(guild_id=guild.id, coach_id=1, waiting_room_id=99, coach_channel_id=office.id)
+        ),  # type: ignore[arg-type]
+    )
+    ctx = _FakeContext(guild, author)
+
+    await cog.bomb.callback(cog, ctx, target, 3)  # type: ignore[union-attr]
+
+    assert ctx.sent_messages == ["Only the configured coach can use this command."]
+
+
+@pytest.mark.asyncio
+async def test_bomb_rejects_out_of_range_count() -> None:
+    office = _FakeVoiceChannel(10, "Coach Office")
+    guild = _FakeGuild(100, [office])
+    coach = _FakeMember(1, display_name="Coach")
+    target = _FakeMember(2, display_name="Target")
+    cog = CoachSecretaryCog(
+        bot=object(),  # type: ignore[arg-type]
+        secretary=_FakeSecretary(
+            CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=99, coach_channel_id=office.id)
+        ),  # type: ignore[arg-type]
+    )
+    ctx = _FakeContext(guild, coach)
+
+    await cog.bomb.callback(cog, ctx, target, 0)  # type: ignore[union-attr]
+
+    assert ctx.sent_messages == ["Count must be between 1 and 20."]
 
 
 @pytest.mark.asyncio

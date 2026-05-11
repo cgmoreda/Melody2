@@ -13,6 +13,13 @@ from services.coach_secretary import SUMMON_BYPASS_SECONDS, CoachSecretaryBase
 
 logger = logging.getLogger(__name__)
 SummonTarget = Union[discord.Member, discord.Role]
+BOMB_MAX_MESSAGES = 20
+_BOMB_ALLOWED_MENTIONS = discord.AllowedMentions(
+    users=True,
+    roles=False,
+    everyone=False,
+    replied_user=False,
+)
 
 
 class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
@@ -178,6 +185,29 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         )
         await ctx.send(self._render_summon_summary(coach_room, result))
 
+    @commands.command(name="bomb")
+    @commands.guild_only()
+    async def bomb(self, ctx: commands.Context, target: discord.Member, count: int) -> None:
+        """Mention a member repeatedly. Restricted to the configured coach."""
+        assert ctx.guild is not None
+
+        config = await self._secretary.get_config(ctx.guild.id)
+        if config is None:
+            await ctx.send("Coach secretary is not configured. Use !coach setup first.")
+            return
+        if ctx.author.id != config.coach_id:
+            await ctx.send("Only the configured coach can use this command.")
+            return
+        if target.bot:
+            await ctx.send("Cannot bomb bot accounts.")
+            return
+        if count < 1 or count > BOMB_MAX_MESSAGES:
+            await ctx.send(f"Count must be between 1 and {BOMB_MAX_MESSAGES}.")
+            return
+
+        for _ in range(count):
+            await ctx.send(target.mention, allowed_mentions=_BOMB_ALLOWED_MENTIONS)
+
     @staticmethod
     def _members_from_summon_target(target: SummonTarget) -> list[discord.Member]:
         if isinstance(target, discord.Member):
@@ -281,6 +311,19 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
             return
         if isinstance(error, commands.BadUnionArgument):
             await ctx.send("Could not resolve that target. Mention a valid user or role.")
+            return
+        raise error
+
+    @bomb.error
+    async def bomb_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"Usage: !bomb @user <count 1-{BOMB_MAX_MESSAGES}>")
+            return
+        if isinstance(error, commands.MemberNotFound):
+            await ctx.send("Could not resolve that user.")
+            return
+        if isinstance(error, commands.BadArgument):
+            await ctx.send(f"Usage: !bomb @user <count 1-{BOMB_MAX_MESSAGES}>")
             return
         raise error
 
