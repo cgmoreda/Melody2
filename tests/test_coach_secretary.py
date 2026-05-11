@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
 import cogs.coach_secretary as coach_module
+import services.coach_secretary as secretary_module
 from cogs.coach_secretary import CoachSecretaryCog
 from db.repository import CoachConfig
+from services.coach_secretary import CoachSecretary
 
 
 class _FakeVoiceState:
@@ -58,13 +61,22 @@ class _FakeRole:
 
 
 class _FakeGuild:
-    def __init__(self, guild_id: int, channels: list[_FakeVoiceChannel]) -> None:
+    def __init__(
+        self,
+        guild_id: int,
+        channels: list[_FakeVoiceChannel],
+        members: list[_FakeMember] | None = None,
+    ) -> None:
         self.id = guild_id
         self.name = f"guild-{guild_id}"
         self._channels = {channel.id: channel for channel in channels}
+        self._members = {member.id: member for member in members or []}
 
     def get_channel(self, channel_id: int) -> _FakeVoiceChannel | None:
         return self._channels.get(channel_id)
+
+    def get_member(self, member_id: int) -> _FakeMember | None:
+        return self._members.get(member_id)
 
 
 class _FakeContext:
@@ -80,6 +92,7 @@ class _FakeContext:
 class _FakeSecretary:
     def __init__(self, config: CoachConfig | None) -> None:
         self._config = config
+        self.marked_summons: list[tuple[int, int]] = []
 
     async def get_config(self, guild_id: int) -> CoachConfig | None:
         return self._config
@@ -95,29 +108,51 @@ class _FakeSecretary:
     def clear_notification(self, guild_id: int, member_id: int) -> None:
         return None
 
+    def mark_summoned_member(self, guild_id: int, member_id: int) -> None:
+        self.marked_summons.append((guild_id, member_id))
+
+
+class _FakeCoachRepo:
+    def __init__(self, config: CoachConfig | None) -> None:
+        self._config = config
+
+    async def get_coach_config(self, guild_id: int) -> CoachConfig | None:
+        return self._config
+
+    async def upsert_coach_config(self, config: CoachConfig) -> None:
+        self._config = config
+
+    async def delete_coach_config(self, guild_id: int) -> bool:
+        removed = self._config is not None
+        self._config = None
+        return removed
+
 
 @pytest.fixture(autouse=True)
 def _patch_discord_types(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coach_module.discord, "Member", _FakeMember)
     monkeypatch.setattr(coach_module.discord, "Role", _FakeRole)
     monkeypatch.setattr(coach_module.discord, "VoiceChannel", _FakeVoiceChannel)
+    monkeypatch.setattr(secretary_module.discord, "VoiceChannel", _FakeVoiceChannel)
 
 
 @pytest.mark.asyncio
 async def test_summon_role_moves_voice_members_and_dms_members_not_in_voice() -> None:
     office = _FakeVoiceChannel(10, "Coach Office")
+    waiting = _FakeVoiceChannel(11, "Secretary")
     lounge = _FakeVoiceChannel(20, "Lounge")
-    guild = _FakeGuild(100, [office, lounge])
+    guild = _FakeGuild(100, [office, waiting, lounge])
     coach = _FakeMember(1, display_name="Coach", voice_channel=office)
     in_voice = _FakeMember(2, display_name="In Voice", voice_channel=lounge)
     not_in_voice = _FakeMember(3, display_name="No Voice")
     bot_member = _FakeMember(4, display_name="Bot", bot=True, voice_channel=lounge)
     role = _FakeRole(50, "Training", [in_voice, not_in_voice, bot_member])
+    secretary = _FakeSecretary(
+        CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=waiting.id, coach_channel_id=office.id)
+    )
     cog = CoachSecretaryCog(
         bot=object(),  # type: ignore[arg-type]
-        secretary=_FakeSecretary(
-            CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=99, coach_channel_id=office.id)
-        ),  # type: ignore[arg-type]
+        secretary=secretary,  # type: ignore[arg-type]
     )
     ctx = _FakeContext(guild, coach)
 
@@ -125,7 +160,10 @@ async def test_summon_role_moves_voice_members_and_dms_members_not_in_voice() ->
 
     assert in_voice.move_calls == [(office, f"Summoned by coach {coach} ({coach.id})")]
     assert "Coach Office" in not_in_voice.sent_messages[0]
+    assert "Secretary" in not_in_voice.sent_messages[0]
+    assert "10 minutes" in not_in_voice.sent_messages[0]
     assert guild.name in not_in_voice.sent_messages[0]
+    assert secretary.marked_summons == [(guild.id, not_in_voice.id)]
     assert bot_member.move_calls == []
     assert bot_member.sent_messages == []
     assert ctx.sent_messages == ["Summon to <#10> complete. Moved: **1**. DM'd: **1**."]
@@ -134,21 +172,27 @@ async def test_summon_role_moves_voice_members_and_dms_members_not_in_voice() ->
 @pytest.mark.asyncio
 async def test_summon_member_dms_target_when_not_in_voice() -> None:
     office = _FakeVoiceChannel(10, "Coach Office")
-    guild = _FakeGuild(100, [office])
+    waiting = _FakeVoiceChannel(11, "Secretary")
+    guild = _FakeGuild(100, [office, waiting])
     coach = _FakeMember(1, display_name="Coach")
     target = _FakeMember(2, display_name="Target")
+    secretary = _FakeSecretary(
+        CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=waiting.id, coach_channel_id=office.id)
+    )
     cog = CoachSecretaryCog(
         bot=object(),  # type: ignore[arg-type]
-        secretary=_FakeSecretary(
-            CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=99, coach_channel_id=office.id)
-        ),  # type: ignore[arg-type]
+        secretary=secretary,  # type: ignore[arg-type]
     )
     ctx = _FakeContext(guild, coach)
 
     await cog.summon.callback(cog, ctx, target)  # type: ignore[union-attr]
 
     assert target.move_calls == []
-    assert target.sent_messages == ["Coach asked you to join the coach's office in guild-100: Coach Office."]
+    assert target.sent_messages == [
+        "Coach asked you to join the coach's office in guild-100: Coach Office. "
+        "If you can only access Secretary, join it within 10 minutes and I'll move you in automatically."
+    ]
+    assert secretary.marked_summons == [(guild.id, target.id)]
     assert ctx.sent_messages == ["Summon to <#10> complete. DM'd: **1**."]
 
 
@@ -190,3 +234,45 @@ async def test_summon_requires_coach_configuration() -> None:
 
     assert target.sent_messages == []
     assert ctx.sent_messages == ["Coach secretary is not configured. Use !coach setup first."]
+
+
+@pytest.mark.asyncio
+async def test_summoned_waiting_member_moves_directly_before_expiry() -> None:
+    now = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+    office = _FakeVoiceChannel(10, "Coach Office")
+    waiting = _FakeVoiceChannel(11, "Secretary")
+    coach = _FakeMember(1, display_name="Coach")
+    member = _FakeMember(2, display_name="Summoned", voice_channel=waiting)
+    guild = _FakeGuild(100, [office, waiting], members=[coach, member])
+    config = CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=waiting.id, coach_channel_id=office.id)
+    secretary = CoachSecretary(_FakeCoachRepo(config), now_provider=lambda: now)  # type: ignore[arg-type]
+    secretary.mark_summoned_member(guild.id, member.id)
+
+    await secretary.handle_waiting_member(member, guild)  # type: ignore[arg-type]
+
+    assert member.move_calls == [(office, "Summoned member joined waiting room")]
+    assert coach.sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_summoned_waiting_member_bypass_expires_after_ten_minutes() -> None:
+    current_time = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+
+    def _now() -> datetime:
+        return current_time
+
+    office = _FakeVoiceChannel(10, "Coach Office")
+    waiting = _FakeVoiceChannel(11, "Secretary")
+    coach = _FakeMember(1, display_name="Coach")
+    member = _FakeMember(2, display_name="Summoned", voice_channel=waiting)
+    guild = _FakeGuild(100, [office, waiting], members=[coach, member])
+    config = CoachConfig(guild_id=guild.id, coach_id=coach.id, waiting_room_id=waiting.id, coach_channel_id=office.id)
+    secretary = CoachSecretary(_FakeCoachRepo(config), now_provider=_now)  # type: ignore[arg-type]
+    secretary.mark_summoned_member(guild.id, member.id)
+
+    current_time += timedelta(minutes=10, seconds=1)
+    await secretary.handle_waiting_member(member, guild)  # type: ignore[arg-type]
+
+    assert member.move_calls == []
+    assert len(coach.sent_messages) == 1
+    assert "Summoned is in the waiting room" in coach.sent_messages[0]

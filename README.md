@@ -159,7 +159,7 @@ Text config keys:
 | `!coach setup @CoachUser "Waiting Room" "Coach Room"` | Configure coach routing. |
 | `!coach reset` | Remove coach routing configuration. |
 | `!coach config` | Show current coach routing configuration. |
-| `!summon <@user\|@role>` | Coach-only summon to the configured coach voice room; users outside voice are DM'd. |
+| `!summon <@user\|@role>` | Coach-only summon to the configured coach voice room; users outside voice are DM'd and can enter the waiting room for automatic transfer within 10 minutes. |
 
 ### Voice Hours
 
