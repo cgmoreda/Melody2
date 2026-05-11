@@ -7,7 +7,7 @@ import pytest
 
 import cogs.verification as verification_module
 from cogs.verification import VerificationCog
-from db.repository import PendingVerification, VerifiedUser
+from db.repository import PendingVerification, VerifiedHandleConflict, VerifiedUser
 from services.cf_client import CFContestChange, CFSubmission, CFUserInfo
 
 
@@ -15,6 +15,7 @@ class _FakeRepo:
     def __init__(self) -> None:
         self.pending: dict[tuple[int, int], PendingVerification] = {}
         self.verified: list[VerifiedUser] = []
+        self.raise_conflict_on_upsert = False
 
     async def upsert_pending_verification(
         self,
@@ -42,7 +43,24 @@ class _FakeRepo:
         return self.pending.pop((guild_id, discord_id), None) is not None
 
     async def upsert(self, user: VerifiedUser) -> None:
+        if self.raise_conflict_on_upsert:
+            raise VerifiedHandleConflict(user.guild_id, user.cf_handle)
+        existing = await self.get_by_cf_handle(user.guild_id, user.cf_handle)
+        if existing is not None and existing.discord_id != user.discord_id:
+            raise VerifiedHandleConflict(user.guild_id, user.cf_handle)
         self.verified.append(user)
+
+    async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
+        for user in reversed(self.verified):
+            if user.discord_id == discord_id and user.guild_id == guild_id:
+                return user
+        return None
+
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        for user in reversed(self.verified):
+            if user.guild_id == guild_id and user.cf_handle.casefold() == cf_handle.casefold():
+                return user
+        return None
 
 
 class _FakeCFClient:
@@ -164,6 +182,30 @@ async def test_pending_verification_survives_across_cog_instances(monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_verify_rejects_handle_already_linked_to_another_member(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(verification_module, "_generate_code", lambda length=6: "CF-VERIFY-unused")
+
+    repo = _FakeRepo()
+    repo.verified.append(VerifiedUser(discord_id=999, cf_handle="tourist", rating=3000, guild_id=101))
+    guild = _FakeGuild(101)
+    member = _FakeMember(202)
+    ctx = _FakeContext(guild, member)
+
+    cog = VerificationCog(
+        cf_client=_FakeCFClient({"tourist": _build_user(handle="tourist", first_name=None)}),  # type: ignore[arg-type]
+        role_assigner=_FakeRoleAssigner(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=object(),  # type: ignore[arg-type]
+        reminder_service=None,
+    )
+
+    await cog.verify.callback(cog, ctx, "tourist")
+
+    assert "already linked" in ctx.messages[-1]
+    assert repo.pending == {}
+
+
+@pytest.mark.asyncio
 async def test_confirm_expired_pending_verification_clears_row() -> None:
     repo = _FakeRepo()
     guild = _FakeGuild(11)
@@ -227,6 +269,70 @@ async def test_confirm_success_deletes_pending_row() -> None:
     assert len(repo.verified) == 1
     assert repo.verified[0].cf_handle == "active_handle"
     assert roles.apply_calls == [(member.id, guild.id, 2100)]
+
+
+@pytest.mark.asyncio
+async def test_confirm_handles_race_time_handle_conflict_without_deleting_pending() -> None:
+    repo = _FakeRepo()
+    repo.raise_conflict_on_upsert = True
+    guild = _FakeGuild(313)
+    member = _FakeMember(414)
+    ctx = _FakeContext(guild, member)
+
+    now = datetime.now(tz=UTC)
+    await repo.upsert_pending_verification(
+        guild_id=guild.id,
+        discord_id=member.id,
+        cf_handle="race_handle",
+        verification_code="CF-VERIFY-race",
+        created_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+
+    roles = _FakeRoleAssigner()
+    cog = VerificationCog(
+        cf_client=_FakeCFClient({"race_handle": _build_user(handle="race_handle", first_name="CF-VERIFY-race")}),  # type: ignore[arg-type]
+        role_assigner=roles,  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=object(),  # type: ignore[arg-type]
+        reminder_service=None,
+    )
+
+    await cog.confirm.callback(cog, ctx)
+
+    assert await repo.get_pending_verification(guild.id, member.id) is not None
+    assert repo.verified == []
+    assert roles.apply_calls == []
+    assert "already linked" in ctx.messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_updaterating_rejects_canonical_handle_conflict_before_role_update() -> None:
+    repo = _FakeRepo()
+    guild = _FakeGuild(515)
+    member = _FakeMember(616)
+    ctx = _FakeContext(guild, member)
+    repo.verified.extend(
+        [
+            VerifiedUser(discord_id=member.id, cf_handle="old_handle", rating=1200, guild_id=guild.id),
+            VerifiedUser(discord_id=999, cf_handle="new_handle", rating=1900, guild_id=guild.id),
+        ]
+    )
+
+    roles = _FakeRoleAssigner()
+    cog = VerificationCog(
+        cf_client=_FakeCFClient({"old_handle": _build_user(handle="new_handle", first_name=None, max_rating=2100)}),  # type: ignore[arg-type]
+        role_assigner=roles,  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=object(),  # type: ignore[arg-type]
+        reminder_service=None,
+    )
+
+    await cog.updaterating.callback(cog, ctx)
+
+    assert "already linked" in ctx.messages[-1]
+    assert len(repo.verified) == 2
+    assert roles.apply_calls == []
 
 
 @pytest.mark.asyncio

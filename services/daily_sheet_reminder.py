@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DAILY_SHEET_MESSAGE = "Reminder: please update your daily sheets."
 DEFAULT_DAILY_SHEET_POLL_SECONDS = 60
+_EVERYONE_MENTION = "@everyone"
+_DAILY_SHEET_ALLOWED_MENTIONS = discord.AllowedMentions(
+    everyone=True,
+    users=False,
+    roles=False,
+    replied_user=False,
+)
+
+
+def _with_everyone_mention(message: str) -> str:
+    clean_message = message.strip()
+    if _EVERYONE_MENTION in clean_message:
+        return clean_message
+    return f"{_EVERYONE_MENTION} {clean_message}".strip()
 
 
 def parse_utc_time(raw: str) -> tuple[int, int]:
@@ -75,8 +89,11 @@ class DailySheetReminderService:
         message: str,
     ) -> DailySheetReminderConfig:
         clean_message = message.strip() or DEFAULT_DAILY_SHEET_MESSAGE
-        if len(clean_message) > DISCORD_MESSAGE_CHAR_LIMIT:
-            raise ValueError(f"Reminder message must be {DISCORD_MESSAGE_CHAR_LIMIT} characters or fewer.")
+        if len(_with_everyone_mention(clean_message)) > DISCORD_MESSAGE_CHAR_LIMIT:
+            raise ValueError(
+                "Reminder message including the @everyone mention must be "
+                f"{DISCORD_MESSAGE_CHAR_LIMIT} characters or fewer."
+            )
         await self._repo.upsert_daily_sheet_reminder(
             guild_id=guild_id,
             channel_id=channel_id,
@@ -140,9 +157,25 @@ class DailySheetReminderService:
             )
             return
 
+        sent_on = now.date()
+        marked = await self._repo.mark_daily_sheet_reminder_sent(reminder.guild_id, sent_on)
+        if not marked:
+            return
+
         try:
-            await channel.send(reminder.message)
+            await channel.send(
+                _with_everyone_mention(reminder.message),
+                allowed_mentions=_DAILY_SHEET_ALLOWED_MENTIONS,
+            )
         except discord.Forbidden:
+            try:
+                await self._repo.clear_daily_sheet_reminder_sent(reminder.guild_id, sent_on)
+            except Exception:
+                logger.exception(
+                    "Failed clearing daily sheet reminder claim for guild %s on %s",
+                    reminder.guild_id,
+                    sent_on,
+                )
             logger.warning(
                 "Cannot send daily sheet reminder to channel %s in guild %s due to missing permissions",
                 reminder.channel_id,
@@ -158,10 +191,8 @@ class DailySheetReminderService:
             )
             return
 
-        marked = await self._repo.mark_daily_sheet_reminder_sent(reminder.guild_id, now.date())
-        if marked:
-            logger.info(
-                "Sent daily sheet reminder in guild %s channel %s",
-                reminder.guild_id,
-                reminder.channel_id,
-            )
+        logger.info(
+            "Sent daily sheet reminder in guild %s channel %s",
+            reminder.guild_id,
+            reminder.channel_id,
+        )

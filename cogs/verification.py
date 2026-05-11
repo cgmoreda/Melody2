@@ -12,7 +12,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from db.repository import VerificationRepository, VerifiedUser
+from db.repository import VerificationRepository, VerifiedHandleConflict, VerifiedUser
 from services.discord_output import (
     DISCORD_EMBED_FIELD_VALUE_LIMIT,
     clip_embed_description,
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 MAX_RECENT_CONTEST_LINES = 5
 PENDING_VERIFICATION_EXPIRY_MINUTES = 15
+SIMPLE_API_COOLDOWN_SECONDS = 10
+FANOUT_COOLDOWN_SECONDS = 60
 
 
 def _generate_code(length: int = 6) -> str:
@@ -122,6 +124,20 @@ class VerificationCog(commands.Cog, name="Verification"):
             lines.append(f"URL: `{error.requested_url}`")
         lines.append("Please try again in a minute.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _cooldown_message(error: commands.CommandOnCooldown) -> str:
+        retry_after = max(1, int(error.retry_after + 0.999))
+        return f"That command is on cooldown. Try again in **{retry_after}s**."
+
+    async def _send_handle_conflict(
+        self,
+        ctx: commands.Context,
+        handle: str,
+        existing: Optional[VerifiedUser] = None,
+    ) -> None:
+        owner_text = f" by <@{existing.discord_id}>" if existing is not None else ""
+        await ctx.send(f"Codeforces handle **{handle}** is already linked{owner_text} in this server.")
 
     @staticmethod
     def _build_whois_embed(info: CFUserInfo) -> discord.Embed:
@@ -258,19 +274,31 @@ class VerificationCog(commands.Cog, name="Verification"):
             return None
         return target
 
-    async def _fetch_latest_histories(self, handles: list[str]) -> dict[str, list[CFContestChange]]:
+    async def _fetch_latest_histories(self, handles: list[str]) -> tuple[dict[str, list[CFContestChange]], list[str]]:
         sem = asyncio.Semaphore(8)
 
-        async def _fetch(handle: str) -> tuple[str, list[CFContestChange]]:
+        async def _fetch(handle: str) -> tuple[str, Optional[list[CFContestChange]]]:
             async with sem:
-                history = await self._cf.get_rating_history(handle)
+                try:
+                    history = await self._cf.get_rating_history(handle)
+                except CFRequestError as exc:
+                    logger.warning("Failed fetching rating history for %s: %s", handle, exc)
+                    return handle, None
                 return handle, history
 
         rows = await asyncio.gather(*[_fetch(handle) for handle in handles])
-        return {handle: history for handle, history in rows}
+        histories: dict[str, list[CFContestChange]] = {}
+        failed_handles: list[str] = []
+        for handle, history in rows:
+            if history is None:
+                failed_handles.append(handle)
+                continue
+            histories[handle] = history
+        return histories, failed_handles
 
     @commands.command(name="verify")
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def verify(self, ctx: commands.Context, handle: str) -> None:
         """Start Codeforces handle verification for your Discord account."""
         if ctx.guild is None:
@@ -283,6 +311,11 @@ class VerificationCog(commands.Cog, name="Verification"):
             return
         if info is None:
             await ctx.send(f"Could not find Codeforces handle **{handle}**.")
+            return
+
+        existing = await self._repo.get_by_cf_handle(ctx.guild.id, info.handle)
+        if existing is not None and existing.discord_id != ctx.author.id:
+            await self._send_handle_conflict(ctx, info.handle, existing)
             return
 
         code = _generate_code()
@@ -300,6 +333,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.command(name="confirm")
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def confirm(self, ctx: commands.Context) -> None:
         """Confirm verification after setting your temporary code on Codeforces."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
@@ -336,15 +370,25 @@ class VerificationCog(commands.Cog, name="Verification"):
             )
             return
 
-        await self._repo.delete_pending_verification(ctx.guild.id, ctx.author.id)
-
         user = VerifiedUser(
             discord_id=ctx.author.id,
             cf_handle=info.handle,
             rating=info.max_rating,
             guild_id=ctx.guild.id,
         )
-        await self._repo.upsert(user)
+
+        existing = await self._repo.get_by_cf_handle(ctx.guild.id, info.handle)
+        if existing is not None and existing.discord_id != ctx.author.id:
+            await self._send_handle_conflict(ctx, info.handle, existing)
+            return
+
+        try:
+            await self._repo.upsert(user)
+        except VerifiedHandleConflict:
+            await self._send_handle_conflict(ctx, info.handle)
+            return
+
+        await self._repo.delete_pending_verification(ctx.guild.id, ctx.author.id)
 
         role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
         role_text = f" and assigned role **{role.name}**" if role else ""
@@ -362,6 +406,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.command(name="updaterating", aliases=["update"])
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def updaterating(self, ctx: commands.Context) -> None:
         """Refresh your linked Codeforces rating and update your role."""
         assert ctx.guild is not None and isinstance(ctx.author, discord.Member)
@@ -394,7 +439,17 @@ class VerificationCog(commands.Cog, name="Verification"):
             rating=info.max_rating,
             guild_id=record.guild_id,
         )
-        await self._repo.upsert(updated_record)
+
+        existing = await self._repo.get_by_cf_handle(ctx.guild.id, info.handle)
+        if existing is not None and existing.discord_id != ctx.author.id:
+            await self._send_handle_conflict(ctx, info.handle, existing)
+            return
+
+        try:
+            await self._repo.upsert(updated_record)
+        except VerifiedHandleConflict:
+            await self._send_handle_conflict(ctx, info.handle)
+            return
 
         role = await self._roles.apply(ctx.author, ctx.guild, info.max_rating)
         new_role_rule = self._roles.role_for(info.max_rating)
@@ -422,6 +477,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.command(name="whois")
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def whois(self, ctx: commands.Context, handle: str) -> None:
         """Show live Codeforces profile details for a handle."""
         try:
@@ -437,6 +493,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.command(name="stats")
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def stats(self, ctx: commands.Context, handle: str) -> None:
         """Show contest and submission statistics for a Codeforces handle."""
         try:
@@ -471,6 +528,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @commands.command(name="roundchanges", aliases=["lastround"])
     @commands.guild_only()
+    @commands.cooldown(1, FANOUT_COOLDOWN_SECONDS, commands.BucketType.guild)
     async def roundchanges(self, ctx: commands.Context) -> None:
         """Show latest round rating changes for verified server members."""
         assert ctx.guild is not None
@@ -483,14 +541,20 @@ class VerificationCog(commands.Cog, name="Verification"):
 
         unique_handles = sorted({user.cf_handle for user in users})
         try:
-            history_by_handle = await self._fetch_latest_histories(unique_handles)
+            history_by_handle, failed_handles = await self._fetch_latest_histories(unique_handles)
         except CFRequestError as exc:
             await ctx.send(self._cf_error_message(exc))
             return
 
         latest_entries = [history[-1] for history in history_by_handle.values() if history]
         if not latest_entries:
-            await ctx.send("Could not fetch rating history for verified users right now.")
+            if failed_handles:
+                await ctx.send(
+                    "Could not fetch rating history for verified users right now. "
+                    f"Skipped **{len(failed_handles)}** handle(s) due to Codeforces errors."
+                )
+            else:
+                await ctx.send("Could not fetch rating history for verified users right now.")
             return
 
         target_contest_id = max(entry.contest_id for entry in latest_entries)
@@ -501,7 +565,12 @@ class VerificationCog(commands.Cog, name="Verification"):
 
         participants: list[tuple[int, str]] = []
         non_participants: list[str] = []
+        failed_handle_set = {handle.casefold() for handle in failed_handles}
+        skipped_user_count = 0
         for user in users:
+            if user.cf_handle.casefold() in failed_handle_set:
+                skipped_user_count += 1
+                continue
             history = history_by_handle.get(user.cf_handle, [])
             row = next((item for item in reversed(history) if item.contest_id == target_contest_id), None)
             member = ctx.guild.get_member(user.discord_id)
@@ -533,6 +602,8 @@ class VerificationCog(commands.Cog, name="Verification"):
 
         displayed = lines[: config.roundchanges_max_lines]
         hidden_count = len(lines) - len(displayed)
+        if skipped_user_count > 0:
+            displayed.append(f"Skipped **{skipped_user_count}** verified user(s) due to Codeforces fetch errors.")
 
         for embed in self._build_roundchanges_embeds(
             displayed_lines=displayed,
@@ -620,6 +691,7 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @reminder.command(name="next")
     @commands.guild_only()
+    @commands.cooldown(1, SIMPLE_API_COOLDOWN_SECONDS, commands.BucketType.user)
     async def reminder_next(self, ctx: commands.Context, platform: str = "codeforces") -> None:
         """Show upcoming contests for a given platform.
         
@@ -671,13 +743,33 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @verify.error
     async def verify_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("Usage: **!verify <codeforces_handle>**")
             return
         raise error
 
+    @confirm.error
+    async def confirm_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
+        raise error
+
+    @updaterating.error
+    async def updaterating_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
+        raise error
+
     @whois.error
     async def whois_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("Usage: **!whois <codeforces_handle>**")
             return
@@ -685,13 +777,26 @@ class VerificationCog(commands.Cog, name="Verification"):
 
     @stats.error
     async def stats_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("Usage: **!stats <codeforces_handle>**")
             return
         raise error
 
+    @roundchanges.error
+    async def roundchanges_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
+        raise error
+
     @reminder.error
     async def reminder_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You need the **Manage Server** permission for this reminder action.")
             return

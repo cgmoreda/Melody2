@@ -4,8 +4,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from db.repository import GymProblemRatingVote, VerifiedUser
-from services.cf_client import CFSubmission
+from db.repository import GymParticipationCache, GymProblemRatingVote, VerifiedUser
+from services.cf_client import CFRequestError, CFSubmission
 from services.gym_service import GymService
 
 
@@ -16,10 +16,13 @@ class _FakeRepo:
         verified_by_member: dict[tuple[int, int], VerifiedUser] | None = None,
         all_verified: list[VerifiedUser] | None = None,
         problem_votes: list[GymProblemRatingVote] | None = None,
+        participation_cache: list[GymParticipationCache] | None = None,
     ) -> None:
         self._verified_by_member = verified_by_member or {}
         self._all_verified = all_verified or []
         self._problem_votes = problem_votes or []
+        self._participation_cache = participation_cache or []
+        self.participation_upserts: list[tuple[int, int, int, int, datetime]] = []
 
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> VerifiedUser | None:
         return self._verified_by_member.get((guild_id, discord_id))
@@ -45,6 +48,23 @@ class _FakeRepo:
             and row.problem_index == problem_index
         ]
 
+    async def get_gym_participation_cache(self, guild_id: int, contest_id: int) -> list[GymParticipationCache]:
+        return [
+            row
+            for row in self._participation_cache
+            if row.guild_id == guild_id and row.contest_id == contest_id
+        ]
+
+    async def upsert_gym_participation_cache(
+        self,
+        guild_id: int,
+        contest_id: int,
+        discord_id: int,
+        solved_count: int,
+        checked_at: datetime,
+    ) -> None:
+        self.participation_upserts.append((guild_id, contest_id, discord_id, solved_count, checked_at))
+
 
 class _FakeCF:
     def __init__(self, submissions: list[CFSubmission]) -> None:
@@ -54,6 +74,19 @@ class _FakeCF:
     async def get_recent_submissions(self, handle: str, count: int = 5000) -> list[CFSubmission]:
         self.calls += 1
         return list(self._submissions)
+
+
+class _FailingCF:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_recent_submissions(self, handle: str, count: int = 5000) -> list[CFSubmission]:
+        self.calls += 1
+        raise CFRequestError(
+            endpoint="user.status",
+            failure_kind="network",
+            requested_url=f"https://codeforces.com/api/user.status?handle={handle}",
+        )
 
 
 @pytest.mark.asyncio
@@ -124,6 +157,56 @@ async def test_can_modify_tags_allows_solver_when_rating_below_expert() -> None:
 
 
 @pytest.mark.asyncio
+async def test_contest_participation_marks_failed_refresh_without_false_zero() -> None:
+    guild_id = 77
+    contest_id = 2062
+    verified = VerifiedUser(discord_id=66, cf_handle="solver_user", rating=1400, guild_id=guild_id)
+    service = GymService(
+        repo=_FakeRepo(verified_by_member={(guild_id, 66): verified}),  # type: ignore[arg-type]
+        cf=_FailingCF(),  # type: ignore[arg-type]
+    )
+
+    result = await service.contest_participation(
+        guild_id=guild_id,
+        contest_id=contest_id,
+        training_member_ids=[66],
+        verified_by_id={66: verified},
+        force=True,
+    )
+
+    assert result.failed_ids == {66}
+    assert result.solved_by_discord == {}
+    assert result.unverified_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_contest_participation_keeps_stale_cached_count_on_refresh_failure() -> None:
+    guild_id = 77
+    contest_id = 2062
+    checked_at = datetime(2026, 1, 1, tzinfo=UTC)
+    verified = VerifiedUser(discord_id=66, cf_handle="solver_user", rating=1400, guild_id=guild_id)
+    repo = _FakeRepo(
+        verified_by_member={(guild_id, 66): verified},
+        participation_cache=[
+            GymParticipationCache(guild_id, contest_id, 66, solved_count=2, checked_at=checked_at)
+        ],
+    )
+    service = GymService(repo=repo, cf=_FailingCF())  # type: ignore[arg-type]
+
+    result = await service.contest_participation(
+        guild_id=guild_id,
+        contest_id=contest_id,
+        training_member_ids=[66],
+        verified_by_id={66: verified},
+        force=True,
+    )
+
+    assert result.failed_ids == {66}
+    assert result.solved_by_discord == {66: 2}
+    assert repo.participation_upserts == []
+
+
+@pytest.mark.asyncio
 async def test_problem_rating_summary_ignores_unverified_votes_and_applies_weights() -> None:
     now = datetime.now(tz=UTC)
     guild_id = 500
@@ -149,3 +232,16 @@ async def test_problem_rating_summary_ignores_unverified_votes_and_applies_weigh
     assert summary["count"] == pytest.approx(2.0)
     assert summary["avg"] == pytest.approx(1500.0)
     assert summary["weighted_avg"] == pytest.approx((1000 * 1.3 + 2000 * 2.6) / (1.3 + 2.6))
+
+
+@pytest.mark.asyncio
+async def test_gym_submission_cache_evicts_least_recent_entry() -> None:
+    service = GymService(repo=_FakeRepo(), cf=_FakeCF([]))  # type: ignore[arg-type]
+    service._submission_cache_max_entries = 2
+
+    await service.get_submissions("a")
+    await service.get_submissions("b")
+    await service.get_submissions("a")
+    await service.get_submissions("c")
+
+    assert list(service._submission_cache) == ["a", "c"]

@@ -8,6 +8,7 @@ import pytest
 import cogs.gym as gym_module
 from cogs.gym import GymCog
 from db.repository import GymContest, VerifiedUser
+from services.gym_service import GymParticipationResult
 
 
 class _FakeRepo:
@@ -77,9 +78,9 @@ async def test_gald_accepts_force_teams_contest_in_any_order(monkeypatch: pytest
         verified_by_id: dict[int, VerifiedUser],
         *,
         force: bool,
-    ) -> tuple[dict[int, int], set[int]]:
+    ) -> GymParticipationResult:
         calls.append({"contest_id": contest_id, "force": force})
-        return {100: 0}, set()
+        return GymParticipationResult(solved_by_discord={100: 0}, unverified_ids=set(), failed_ids=set())
 
     async def _fake_send_chunks(ctx: object, lines: list[str]) -> None:
         sent_chunks.append(lines)
@@ -97,4 +98,50 @@ async def test_gald_accepts_force_teams_contest_in_any_order(monkeypatch: pytest
     output = "\n".join(sent_chunks[0])
     assert "Contest `2062` (team)" in output
     assert "cache mode: **force(10m)**" in output
+    assert "<@100>" in output
+
+
+@pytest.mark.asyncio
+async def test_gald_reports_failed_refresh_without_listing_as_zero_solved(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    repo = _FakeRepo([GymContest(1, 2062, "individual", 10, now)])
+    cog = GymCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        cf=object(),  # type: ignore[arg-type]
+        config_service=_FakeConfig(),  # type: ignore[arg-type]
+    )
+    member = _FakeMember(100, "Trainee")
+    sent_chunks: list[list[str]] = []
+
+    async def _training_members(guild: object) -> list[_FakeMember]:
+        return [member]
+
+    async def _verified_map(guild_id: int) -> dict[int, VerifiedUser]:
+        return {100: VerifiedUser(discord_id=100, cf_handle="tourist", rating=3000, guild_id=1)}
+
+    async def _contest_participation(
+        guild_id: int,
+        contest_id: int,
+        training_members: list[_FakeMember],
+        verified_by_id: dict[int, VerifiedUser],
+        *,
+        force: bool,
+    ) -> GymParticipationResult:
+        return GymParticipationResult(solved_by_discord={}, unverified_ids=set(), failed_ids={100})
+
+    async def _fake_send_chunks(ctx: object, lines: list[str]) -> None:
+        sent_chunks.append(lines)
+
+    monkeypatch.setattr(cog, "_training_members", _training_members)
+    monkeypatch.setattr(cog, "_verified_map", _verified_map)
+    monkeypatch.setattr(cog, "_contest_participation", _contest_participation)
+    monkeypatch.setattr(gym_module, "send_context_lines_chunks", _fake_send_chunks)
+
+    ctx = _FakeContext()
+    await cog.gald.callback(cog, ctx, "2062")  # type: ignore[union-attr]
+
+    output = "\n".join(sent_chunks[0])
+    assert "Did not solve any problem yet" not in output
+    assert "Skipped due to Codeforces refresh errors (1)" in output
     assert "<@100>" in output

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Union
 
 import discord
 from discord.ext import commands
@@ -11,6 +12,7 @@ from db.repository import CoachConfig
 from services.coach_secretary import CoachSecretaryBase
 
 logger = logging.getLogger(__name__)
+SummonTarget = Union[discord.Member, discord.Role]
 
 
 class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
@@ -140,6 +142,103 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         )
         await ctx.send(embed=embed)
 
+    @commands.command(name="summon")
+    @commands.guild_only()
+    async def summon(self, ctx: commands.Context, target: SummonTarget) -> None:
+        """Summon a member or role to the configured coach room."""
+        assert ctx.guild is not None
+
+        config = await self._secretary.get_config(ctx.guild.id)
+        if config is None:
+            await ctx.send("Coach secretary is not configured. Use !coach setup first.")
+            return
+        if ctx.author.id != config.coach_id:
+            await ctx.send("Only the configured coach can use this command.")
+            return
+
+        coach_room = ctx.guild.get_channel(config.coach_channel_id)
+        if not isinstance(coach_room, discord.VoiceChannel):
+            await ctx.send("Coach room channel was not found. Use !coach setup again.")
+            return
+
+        members = self._members_from_summon_target(target)
+        if not members:
+            await ctx.send("No non-bot members found for that target.")
+            return
+
+        result = await self._summon_members(
+            guild=ctx.guild,
+            coach=ctx.author,
+            coach_room=coach_room,
+            members=members,
+        )
+        await ctx.send(self._render_summon_summary(coach_room, result))
+
+    @staticmethod
+    def _members_from_summon_target(target: SummonTarget) -> list[discord.Member]:
+        if isinstance(target, discord.Member):
+            return [] if target.bot else [target]
+        if isinstance(target, discord.Role):
+            return [member for member in target.members if not member.bot]
+        return []
+
+    async def _summon_members(
+        self,
+        *,
+        guild: discord.Guild,
+        coach: discord.Member,
+        coach_room: discord.VoiceChannel,
+        members: list[discord.Member],
+    ) -> dict[str, int]:
+        result = {
+            "moved": 0,
+            "already": 0,
+            "dm_sent": 0,
+            "dm_failed": 0,
+            "move_failed": 0,
+        }
+        reason = f"Summoned by coach {coach} ({coach.id})"
+
+        for member in members:
+            voice_channel = member.voice.channel if member.voice is not None else None
+            if voice_channel is None:
+                try:
+                    await member.send(
+                        f"{coach.display_name} asked you to join the coach's office in "
+                        f"{guild.name}: {coach_room.name}."
+                    )
+                    result["dm_sent"] += 1
+                except (discord.Forbidden, discord.HTTPException):
+                    result["dm_failed"] += 1
+                continue
+
+            if voice_channel.id == coach_room.id:
+                result["already"] += 1
+                continue
+
+            try:
+                await member.move_to(coach_room, reason=reason)
+                result["moved"] += 1
+            except (discord.Forbidden, discord.HTTPException):
+                result["move_failed"] += 1
+
+        return result
+
+    @staticmethod
+    def _render_summon_summary(coach_room: discord.VoiceChannel, result: dict[str, int]) -> str:
+        parts = [f"Summon to {coach_room.mention} complete."]
+        if result["moved"]:
+            parts.append(f"Moved: **{result['moved']}**.")
+        if result["already"]:
+            parts.append(f"Already there: **{result['already']}**.")
+        if result["dm_sent"]:
+            parts.append(f"DM'd: **{result['dm_sent']}**.")
+        if result["move_failed"]:
+            parts.append(f"Move failed: **{result['move_failed']}**.")
+        if result["dm_failed"]:
+            parts.append(f"DM failed: **{result['dm_failed']}**.")
+        return " ".join(parts)
+
     @coach_setup.error
     async def coach_setup_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.MissingRequiredArgument):
@@ -150,6 +249,16 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
             return
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You need Administrator permission for this command.")
+            return
+        raise error
+
+    @summon.error
+    async def summon_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Usage: !summon <@user|@role>")
+            return
+        if isinstance(error, commands.BadUnionArgument):
+            await ctx.send("Could not resolve that target. Mention a valid user or role.")
             return
         raise error
 

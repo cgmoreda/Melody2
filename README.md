@@ -13,7 +13,7 @@ The bot uses the `!` command prefix and stores persistent state in PostgreSQL. D
 - Codeforces and AtCoder contest reminders with restart-safe deduplication.
 
 ### Training Operations
-- Daily sheet reminders per guild and channel.
+- Daily sheet reminders per guild and channel with `@everyone` delivery pings.
 - Voice-hour tracking for solo channels and configured tracked-channel keywords.
 - Training timesheets and max voice-hour reports with Egypt-day boundaries.
 - Trainee accountability reports for minimum voice-hour targets.
@@ -48,6 +48,7 @@ Optional environment variables:
 | --- | ---: | --- |
 | `CF_REMINDER_POLL_SECONDS` | `300` | Contest reminder poll interval. Clamped to `300..600`. |
 | `CACHE_TTL_SECONDS` | `60` | Codeforces response cache TTL. |
+| `CF_CACHE_MAX_ENTRIES` | `1024` | Maximum in-memory Codeforces response cache entries. |
 | `REQUEST_TIMEOUT_SECONDS` | `20` | Per-request Codeforces API timeout. |
 | `CF_MAX_RETRIES` | `3` | Codeforces API retry count. |
 
@@ -158,6 +159,7 @@ Text config keys:
 | `!coach setup @CoachUser "Waiting Room" "Coach Room"` | Configure coach routing. |
 | `!coach reset` | Remove coach routing configuration. |
 | `!coach config` | Show current coach routing configuration. |
+| `!summon <@user\|@role>` | Coach-only summon to the configured coach voice room; users outside voice are DM'd. |
 
 ### Voice Hours
 

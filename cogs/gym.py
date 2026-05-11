@@ -11,7 +11,7 @@ from db.repository import GymFeatureRepository, VerifiedUser
 from services.command_parser import CommandParseError, normalize_token
 from services.discord_output import send_context_lines_chunks, send_interaction_lines_chunks, send_interaction_text_chunks
 from services.cf_client import CFRequestError, CodeforcesClientBase
-from services.gym_service import GymService, normalize_problem_index, normalize_tag, problem_ref
+from services.gym_service import GymParticipationResult, GymService, normalize_problem_index, normalize_tag, problem_ref
 from services.guild_config import GuildConfigService
 
 
@@ -22,6 +22,7 @@ class GaldCommandRequest:
     force: bool = False
 
 
+GALD_COOLDOWN_SECONDS = 60
 COMMON_TAGS: tuple[str, ...] = (
     "implementation",
     "math",
@@ -369,6 +370,11 @@ class GymCog(commands.Cog, name="Gyms"):
         return "\n".join(lines)
 
     @staticmethod
+    def _cooldown_message(error: commands.CommandOnCooldown) -> str:
+        retry_after = max(1, int(error.retry_after + 0.999))
+        return f"That command is on cooldown. Try again in **{retry_after}s**."
+
+    @staticmethod
     def _sorted_members(members: list[discord.Member]) -> list[discord.Member]:
         return sorted(members, key=lambda member: member.display_name.casefold())
 
@@ -456,7 +462,7 @@ class GymCog(commands.Cog, name="Gyms"):
         verified_by_id: dict[int, VerifiedUser],
         *,
         force: bool,
-    ) -> tuple[dict[int, int], set[int]]:
+    ) -> GymParticipationResult:
         training_member_ids = [member.id for member in training_members]
         return await self._gym_service.contest_participation(
             guild_id=guild_id,
@@ -562,6 +568,7 @@ class GymCog(commands.Cog, name="Gyms"):
         ),
     )
     @commands.guild_only()
+    @commands.cooldown(1, GALD_COOLDOWN_SECONDS, commands.BucketType.guild)
     async def gald(self, ctx: commands.Context, *args: str) -> None:
         """List trainees with zero solved gym problems."""
         assert ctx.guild is not None
@@ -593,7 +600,7 @@ class GymCog(commands.Cog, name="Gyms"):
 
         for gym in gyms:
             try:
-                solved_by_discord, unverified_ids = await self._contest_participation(
+                participation = await self._contest_participation(
                     ctx.guild.id,
                     gym.contest_id,
                     training_members,
@@ -603,16 +610,24 @@ class GymCog(commands.Cog, name="Gyms"):
             except CFRequestError as exc:
                 await ctx.send(self._cf_error_message(exc))
                 return
+            solved_by_discord = participation.solved_by_discord
+            unverified_ids = participation.unverified_ids
+            failed_ids = participation.failed_ids
 
             not_participated = self._sorted_members(
                 [
                     member
                     for member in training_members
-                    if member.id in verified_by_id and solved_by_discord.get(member.id, 0) <= 0
+                    if member.id in verified_by_id
+                    and member.id not in failed_ids
+                    and solved_by_discord.get(member.id, 0) <= 0
                 ]
             )
             unverified_members = self._sorted_members(
                 [member for member in training_members if member.id in unverified_ids]
+            )
+            failed_members = self._sorted_members(
+                [member for member in training_members if member.id in failed_ids]
             )
 
             lines = [
@@ -620,7 +635,7 @@ class GymCog(commands.Cog, name="Gyms"):
                 f"Trainees tracked: **{len(training_members)}** | cache mode: **{cache_note}**",
                 "",
             ]
-            if not not_participated and not unverified_members:
+            if not not_participated and not unverified_members and not failed_members:
                 lines.append("All trainees have solved at least one problem.")
             else:
                 if not_participated:
@@ -630,8 +645,19 @@ class GymCog(commands.Cog, name="Gyms"):
                 if unverified_members:
                     lines.append(f"Unverified trainees (cannot track CF handle) ({len(unverified_members)}):")
                     lines.extend(member.mention for member in unverified_members)
+                    lines.append("")
+                if failed_members:
+                    lines.append(f"Skipped due to Codeforces refresh errors ({len(failed_members)}):")
+                    lines.extend(member.mention for member in failed_members)
 
             await send_context_lines_chunks(ctx, lines)
+
+    @gald.error
+    async def gald_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(self._cooldown_message(error))
+            return
+        raise error
 
     async def _start_add_gym(self, interaction: discord.Interaction, contest_id: int) -> None:
         guild_id = self._guild_id_from_interaction(interaction)

@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from db.repository import GymFeatureRepository, VerifiedUser
-from services.cf_client import CFSubmission, CodeforcesClientBase
+from services.cf_client import CFRequestError, CFSubmission, CodeforcesClientBase
 
 PARTICIPATION_CACHE_SECONDS = 3600
 FORCE_REFRESH_SECONDS = 600
 SUBMISSION_CACHE_SECONDS = 3600
+GYM_SUBMISSION_CACHE_MAX_ENTRIES = 512
+
+
+@dataclass(frozen=True, slots=True)
+class GymParticipationResult:
+    solved_by_discord: dict[int, int]
+    unverified_ids: set[int]
+    failed_ids: set[int]
+
+
 def normalize_problem_index(raw: str) -> str:
     return raw.strip().upper()
 
@@ -38,7 +50,8 @@ class GymService:
     def __init__(self, repo: GymFeatureRepository, cf: CodeforcesClientBase) -> None:
         self._repo = repo
         self._cf = cf
-        self._submission_cache: dict[str, tuple[float, list[CFSubmission]]] = {}
+        self._submission_cache: OrderedDict[str, tuple[float, list[CFSubmission]]] = OrderedDict()
+        self._submission_cache_max_entries = GYM_SUBMISSION_CACHE_MAX_ENTRIES
         self._submission_sem = asyncio.Semaphore(6)
 
     async def verified_map(self, guild_id: int) -> dict[int, VerifiedUser]:
@@ -52,10 +65,15 @@ class GymService:
         if cached is not None:
             ts, payload = cached
             if now_ts - ts < refresh_after_seconds:
+                self._submission_cache.move_to_end(cache_key)
                 return payload
+            self._submission_cache.pop(cache_key, None)
         async with self._submission_sem:
             payload = await self._cf.get_recent_submissions(handle, count=5000)
         self._submission_cache[cache_key] = (time.time(), payload)
+        self._submission_cache.move_to_end(cache_key)
+        while len(self._submission_cache) > self._submission_cache_max_entries:
+            self._submission_cache.popitem(last=False)
         return payload
 
     async def solved_count_for_contest(
@@ -119,7 +137,7 @@ class GymService:
         training_member_ids: list[int],
         verified_by_id: dict[int, VerifiedUser],
         force: bool,
-    ) -> tuple[dict[int, int], set[int]]:
+    ) -> GymParticipationResult:
         now = datetime.now(tz=UTC)
         refresh_age_seconds = FORCE_REFRESH_SECONDS if force else PARTICIPATION_CACHE_SECONDS
         submission_refresh_seconds = FORCE_REFRESH_SECONDS if force else SUBMISSION_CACHE_SECONDS
@@ -129,7 +147,8 @@ class GymService:
 
         solved_by_discord: dict[int, int] = {}
         unverified_ids: set[int] = set()
-        pending: list[tuple[int, str, int]] = []
+        failed_ids: set[int] = set()
+        pending: list[tuple[int, str, int, bool]] = []
 
         for member_id in training_member_ids:
             verified = verified_by_id.get(member_id)
@@ -143,14 +162,22 @@ class GymService:
                     solved_by_discord[member_id] = cached.solved_count
                     continue
             previous_solved_count = cached.solved_count if cached is not None else 0
-            pending.append((member_id, verified.cf_handle, previous_solved_count))
+            pending.append((member_id, verified.cf_handle, previous_solved_count, cached is not None))
 
-        async def _refresh_one(discord_id: int, handle: str, previous_solved_count: int) -> tuple[int, int]:
-            fetched_solved_count = await self.solved_count_for_contest(
-                handle,
-                contest_id,
-                refresh_after_seconds=submission_refresh_seconds,
-            )
+        async def _refresh_one(
+            discord_id: int,
+            handle: str,
+            previous_solved_count: int,
+            has_cached_count: bool,
+        ) -> tuple[int, int | None, bool]:
+            try:
+                fetched_solved_count = await self.solved_count_for_contest(
+                    handle,
+                    contest_id,
+                    refresh_after_seconds=submission_refresh_seconds,
+                )
+            except CFRequestError:
+                return discord_id, previous_solved_count if has_cached_count else None, True
             solved_count = max(previous_solved_count, fetched_solved_count)
             await self._repo.upsert_gym_participation_cache(
                 guild_id,
@@ -159,19 +186,26 @@ class GymService:
                 solved_count,
                 now,
             )
-            return discord_id, solved_count
+            return discord_id, solved_count, False
 
         if pending:
             refreshed = await asyncio.gather(
                 *[
-                    _refresh_one(discord_id, handle, previous_solved_count)
-                    for discord_id, handle, previous_solved_count in pending
+                    _refresh_one(discord_id, handle, previous_solved_count, has_cached_count)
+                    for discord_id, handle, previous_solved_count, has_cached_count in pending
                 ]
             )
-            for discord_id, solved_count in refreshed:
-                solved_by_discord[discord_id] = solved_count
+            for discord_id, solved_count, failed in refreshed:
+                if failed:
+                    failed_ids.add(discord_id)
+                if solved_count is not None:
+                    solved_by_discord[discord_id] = solved_count
 
-        return solved_by_discord, unverified_ids
+        return GymParticipationResult(
+            solved_by_discord=solved_by_discord,
+            unverified_ids=unverified_ids,
+            failed_ids=failed_ids,
+        )
 
     async def problem_rating_summary(self, guild_id: int, contest_id: int, problem_index: str) -> dict[str, float]:
         votes = await self._repo.list_gym_problem_rating_votes(guild_id, contest_id, problem_index)

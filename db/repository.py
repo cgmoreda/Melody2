@@ -13,6 +13,15 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 
+class VerifiedHandleConflict(Exception):
+    """Raised when a Codeforces handle is already linked in a guild."""
+
+    def __init__(self, guild_id: int, cf_handle: str) -> None:
+        super().__init__(f"Codeforces handle {cf_handle!r} is already linked in guild {guild_id}")
+        self.guild_id = guild_id
+        self.cf_handle = cf_handle
+
+
 def _voice_session_lock_key(guild_id: int, discord_id: int) -> int:
     raw = f"{guild_id}:{discord_id}".encode("ascii")
     digest = hashlib.blake2b(raw, digest_size=8).digest()
@@ -170,6 +179,9 @@ class VerificationReadRepository(Protocol):
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         ...
 
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        ...
+
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
         ...
 
@@ -254,6 +266,9 @@ class DailySheetReminderRepository(Protocol):
         ...
 
     async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        ...
+
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
         ...
 
 
@@ -450,6 +465,10 @@ class UserRepositoryBase(abc.ABC):
         """Look up a verified user by their Discord snowflake."""
 
     @abc.abstractmethod
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        """Look up a verified user by Codeforces handle within a guild."""
+
+    @abc.abstractmethod
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
         """Return every verified user in a guild."""
 
@@ -540,6 +559,10 @@ class UserRepositoryBase(abc.ABC):
     @abc.abstractmethod
     async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
         """Mark one guild's daily sheets reminder as sent for the given date."""
+
+    @abc.abstractmethod
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        """Clear a sent marker for one guild/date. Returns True when cleared."""
 
     @abc.abstractmethod
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
@@ -1270,19 +1293,25 @@ class UserRepository(UserRepositoryBase):
     async def upsert(self, user: VerifiedUser) -> None:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO verified_users (discord_id, guild_id, cf_handle, rating)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT(discord_id, guild_id)
-                DO UPDATE SET cf_handle = excluded.cf_handle,
-                              rating = excluded.rating
-                """,
-                user.discord_id,
-                user.guild_id,
-                user.cf_handle,
-                user.rating,
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO verified_users (discord_id, guild_id, cf_handle, rating)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT(discord_id, guild_id)
+                    DO UPDATE SET cf_handle = excluded.cf_handle,
+                                  rating = excluded.rating
+                    """,
+                    user.discord_id,
+                    user.guild_id,
+                    user.cf_handle,
+                    user.rating,
+                )
+            except asyncpg.exceptions.UniqueViolationError as exc:
+                constraint = getattr(exc, "constraint_name", None)
+                if constraint not in (None, "uq_verified_users_guild_cf_handle_ci"):
+                    raise
+                raise VerifiedHandleConflict(user.guild_id, user.cf_handle) from exc
 
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         assert self._pool is not None, "Call init() first"
@@ -1295,6 +1324,29 @@ class UserRepository(UserRepositoryBase):
                 """,
                 discord_id,
                 guild_id,
+            )
+        if row is None:
+            return None
+        return VerifiedUser(
+            discord_id=row["discord_id"],
+            cf_handle=row["cf_handle"],
+            rating=row["rating"],
+            guild_id=row["guild_id"],
+        )
+
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT discord_id, cf_handle, rating, guild_id
+                FROM verified_users
+                WHERE guild_id = $1
+                  AND LOWER(cf_handle) = LOWER($2)
+                LIMIT 1
+                """,
+                guild_id,
+                cf_handle,
             )
         if row is None:
             return None
@@ -1615,6 +1667,21 @@ class UserRepository(UserRepositoryBase):
                 SET last_sent_on = $2
                 WHERE guild_id = $1
                   AND (last_sent_on IS NULL OR last_sent_on < $2)
+                """,
+                guild_id,
+                sent_on,
+            )
+        return result.endswith("1")
+
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE daily_sheet_reminders
+                SET last_sent_on = NULL
+                WHERE guild_id = $1
+                  AND last_sent_on = $2
                 """,
                 guild_id,
                 sent_on,
