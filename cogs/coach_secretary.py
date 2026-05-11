@@ -9,7 +9,7 @@ import discord
 from discord.ext import commands
 
 from db.repository import CoachConfig
-from services.coach_secretary import CoachSecretaryBase
+from services.coach_secretary import SUMMON_BYPASS_SECONDS, CoachSecretaryBase
 
 logger = logging.getLogger(__name__)
 SummonTarget = Union[discord.Member, discord.Role]
@@ -160,6 +160,9 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         if not isinstance(coach_room, discord.VoiceChannel):
             await ctx.send("Coach room channel was not found. Use !coach setup again.")
             return
+        waiting_room = ctx.guild.get_channel(config.waiting_room_id)
+        if not isinstance(waiting_room, discord.VoiceChannel):
+            waiting_room = None
 
         members = self._members_from_summon_target(target)
         if not members:
@@ -170,6 +173,7 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
             guild=ctx.guild,
             coach=ctx.author,
             coach_room=coach_room,
+            waiting_room=waiting_room,
             members=members,
         )
         await ctx.send(self._render_summon_summary(coach_room, result))
@@ -188,6 +192,7 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         guild: discord.Guild,
         coach: discord.Member,
         coach_room: discord.VoiceChannel,
+        waiting_room: discord.VoiceChannel | None,
         members: list[discord.Member],
     ) -> dict[str, int]:
         result = {
@@ -202,11 +207,9 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         for member in members:
             voice_channel = member.voice.channel if member.voice is not None else None
             if voice_channel is None:
+                self._secretary.mark_summoned_member(guild.id, member.id)
                 try:
-                    await member.send(
-                        f"{coach.display_name} asked you to join the coach's office in "
-                        f"{guild.name}: {coach_room.name}."
-                    )
+                    await member.send(self._summon_dm_message(coach, guild, coach_room, waiting_room))
                     result["dm_sent"] += 1
                 except (discord.Forbidden, discord.HTTPException):
                     result["dm_failed"] += 1
@@ -223,6 +226,25 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
                 result["move_failed"] += 1
 
         return result
+
+    @staticmethod
+    def _summon_dm_message(
+        coach: discord.Member,
+        guild: discord.Guild,
+        coach_room: discord.VoiceChannel,
+        waiting_room: discord.VoiceChannel | None,
+    ) -> str:
+        minutes = SUMMON_BYPASS_SECONDS // 60
+        message = (
+            f"{coach.display_name} asked you to join the coach's office in "
+            f"{guild.name}: {coach_room.name}."
+        )
+        if waiting_room is None:
+            return message
+        return (
+            f"{message} If you can only access {waiting_room.name}, join it within "
+            f"{minutes} minutes and I'll move you in automatically."
+        )
 
     @staticmethod
     def _render_summon_summary(coach_room: discord.VoiceChannel, result: dict[str, int]) -> str:

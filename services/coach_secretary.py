@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import abc
 import logging
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 import discord
@@ -13,6 +15,7 @@ from db.repository import CoachConfig, CoachRepository
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT_SECONDS = 300
+SUMMON_BYPASS_SECONDS = 600
 
 
 class CoachSecretaryBase(abc.ABC):
@@ -37,6 +40,10 @@ class CoachSecretaryBase(abc.ABC):
     @abc.abstractmethod
     def clear_notification(self, guild_id: int, member_id: int) -> None:
         """Clear dedupe state for a pending member request."""
+
+    @abc.abstractmethod
+    def mark_summoned_member(self, guild_id: int, member_id: int) -> None:
+        """Allow a summoned member to enter the coach room through the waiting room briefly."""
 
 
 class ApprovalView(discord.ui.View):
@@ -133,10 +140,17 @@ class ApprovalView(discord.ui.View):
 class CoachSecretary(CoachSecretaryBase):
     """Concrete coach routing service with approval workflow."""
 
-    def __init__(self, repo: CoachRepository) -> None:
+    def __init__(
+        self,
+        repo: CoachRepository,
+        *,
+        now_provider: Callable[[], datetime] | None = None,
+    ) -> None:
         self._repo = repo
         self._notified: dict[int, set[int]] = {}
         self._configs: dict[int, CoachConfig] = {}
+        self._summoned_until: dict[int, dict[int, datetime]] = {}
+        self._now = now_provider or (lambda: datetime.now(tz=UTC))
 
     async def get_config(self, guild_id: int) -> Optional[CoachConfig]:
         cached = self._configs.get(guild_id)
@@ -157,12 +171,18 @@ class CoachSecretary(CoachSecretaryBase):
         removed = await self._repo.delete_coach_config(guild_id)
         self._configs.pop(guild_id, None)
         self._notified.pop(guild_id, None)
+        self._summoned_until.pop(guild_id, None)
         return removed
 
     async def handle_waiting_member(self, member: discord.Member, guild: discord.Guild) -> None:
         config = await self.get_config(guild.id)
         if config is None:
             return
+
+        if self._consume_active_summon(guild.id, member.id):
+            moved = await self._move_summoned_waiting_member(member, guild, config)
+            if moved:
+                return
 
         notified = self._notified.setdefault(guild.id, set())
         if member.id in notified:
@@ -190,6 +210,32 @@ class CoachSecretary(CoachSecretaryBase):
         except discord.Forbidden:
             logger.info("Cannot DM waiting member %s in guild %s", member.id, guild.id)
 
+    async def _move_summoned_waiting_member(
+        self,
+        member: discord.Member,
+        guild: discord.Guild,
+        config: CoachConfig,
+    ) -> bool:
+        coach_channel = guild.get_channel(config.coach_channel_id)
+        if not isinstance(coach_channel, discord.VoiceChannel):
+            logger.warning("Coach room channel %s was not found in guild %s", config.coach_channel_id, guild.id)
+            return False
+
+        if member.voice is None or member.voice.channel is None:
+            return False
+
+        try:
+            await member.move_to(coach_channel, reason="Summoned member joined waiting room")
+        except discord.Forbidden:
+            logger.warning("Missing permissions to move summoned member %s in guild %s", member.id, guild.id)
+            return False
+        except discord.HTTPException as exc:
+            logger.warning("Could not move summoned member %s in guild %s: %s", member.id, guild.id, exc)
+            return False
+
+        logger.info("Moved summoned member %s to coach room in guild %s", member.id, guild.id)
+        return True
+
     def clear_notification(self, guild_id: int, member_id: int) -> None:
         notified = self._notified.get(guild_id)
         if notified is None:
@@ -197,3 +243,35 @@ class CoachSecretary(CoachSecretaryBase):
         notified.discard(member_id)
         if not notified:
             self._notified.pop(guild_id, None)
+
+    def mark_summoned_member(self, guild_id: int, member_id: int) -> None:
+        self._prune_expired_summons(guild_id)
+        expires_at = self._current_time() + timedelta(seconds=SUMMON_BYPASS_SECONDS)
+        self._summoned_until.setdefault(guild_id, {})[member_id] = expires_at
+
+    def _consume_active_summon(self, guild_id: int, member_id: int) -> bool:
+        self._prune_expired_summons(guild_id)
+        summoned = self._summoned_until.get(guild_id)
+        if summoned is None or member_id not in summoned:
+            return False
+        del summoned[member_id]
+        if not summoned:
+            self._summoned_until.pop(guild_id, None)
+        return True
+
+    def _prune_expired_summons(self, guild_id: int) -> None:
+        summoned = self._summoned_until.get(guild_id)
+        if not summoned:
+            return
+        now = self._current_time()
+        expired_ids = [member_id for member_id, expires_at in summoned.items() if expires_at <= now]
+        for member_id in expired_ids:
+            del summoned[member_id]
+        if not summoned:
+            self._summoned_until.pop(guild_id, None)
+
+    def _current_time(self) -> datetime:
+        now = self._now()
+        if now.tzinfo is None:
+            return now.replace(tzinfo=UTC)
+        return now.astimezone(UTC)
