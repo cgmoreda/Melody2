@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Optional
 
 import discord
@@ -64,6 +64,20 @@ class DailySheetReminderService:
         self._poll_seconds = max(30, poll_seconds)
         self._now = now_provider or (lambda: datetime.now(tz=UTC))
         self._task: Optional[asyncio.Task[None]] = None
+        self._reminders: dict[int, DailySheetReminderConfig] = {}
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    async def initialize(self) -> None:
+        async with self._init_lock:
+            reminders = await self._repo.list_daily_sheet_reminders()
+            self._reminders = {reminder.guild_id: reminder for reminder in reminders}
+            self._initialized = True
+
+    async def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        await self.initialize()
 
     def start(self) -> None:
         if self._task is None:
@@ -101,7 +115,7 @@ class DailySheetReminderService:
             remind_minute_utc=remind_minute_utc,
             message=clean_message,
         )
-        return DailySheetReminderConfig(
+        config = DailySheetReminderConfig(
             guild_id=guild_id,
             channel_id=channel_id,
             remind_hour_utc=remind_hour_utc,
@@ -109,12 +123,17 @@ class DailySheetReminderService:
             message=clean_message,
             last_sent_on=None,
         )
+        self._reminders[guild_id] = config
+        return config
 
     async def disable_reminder(self, guild_id: int) -> bool:
-        return await self._repo.delete_daily_sheet_reminder(guild_id)
+        removed = await self._repo.delete_daily_sheet_reminder(guild_id)
+        self._reminders.pop(guild_id, None)
+        return removed
 
     async def get_reminder(self, guild_id: int) -> Optional[DailySheetReminderConfig]:
-        return await self._repo.get_daily_sheet_reminder(guild_id)
+        await self._ensure_initialized()
+        return self._reminders.get(guild_id)
 
     async def _run_loop(self) -> None:
         logger.info("Daily sheet reminder loop started (poll=%ss)", self._poll_seconds)
@@ -132,7 +151,8 @@ class DailySheetReminderService:
         else:
             now = now.astimezone(UTC)
 
-        reminders = await self._repo.list_daily_sheet_reminders()
+        await self._ensure_initialized()
+        reminders = list(self._reminders.values())
         for reminder in reminders:
             if not self._is_due(reminder, now):
                 continue
@@ -147,6 +167,32 @@ class DailySheetReminderService:
         target_minutes = reminder.remind_hour_utc * 60 + reminder.remind_minute_utc
         return current_minutes >= target_minutes
 
+    def _cache_reminder_sent(self, guild_id: int, sent_on: date) -> None:
+        config = self._reminders.get(guild_id)
+        if config is None:
+            return
+        self._reminders[guild_id] = DailySheetReminderConfig(
+            guild_id=config.guild_id,
+            channel_id=config.channel_id,
+            remind_hour_utc=config.remind_hour_utc,
+            remind_minute_utc=config.remind_minute_utc,
+            message=config.message,
+            last_sent_on=sent_on,
+        )
+
+    def _cache_reminder_unsent(self, guild_id: int, sent_on: date) -> None:
+        config = self._reminders.get(guild_id)
+        if config is None or config.last_sent_on != sent_on:
+            return
+        self._reminders[guild_id] = DailySheetReminderConfig(
+            guild_id=config.guild_id,
+            channel_id=config.channel_id,
+            remind_hour_utc=config.remind_hour_utc,
+            remind_minute_utc=config.remind_minute_utc,
+            message=config.message,
+            last_sent_on=None,
+        )
+
     async def _send_due_reminder(self, reminder: DailySheetReminderConfig, now: datetime) -> None:
         channel = self._bot.get_channel(reminder.channel_id)
         if not isinstance(channel, discord.TextChannel):
@@ -160,7 +206,9 @@ class DailySheetReminderService:
         sent_on = now.date()
         marked = await self._repo.mark_daily_sheet_reminder_sent(reminder.guild_id, sent_on)
         if not marked:
+            self._cache_reminder_sent(reminder.guild_id, sent_on)
             return
+        self._cache_reminder_sent(reminder.guild_id, sent_on)
 
         try:
             await channel.send(
@@ -181,6 +229,7 @@ class DailySheetReminderService:
                 reminder.channel_id,
                 reminder.guild_id,
             )
+            self._cache_reminder_unsent(reminder.guild_id, sent_on)
             return
         except discord.HTTPException as exc:
             logger.warning(

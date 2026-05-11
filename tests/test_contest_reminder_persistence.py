@@ -15,6 +15,8 @@ class _PersistentReminderRepo:
         self._sent: set[tuple[int, int, str, str, str]] = set()
         self.has_calls = 0
         self.mark_calls = 0
+        self.claim_calls = 0
+        self.clear_calls = 0
 
     async def get_reminder_channels(self) -> list[tuple[int, int]]:
         return []
@@ -43,10 +45,44 @@ class _PersistentReminderRepo:
         platform: str = "codeforces",
     ) -> bool:
         self.mark_calls += 1
+        return await self.claim_contest_reminder_sent(
+            guild_id,
+            channel_id,
+            contest_id,
+            reminder_type,
+            sent_at,
+            platform,
+        )
+
+    async def claim_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        sent_at: datetime,
+        platform: str = "codeforces",
+    ) -> bool:
+        self.claim_calls += 1
         key = (guild_id, channel_id, platform, contest_id, reminder_type)
         if key in self._sent:
             return False
         self._sent.add(key)
+        return True
+
+    async def clear_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        platform: str = "codeforces",
+    ) -> bool:
+        self.clear_calls += 1
+        key = (guild_id, channel_id, platform, contest_id, reminder_type)
+        if key not in self._sent:
+            return False
+        self._sent.remove(key)
         return True
 
 
@@ -119,8 +155,9 @@ async def test_concurrent_reminder_attempts_send_once_and_mark_once() -> None:
     await asyncio.gather(_attempt(), _attempt())
 
     assert channel.messages == ["[Reminder] test starts in 24h"]
-    assert repo.mark_calls == 1
-    assert repo.has_calls >= 1
+    assert repo.claim_calls == 1
+    assert repo.mark_calls == 0
+    assert repo.has_calls == 0
 
 
 @pytest.mark.asyncio
@@ -159,11 +196,12 @@ async def test_persisted_dedupe_survives_restart_like_new_service_instance() -> 
     )
 
     assert channel.messages == ["[Reminder] test starts in 1h"]
-    assert repo.mark_calls == 1
+    assert repo.claim_calls == 2
+    assert repo.mark_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_existing_persisted_dedupe_key_skips_send_and_mark() -> None:
+async def test_existing_persisted_dedupe_key_skips_send_after_failed_claim() -> None:
     repo = _PersistentReminderRepo()
     repo._sent.add((123, 456, "codeforces", "789", "24h"))
     service = _service(repo)
@@ -187,8 +225,46 @@ async def test_existing_persisted_dedupe_key_skips_send_and_mark() -> None:
     )
 
     assert channel.messages == []
-    assert repo.has_calls >= 1
+    assert repo.has_calls == 0
+    assert repo.claim_calls == 1
     assert repo.mark_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_send_forbidden_clears_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Forbidden(Exception):
+        pass
+
+    class _ForbiddenTextChannel(_FakeTextChannel):
+        async def send(self, message: str) -> None:
+            raise _Forbidden()
+
+    monkeypatch.setattr(contest_reminder_module.discord, "Forbidden", _Forbidden)
+
+    repo = _PersistentReminderRepo()
+    service = _service(repo)
+    channel = _ForbiddenTextChannel(456)
+    contest = Contest(
+        platform="codeforces",
+        contest_id="790",
+        name="Codeforces Round 790 (Div. 2)",
+        start_time_seconds=int(datetime.now(tz=UTC).timestamp()) + 24 * 3600,
+    )
+
+    await service._maybe_send_reminder(
+        guild_id=123,
+        channel=channel,  # type: ignore[arg-type]
+        contest=contest,
+        reminder_type="24h",
+        target=timedelta(hours=24),
+        window=timedelta(minutes=5),
+        message="[Reminder] forbidden",
+        until_start=timedelta(hours=24) - timedelta(seconds=1),
+    )
+
+    assert repo.claim_calls == 1
+    assert repo.clear_calls == 1
+    assert repo._sent == set()
 
 
 @pytest.mark.asyncio
@@ -236,7 +312,8 @@ async def test_atcoder_contest_dedupe_independent_from_codeforces() -> None:
         "[Reminder] CF 100 starts in 1h",
         "[Reminder] AC 100 starts in 1h",
     ]
-    assert repo.mark_calls == 2
+    assert repo.claim_calls == 2
+    assert repo.mark_calls == 0
 
 
 @pytest.mark.asyncio
@@ -284,4 +361,5 @@ async def test_tick_sends_codeforces_div_reminders_only_and_keeps_atcoder(
         "[Reminder] Codeforces Round 1 (Div. 2) starts in 24h",
         "[Reminder] AtCoder Beginner Contest 999 starts in 24h",
     ]
-    assert repo.mark_calls == 2
+    assert repo.claim_calls == 2
+    assert repo.mark_calls == 0

@@ -179,13 +179,6 @@ class GymService:
             except CFRequestError:
                 return discord_id, previous_solved_count if has_cached_count else None, True
             solved_count = max(previous_solved_count, fetched_solved_count)
-            await self._repo.upsert_gym_participation_cache(
-                guild_id,
-                contest_id,
-                discord_id,
-                solved_count,
-                now,
-            )
             return discord_id, solved_count, False
 
         if pending:
@@ -195,11 +188,15 @@ class GymService:
                     for discord_id, handle, previous_solved_count, has_cached_count in pending
                 ]
             )
+            cache_rows: list[tuple[int, int, int, int, datetime]] = []
             for discord_id, solved_count, failed in refreshed:
                 if failed:
                     failed_ids.add(discord_id)
                 if solved_count is not None:
                     solved_by_discord[discord_id] = solved_count
+                if not failed and solved_count is not None:
+                    cache_rows.append((guild_id, contest_id, discord_id, solved_count, now))
+            await self._repo.upsert_many_gym_participation_cache(cache_rows)
 
         return GymParticipationResult(
             solved_by_discord=solved_by_discord,

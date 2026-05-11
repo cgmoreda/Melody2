@@ -65,6 +65,12 @@ class _FakeRepo:
     ) -> None:
         self.participation_upserts.append((guild_id, contest_id, discord_id, solved_count, checked_at))
 
+    async def upsert_many_gym_participation_cache(
+        self,
+        rows: list[tuple[int, int, int, int, datetime]],
+    ) -> None:
+        self.participation_upserts.extend(rows)
+
 
 class _FakeCF:
     def __init__(self, submissions: list[CFSubmission]) -> None:

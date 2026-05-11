@@ -20,8 +20,10 @@ class _FakeRepo:
         self.cleared: list[tuple[int, date]] = []
         self.upserts: list[dict[str, object]] = []
         self.deleted: list[int] = []
+        self.list_calls = 0
 
     async def list_daily_sheet_reminders(self) -> list[DailySheetReminderConfig]:
+        self.list_calls += 1
         return list(self.configs)
 
     async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
@@ -75,6 +77,17 @@ class _FakeRepo:
                 "remind_minute_utc": remind_minute_utc,
                 "message": message,
             }
+        )
+        self.configs = [config for config in self.configs if config.guild_id != guild_id]
+        self.configs.append(
+            DailySheetReminderConfig(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                remind_hour_utc=remind_hour_utc,
+                remind_minute_utc=remind_minute_utc,
+                message=message,
+                last_sent_on=None,
+            )
         )
 
     async def delete_daily_sheet_reminder(self, guild_id: int) -> bool:
@@ -171,6 +184,7 @@ async def test_daily_sheet_reminder_tick_sends_due_reminder_once_per_day(
     assert channel.sent_kwargs[0]["allowed_mentions"].to_dict() == {"parse": ["everyone"]}
     assert repo.marked == [(1, date(2026, 5, 4))]
     assert repo.cleared == []
+    assert repo.list_calls == 1
 
 
 @pytest.mark.asyncio
@@ -345,6 +359,7 @@ async def test_daily_sheet_reminder_tick_waits_until_configured_time(
 
     assert channel.sent == []
     assert repo.marked == []
+    assert repo.list_calls == 1
 
 
 @pytest.mark.asyncio
