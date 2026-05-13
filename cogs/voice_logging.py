@@ -136,6 +136,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             tuple[int, int],
             tuple[PendingVoiceStart, asyncio.Task[None]],
         ] = {}
+        self._persisted_voice_sessions: set[tuple[int, int]] = set()
         self._tracked_keywords_cache: dict[int, list[str]] = {}
 
     def cog_unload(self) -> None:
@@ -145,6 +146,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         for _, task in self._pending_voice_starts.values():
             task.cancel()
         self._pending_voice_starts.clear()
+        self._persisted_voice_sessions.clear()
 
     async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
         cached = self._tracked_keywords_cache.get(guild_id)
@@ -213,6 +215,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             is_tracked=tracked,
             started_at=started_at,
         )
+        self._persisted_voice_sessions.add(self._voice_session_key(guild_id, member_id))
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -230,10 +233,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             active_member_ids = set(active_tracked_by_member)
             open_tracked_member_ids = await self._repo.get_open_tracked_voice_member_ids(guild.id)
+            for member_id in open_tracked_member_ids:
+                self._persisted_voice_sessions.add(self._voice_session_key(guild.id, member_id))
 
             for stale_member_id in open_tracked_member_ids - active_member_ids:
                 self._cancel_pending_voice_start(guild.id, stale_member_id)
-                await self._repo.close_open_voice_sessions(guild.id, stale_member_id, now)
+                await self._close_voice_session(guild.id, stale_member_id, now)
 
             for member_id, voice_channel in active_tracked_by_member.items():
                 self._cancel_pending_voice_start(guild.id, member_id)
@@ -273,12 +278,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         canceled_pending = self._cancel_pending_voice_start(member.guild.id, member.id)
         self._stop_watchdog(member.id)
 
-        before_is_tracked = isinstance(before.channel, discord.VoiceChannel) and await self._is_tracked_channel(
-            member.guild.id,
-            before.channel,
-        )
-        if before_is_tracked and (canceled_pending is None or canceled_pending[1].done()):
-            await self._repo.close_open_voice_sessions(member.guild.id, member.id, now)
+        before_is_voice = isinstance(before.channel, discord.VoiceChannel)
+        if before_is_voice and (canceled_pending is None or canceled_pending[1].done()):
+            session_key = self._voice_session_key(member.guild.id, member.id)
+            should_close = session_key in self._persisted_voice_sessions
+            if not should_close:
+                should_close = await self._is_tracked_channel(member.guild.id, before.channel)
+            if should_close:
+                await self._close_voice_session(member.guild.id, member.id, now)
 
         if not isinstance(after.channel, discord.VoiceChannel):
             return
@@ -312,6 +319,25 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     def _clear_watchdog_if_current(self, member_id: int, task: asyncio.Task[None]) -> None:
         if self._watchdogs.get(member_id) is task:
             self._watchdogs.pop(member_id, None)
+
+    async def _close_voice_session(self, guild_id: int, member_id: int, ended_at: datetime) -> int:
+        closed = await self._repo.close_open_voice_sessions(guild_id, member_id, ended_at)
+        self._persisted_voice_sessions.discard(self._voice_session_key(guild_id, member_id))
+        return closed
+
+    async def _close_now_untracked_voice_sessions(self, guild: discord.Guild, ended_at: datetime) -> int:
+        closed_total = 0
+        for voice_channel in guild.voice_channels:
+            if await self._is_tracked_channel(guild.id, voice_channel):
+                continue
+            for member in voice_channel.members:
+                if member.bot:
+                    continue
+                session_key = self._voice_session_key(guild.id, member.id)
+                if session_key not in self._persisted_voice_sessions:
+                    continue
+                closed_total += await self._close_voice_session(guild.id, member.id, ended_at)
+        return closed_total
 
     @staticmethod
     def _voice_session_key(guild_id: int, member_id: int) -> tuple[int, int]:
@@ -373,6 +399,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 channel_name=pending.channel_name,
                 started_at=pending.started_at,
             )
+            self._persisted_voice_sessions.add(key)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -838,7 +865,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                             pass
                     continue
 
-                await self._repo.close_open_voice_sessions(guild.id, member.id, datetime.now(tz=UTC))
+                await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
                     try:
                         if removal_action == "afk":
@@ -1356,7 +1383,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             else:
                 await self._config.reset_text(ctx.guild.id, "voice_tracked_keywords")
             self._tracked_keywords_cache.pop(ctx.guild.id, None)
-            await ctx.send(f"Removed `{keyword}` from tracked keywords.")
+            closed = await self._close_now_untracked_voice_sessions(ctx.guild, datetime.now(tz=UTC))
+            message = f"Removed `{keyword}` from tracked keywords."
+            if closed:
+                message = f"{message} Closed **{closed}** now-untracked voice session(s)."
+            await ctx.send(message)
             return
 
         await ctx.send(

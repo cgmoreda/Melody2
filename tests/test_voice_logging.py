@@ -119,14 +119,43 @@ class _FakeConfigServiceWithMaxLines:
         return ""
 
 
+class _MutableTrackedKeywordsConfig(_FakeConfigServiceWithMaxLines):
+    def __init__(self, raw_keywords: str) -> None:
+        self.raw_keywords = raw_keywords
+        self.set_calls: list[tuple[int, str, str]] = []
+        self.reset_calls: list[tuple[int, str]] = []
+
+    async def get_text(self, guild_id: int, key: str) -> str:
+        if key == "voice_tracked_keywords":
+            return self.raw_keywords
+        return await super().get_text(guild_id, key)
+
+    async def set_text(self, guild_id: int, key: str, value: str) -> str:
+        self.set_calls.append((guild_id, key, value))
+        if key == "voice_tracked_keywords":
+            self.raw_keywords = value
+        return value
+
+    async def reset_text(self, guild_id: int, key: str) -> str:
+        self.reset_calls.append((guild_id, key))
+        if key == "voice_tracked_keywords":
+            self.raw_keywords = ""
+        return ""
+
+
 class _FakeContext:
-    def __init__(self, guild: Any, author_id: int = 1) -> None:
+    def __init__(self, guild: Any, author_id: int = 1, *, administrator: bool = False) -> None:
         self.guild = guild
         self.sent_messages: list[str] = []
+        admin_value = administrator
+
+        class _Permissions:
+            administrator = admin_value
 
         class _Author:
             id = author_id
             display_name = "TestUser"
+            guild_permissions = _Permissions()
 
         self.author = _Author()
 
@@ -628,6 +657,70 @@ async def test_voice_state_leave_before_delay_writes_no_session(
     assert repo.replaced_calls == []
     assert repo.started_calls == []
     assert repo.closed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_state_closes_persisted_session_after_channel_is_untracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(44)
+    office = _FakeVoiceChannel(1004, "Coach Office", [member])
+    coffee = _FakeVoiceChannel(1005, "Coffee Room", [])
+    guild = _FakeGuild(902, [office, coffee])
+    member.guild = guild
+    member.voice = _FakeVoiceState(coffee)
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_MutableTrackedKeywordsConfig(""),  # type: ignore[arg-type]
+    )
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
+
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(office),  # type: ignore[arg-type]
+        _FakeVoiceState(coffee),  # type: ignore[arg-type]
+    )
+
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+    assert repo.replaced_calls == []
+
+
+@pytest.mark.asyncio
+async def test_track_remove_closes_sessions_in_channels_that_become_untracked() -> None:
+    member = _FakeMember(45)
+    office = _FakeVoiceChannel(1006, "Coach Office", [member])
+    guild = _FakeGuild(903, [office])
+
+    repo = _FakeRepo()
+    config = _MutableTrackedKeywordsConfig("office")
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=config,  # type: ignore[arg-type]
+    )
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+    ctx = _FakeContext(guild, administrator=True)
+
+    await cog._handle_track(ctx, ("remove", "office"))  # type: ignore[arg-type]
+
+    assert config.raw_keywords == ""
+    assert config.reset_calls == [(guild.id, "voice_tracked_keywords")]
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+    assert ctx.sent_messages == [
+        "Removed `office` from tracked keywords. Closed **1** now-untracked voice session(s)."
+    ]
 
 
 # ---------------------------------------------------------------------------
