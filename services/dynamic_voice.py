@@ -93,13 +93,17 @@ class DynamicVoiceManager:
         """Return True if *member* is allowed in the dynamic channel.
 
         Solo channels: always allowed.
-        Creator is always allowed (when known; ``creator_id == 0`` means unknown after a restart).
-        Duo/Team channels: member must have a role whose 'Team ' suffix
-        matches the channel label (e.g. label 'Assiut Duo' requires 'Team Assiut').
+        Duo channels: always allowed.
+        Coaches/admins are always allowed.
+        Team channel creators are always allowed when known.
+        Team channels otherwise require a role whose 'Team ' suffix
+        matches the channel label (e.g. label 'Assiut Team' requires 'Team Assiut').
         """
         info = self.get_tracked_info(channel.id)
         if info is None:
             return True  # not tracked → no restriction
+        if self._is_coach_or_admin(member):
+            return True
         if info.channel_type in (ChannelType.SOLO, ChannelType.DUO):
             return True
         # Only apply the creator shortcut when the creator is known (creator_id > 0).
@@ -242,6 +246,23 @@ class DynamicVoiceManager:
         return None
 
     @staticmethod
+    def _role_is_coach_or_admin(role: discord.Role) -> bool:
+        """Return True for coach roles or roles with administrator permissions."""
+        role_name = getattr(role, "name", "").casefold()
+        if "coach" in role_name:
+            return True
+        permissions = getattr(role, "permissions", None)
+        return bool(getattr(permissions, "administrator", False))
+
+    @classmethod
+    def _is_coach_or_admin(cls, member: discord.Member) -> bool:
+        """Return True when a member should bypass dynamic voice access checks."""
+        guild_permissions = getattr(member, "guild_permissions", None)
+        if getattr(guild_permissions, "administrator", False):
+            return True
+        return any(cls._role_is_coach_or_admin(role) for role in getattr(member, "roles", ()))
+
+    @staticmethod
     def _extract_group_from_label(label: str, channel_type: ChannelType) -> Optional[str]:
         """Extract the group name from a channel label.
 
@@ -285,7 +306,7 @@ class DynamicVoiceManager:
         """Build permission overwrites for a new dynamic channel.
 
         Solo/Duo: no restrictions (inherits category permissions).
-        Team: deny @everyone connect, allow matching Team role.
+        Team: deny @everyone connect, allow matching Team role and coach/admin roles.
         """
         if channel_type in (ChannelType.SOLO, ChannelType.DUO):
             return {}  # inherit defaults
@@ -303,6 +324,10 @@ class DynamicVoiceManager:
         else:
             # Fallback: allow creator explicitly when they have no Team role
             overwrites[member] = discord.PermissionOverwrite(connect=True)
+
+        for role in getattr(member.guild, "roles", ()):
+            if self._role_is_coach_or_admin(role):
+                overwrites[role] = discord.PermissionOverwrite(connect=True)
 
         return overwrites
 

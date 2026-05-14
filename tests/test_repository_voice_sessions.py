@@ -132,16 +132,16 @@ async def test_tracked_voice_summary_uses_merged_intervals_for_each_window() -> 
     conn = _FakeVoiceConnection(
         fetch_results=[
             [
-                {"discord_id": 10, "start_ts": now - timedelta(hours=6), "end_ts": now},
-                {"discord_id": 10, "start_ts": now - timedelta(hours=2), "end_ts": now},
-            ],
-            [
-                {"discord_id": 10, "start_ts": now - timedelta(hours=5), "end_ts": now},
-                {"discord_id": 10, "start_ts": now - timedelta(hours=1), "end_ts": now},
-            ],
-            [
-                {"discord_id": 10, "start_ts": now - timedelta(hours=6), "end_ts": now},
-                {"discord_id": 10, "start_ts": now - timedelta(hours=2), "end_ts": now},
+                {
+                    "discord_id": 10,
+                    "start_ts": week_since - timedelta(hours=1),
+                    "end_ts": week_since + timedelta(hours=2),
+                },
+                {
+                    "discord_id": 10,
+                    "start_ts": month_since - timedelta(hours=1),
+                    "end_ts": month_since + timedelta(hours=2),
+                },
             ],
         ]
     )
@@ -156,11 +156,12 @@ async def test_tracked_voice_summary_uses_merged_intervals_for_each_window() -> 
 
     assert summary == {
         10: {
-            "week": 5 * 3600.0,
-            "month": 6 * 3600.0,
+            "week": 2 * 3600.0,
+            "month": 5 * 3600.0,
             "all_time": 6 * 3600.0,
         }
     }
+    assert len(conn.fetches) == 1
 
 
 @pytest.mark.asyncio
@@ -219,3 +220,28 @@ async def test_start_voice_session_closes_existing_open_session_before_insert() 
     assert "UPDATE voice_sessions SET ended_at = GREATEST(started_at, $3)" in statements[1]
     assert "INSERT INTO voice_sessions" in statements[2]
     assert conn.executed[1][1] == (1, 10, started_at)
+
+
+@pytest.mark.asyncio
+async def test_replace_voice_session_closes_and_optionally_inserts_in_one_transaction() -> None:
+    started_at = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    ended_at = started_at + timedelta(minutes=5)
+    conn = _FakeVoiceConnection()
+    repo = _repo_with_conn(conn)
+
+    await repo.replace_voice_session(
+        guild_id=1,
+        discord_id=10,
+        ended_at=ended_at,
+        channel_id=20,
+        channel_name="Solo Room A",
+        started_at=started_at,
+    )
+
+    statements = [statement for statement, _ in conn.executed]
+    assert conn.transaction_events == ["enter", "exit"]
+    assert "SELECT pg_advisory_xact_lock($1)" in statements[0]
+    assert "UPDATE voice_sessions SET ended_at = GREATEST(started_at, $3)" in statements[1]
+    assert "INSERT INTO voice_sessions" in statements[2]
+    assert conn.executed[1][1] == (1, 10, ended_at)
+    assert conn.executed[2][1] == (1, 10, 20, "Solo Room A", started_at)

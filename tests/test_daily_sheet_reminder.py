@@ -10,16 +10,20 @@ from cogs.daily_sheets import DailySheetsCog
 from db.repository import DailySheetReminderConfig
 import services.daily_sheet_reminder as daily_sheet_module
 from services.daily_sheet_reminder import DailySheetReminderService, parse_utc_time
+from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 
 
 class _FakeRepo:
     def __init__(self, configs: list[DailySheetReminderConfig] | None = None) -> None:
         self.configs = configs or []
         self.marked: list[tuple[int, date]] = []
+        self.cleared: list[tuple[int, date]] = []
         self.upserts: list[dict[str, object]] = []
         self.deleted: list[int] = []
+        self.list_calls = 0
 
     async def list_daily_sheet_reminders(self) -> list[DailySheetReminderConfig]:
+        self.list_calls += 1
         return list(self.configs)
 
     async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
@@ -36,6 +40,22 @@ class _FakeRepo:
                 remind_minute_utc=config.remind_minute_utc,
                 message=config.message,
                 last_sent_on=sent_on,
+            )
+            return True
+        return False
+
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        self.cleared.append((guild_id, sent_on))
+        for index, config in enumerate(self.configs):
+            if config.guild_id != guild_id or config.last_sent_on != sent_on:
+                continue
+            self.configs[index] = DailySheetReminderConfig(
+                guild_id=config.guild_id,
+                channel_id=config.channel_id,
+                remind_hour_utc=config.remind_hour_utc,
+                remind_minute_utc=config.remind_minute_utc,
+                message=config.message,
+                last_sent_on=None,
             )
             return True
         return False
@@ -58,6 +78,17 @@ class _FakeRepo:
                 "message": message,
             }
         )
+        self.configs = [config for config in self.configs if config.guild_id != guild_id]
+        self.configs.append(
+            DailySheetReminderConfig(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                remind_hour_utc=remind_hour_utc,
+                remind_minute_utc=remind_minute_utc,
+                message=message,
+                last_sent_on=None,
+            )
+        )
 
     async def delete_daily_sheet_reminder(self, guild_id: int) -> bool:
         self.deleted.append(guild_id)
@@ -75,9 +106,11 @@ class _FakeTextChannel:
         self.name = name
         self.mention = f"#{name}"
         self.sent: list[str] = []
+        self.sent_kwargs: list[dict[str, object]] = []
 
-    async def send(self, message: str) -> None:
+    async def send(self, message: str, **kwargs: object) -> None:
         self.sent.append(message)
+        self.sent_kwargs.append(kwargs)
 
 
 class _FakeBot:
@@ -147,8 +180,155 @@ async def test_daily_sheet_reminder_tick_sends_due_reminder_once_per_day(
     await service._tick()
     await service._tick()
 
-    assert channel.sent == ["Update daily sheets."]
+    assert channel.sent == ["@everyone Update daily sheets."]
+    assert channel.sent_kwargs[0]["allowed_mentions"].to_dict() == {"parse": ["everyone"]}
     assert repo.marked == [(1, date(2026, 5, 4))]
+    assert repo.cleared == []
+    assert repo.list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_daily_sheet_reminder_claims_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daily_sheet_module.discord, "TextChannel", _FakeTextChannel)
+    now = datetime(2026, 5, 4, 20, 31, tzinfo=UTC)
+    repo = _FakeRepo(
+        [
+            DailySheetReminderConfig(
+                guild_id=1,
+                channel_id=99,
+                remind_hour_utc=20,
+                remind_minute_utc=30,
+                message="Update daily sheets.",
+                last_sent_on=None,
+            )
+        ]
+    )
+
+    class _AssertingTextChannel(_FakeTextChannel):
+        async def send(self, message: str, **kwargs: object) -> None:
+            assert repo.configs[0].last_sent_on == date(2026, 5, 4)
+            await super().send(message, **kwargs)
+
+    channel = _AssertingTextChannel(99)
+    service = DailySheetReminderService(
+        bot=_FakeBot({99: channel}),  # type: ignore[arg-type]
+        repo=repo,
+        now_provider=lambda: now,
+    )
+
+    await service._tick()
+
+    assert channel.sent == ["@everyone Update daily sheets."]
+
+
+@pytest.mark.asyncio
+async def test_daily_sheet_reminder_does_not_duplicate_everyone_mention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daily_sheet_module.discord, "TextChannel", _FakeTextChannel)
+    channel = _FakeTextChannel(99)
+    now = datetime(2026, 5, 4, 20, 31, tzinfo=UTC)
+    repo = _FakeRepo(
+        [
+            DailySheetReminderConfig(
+                guild_id=1,
+                channel_id=99,
+                remind_hour_utc=20,
+                remind_minute_utc=30,
+                message="@everyone Update daily sheets.",
+                last_sent_on=None,
+            )
+        ]
+    )
+    service = DailySheetReminderService(
+        bot=_FakeBot({99: channel}),  # type: ignore[arg-type]
+        repo=repo,
+        now_provider=lambda: now,
+    )
+
+    await service._tick()
+
+    assert channel.sent == ["@everyone Update daily sheets."]
+
+
+@pytest.mark.asyncio
+async def test_daily_sheet_reminder_clears_claim_on_forbidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Forbidden(Exception):
+        pass
+
+    class _FailingTextChannel(_FakeTextChannel):
+        async def send(self, message: str, **kwargs: object) -> None:
+            raise _Forbidden()
+
+    monkeypatch.setattr(daily_sheet_module.discord, "TextChannel", _FakeTextChannel)
+    monkeypatch.setattr(daily_sheet_module.discord, "Forbidden", _Forbidden)
+    channel = _FailingTextChannel(99)
+    now = datetime(2026, 5, 4, 20, 31, tzinfo=UTC)
+    repo = _FakeRepo(
+        [
+            DailySheetReminderConfig(
+                guild_id=1,
+                channel_id=99,
+                remind_hour_utc=20,
+                remind_minute_utc=30,
+                message="Update daily sheets.",
+                last_sent_on=None,
+            )
+        ]
+    )
+    service = DailySheetReminderService(
+        bot=_FakeBot({99: channel}),  # type: ignore[arg-type]
+        repo=repo,
+        now_provider=lambda: now,
+    )
+
+    await service._tick()
+
+    assert repo.marked == [(1, date(2026, 5, 4))]
+    assert repo.cleared == [(1, date(2026, 5, 4))]
+    assert repo.configs[0].last_sent_on is None
+
+
+@pytest.mark.asyncio
+async def test_daily_sheet_reminder_keeps_claim_on_ambiguous_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Forbidden(Exception):
+        pass
+
+    class _HTTPException(Exception):
+        pass
+
+    class _FailingTextChannel(_FakeTextChannel):
+        async def send(self, message: str, **kwargs: object) -> None:
+            raise _HTTPException("unknown delivery state")
+
+    monkeypatch.setattr(daily_sheet_module.discord, "TextChannel", _FakeTextChannel)
+    monkeypatch.setattr(daily_sheet_module.discord, "Forbidden", _Forbidden)
+    monkeypatch.setattr(daily_sheet_module.discord, "HTTPException", _HTTPException)
+    channel = _FailingTextChannel(99)
+    now = datetime(2026, 5, 4, 20, 31, tzinfo=UTC)
+    repo = _FakeRepo(
+        [
+            DailySheetReminderConfig(
+                guild_id=1,
+                channel_id=99,
+                remind_hour_utc=20,
+                remind_minute_utc=30,
+                message="Update daily sheets.",
+                last_sent_on=None,
+            )
+        ]
+    )
+    service = DailySheetReminderService(
+        bot=_FakeBot({99: channel}),  # type: ignore[arg-type]
+        repo=repo,
+        now_provider=lambda: now,
+    )
+
+    await service._tick()
+
+    assert repo.marked == [(1, date(2026, 5, 4))]
+    assert repo.cleared == []
+    assert repo.configs[0].last_sent_on == date(2026, 5, 4)
 
 
 @pytest.mark.asyncio
@@ -179,6 +359,7 @@ async def test_daily_sheet_reminder_tick_waits_until_configured_time(
 
     assert channel.sent == []
     assert repo.marked == []
+    assert repo.list_calls == 1
 
 
 @pytest.mark.asyncio
@@ -204,6 +385,23 @@ async def test_set_reminder_persists_clean_message() -> None:
             "message": "Update the sheet.",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_set_reminder_rejects_message_too_long_after_everyone_prefix() -> None:
+    repo = _FakeRepo()
+    service = DailySheetReminderService(bot=_FakeBot({}), repo=repo)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="including the @everyone mention"):
+        await service.set_reminder(
+            guild_id=1,
+            channel_id=2,
+            remind_hour_utc=9,
+            remind_minute_utc=5,
+            message="x" * DISCORD_MESSAGE_CHAR_LIMIT,
+        )
+
+    assert repo.upserts == []
 
 
 @pytest.mark.asyncio

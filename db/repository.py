@@ -13,6 +13,15 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 
+class VerifiedHandleConflict(Exception):
+    """Raised when a Codeforces handle is already linked in a guild."""
+
+    def __init__(self, guild_id: int, cf_handle: str) -> None:
+        super().__init__(f"Codeforces handle {cf_handle!r} is already linked in guild {guild_id}")
+        self.guild_id = guild_id
+        self.cf_handle = cf_handle
+
+
 def _voice_session_lock_key(guild_id: int, discord_id: int) -> int:
     raw = f"{guild_id}:{discord_id}".encode("ascii")
     digest = hashlib.blake2b(raw, digest_size=8).digest()
@@ -170,6 +179,9 @@ class VerificationReadRepository(Protocol):
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         ...
 
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        ...
+
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
         ...
 
@@ -228,6 +240,27 @@ class ReminderRepository(Protocol):
     ) -> bool:
         ...
 
+    async def claim_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        sent_at: datetime,
+        platform: str = "codeforces",
+    ) -> bool:
+        ...
+
+    async def clear_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        platform: str = "codeforces",
+    ) -> bool:
+        ...
+
     async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
         ...
 
@@ -256,6 +289,9 @@ class DailySheetReminderRepository(Protocol):
     async def mark_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
         ...
 
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        ...
+
 
 class CoachRepository(Protocol):
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
@@ -281,6 +317,18 @@ class VoiceRepository(Protocol):
         ...
 
     async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
+        ...
+
+    async def replace_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        ended_at: datetime,
+        *,
+        channel_id: Optional[int] = None,
+        channel_name: Optional[str] = None,
+        started_at: Optional[datetime] = None,
+    ) -> int:
         ...
 
     async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
@@ -422,6 +470,12 @@ class GymRepository(Protocol):
     ) -> None:
         ...
 
+    async def upsert_many_gym_participation_cache(
+        self,
+        rows: Iterable[tuple[int, int, int, int, datetime]],
+    ) -> None:
+        ...
+
     async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:
         ...
 
@@ -448,6 +502,10 @@ class UserRepositoryBase(abc.ABC):
     @abc.abstractmethod
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         """Look up a verified user by their Discord snowflake."""
+
+    @abc.abstractmethod
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        """Look up a verified user by Codeforces handle within a guild."""
 
     @abc.abstractmethod
     async def get_all(self, guild_id: int) -> list[VerifiedUser]:
@@ -510,6 +568,29 @@ class UserRepositoryBase(abc.ABC):
         """Record one sent reminder. Returns True when inserted, False when it already existed."""
 
     @abc.abstractmethod
+    async def claim_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        sent_at: datetime,
+        platform: str = "codeforces",
+    ) -> bool:
+        """Atomically claim one reminder dispatch key before sending."""
+
+    @abc.abstractmethod
+    async def clear_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        platform: str = "codeforces",
+    ) -> bool:
+        """Clear a claimed reminder dispatch key. Returns True when deleted."""
+
+    @abc.abstractmethod
     async def cleanup_old_sent_contest_reminders(self, before: datetime) -> int:
         """Delete old persisted reminder dispatch rows and return deleted row count."""
 
@@ -542,6 +623,10 @@ class UserRepositoryBase(abc.ABC):
         """Mark one guild's daily sheets reminder as sent for the given date."""
 
     @abc.abstractmethod
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        """Clear a sent marker for one guild/date. Returns True when cleared."""
+
+    @abc.abstractmethod
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         """Return coach config for a guild, or None."""
 
@@ -568,6 +653,19 @@ class UserRepositoryBase(abc.ABC):
     @abc.abstractmethod
     async def close_open_voice_sessions(self, guild_id: int, discord_id: int, ended_at: datetime) -> int:
         """Close all open voice sessions for a user in a guild."""
+
+    @abc.abstractmethod
+    async def replace_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        ended_at: datetime,
+        *,
+        channel_id: Optional[int] = None,
+        channel_name: Optional[str] = None,
+        started_at: Optional[datetime] = None,
+    ) -> int:
+        """Close existing open sessions and optionally insert a new tracked session."""
 
     @abc.abstractmethod
     async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
@@ -713,6 +811,13 @@ class UserRepositoryBase(abc.ABC):
         checked_at: datetime,
     ) -> None:
         """Create or update one participation cache row."""
+
+    @abc.abstractmethod
+    async def upsert_many_gym_participation_cache(
+        self,
+        rows: Iterable[tuple[int, int, int, int, datetime]],
+    ) -> None:
+        """Create or update multiple participation cache rows."""
 
     @abc.abstractmethod
     async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:
@@ -1270,19 +1375,25 @@ class UserRepository(UserRepositoryBase):
     async def upsert(self, user: VerifiedUser) -> None:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO verified_users (discord_id, guild_id, cf_handle, rating)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT(discord_id, guild_id)
-                DO UPDATE SET cf_handle = excluded.cf_handle,
-                              rating = excluded.rating
-                """,
-                user.discord_id,
-                user.guild_id,
-                user.cf_handle,
-                user.rating,
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO verified_users (discord_id, guild_id, cf_handle, rating)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT(discord_id, guild_id)
+                    DO UPDATE SET cf_handle = excluded.cf_handle,
+                                  rating = excluded.rating
+                    """,
+                    user.discord_id,
+                    user.guild_id,
+                    user.cf_handle,
+                    user.rating,
+                )
+            except asyncpg.exceptions.UniqueViolationError as exc:
+                constraint = getattr(exc, "constraint_name", None)
+                if constraint not in (None, "uq_verified_users_guild_cf_handle_ci"):
+                    raise
+                raise VerifiedHandleConflict(user.guild_id, user.cf_handle) from exc
 
     async def get_by_discord_id(self, discord_id: int, guild_id: int) -> Optional[VerifiedUser]:
         assert self._pool is not None, "Call init() first"
@@ -1295,6 +1406,29 @@ class UserRepository(UserRepositoryBase):
                 """,
                 discord_id,
                 guild_id,
+            )
+        if row is None:
+            return None
+        return VerifiedUser(
+            discord_id=row["discord_id"],
+            cf_handle=row["cf_handle"],
+            rating=row["rating"],
+            guild_id=row["guild_id"],
+        )
+
+    async def get_by_cf_handle(self, guild_id: int, cf_handle: str) -> Optional[VerifiedUser]:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT discord_id, cf_handle, rating, guild_id
+                FROM verified_users
+                WHERE guild_id = $1
+                  AND LOWER(cf_handle) = LOWER($2)
+                LIMIT 1
+                """,
+                guild_id,
+                cf_handle,
             )
         if row is None:
             return None
@@ -1470,6 +1604,24 @@ class UserRepository(UserRepositoryBase):
         sent_at: datetime,
         platform: str = "codeforces",
     ) -> bool:
+        return await self.claim_contest_reminder_sent(
+            guild_id,
+            channel_id,
+            contest_id,
+            reminder_type,
+            sent_at,
+            platform,
+        )
+
+    async def claim_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        sent_at: datetime,
+        platform: str = "codeforces",
+    ) -> bool:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
             result = await conn.execute(
@@ -1486,6 +1638,33 @@ class UserRepository(UserRepositoryBase):
                 contest_id,
                 reminder_type,
                 sent_at,
+            )
+        return result.endswith("1")
+
+    async def clear_contest_reminder_sent(
+        self,
+        guild_id: int,
+        channel_id: int,
+        contest_id: str,
+        reminder_type: str,
+        platform: str = "codeforces",
+    ) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM sent_reminders
+                WHERE guild_id = $1
+                  AND channel_id = $2
+                  AND platform = $3
+                  AND contest_id = $4
+                  AND reminder_type = $5
+                """,
+                guild_id,
+                channel_id,
+                platform,
+                contest_id,
+                reminder_type,
             )
         return result.endswith("1")
 
@@ -1621,6 +1800,21 @@ class UserRepository(UserRepositoryBase):
             )
         return result.endswith("1")
 
+    async def clear_daily_sheet_reminder_sent(self, guild_id: int, sent_on: date) -> bool:
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE daily_sheet_reminders
+                SET last_sent_on = NULL
+                WHERE guild_id = $1
+                  AND last_sent_on = $2
+                """,
+                guild_id,
+                sent_on,
+            )
+        return result.endswith("1")
+
     async def get_coach_config(self, guild_id: int) -> Optional[CoachConfig]:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
@@ -1734,6 +1928,56 @@ class UserRepository(UserRepositoryBase):
         except (ValueError, IndexError):
             return 0
 
+    async def replace_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        ended_at: datetime,
+        *,
+        channel_id: Optional[int] = None,
+        channel_name: Optional[str] = None,
+        started_at: Optional[datetime] = None,
+    ) -> int:
+        if (channel_id is None) != (channel_name is None) or (channel_id is None) != (started_at is None):
+            raise ValueError("channel_id, channel_name, and started_at must be provided together")
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _voice_session_lock_key(guild_id, discord_id),
+                )
+                result = await conn.execute(
+                    """
+                    UPDATE voice_sessions
+                    SET ended_at = GREATEST(started_at, $3)
+                    WHERE guild_id = $1
+                      AND discord_id = $2
+                      AND ended_at IS NULL
+                    """,
+                    guild_id,
+                    discord_id,
+                    ended_at,
+                )
+                if channel_id is not None and channel_name is not None and started_at is not None:
+                    await conn.execute(
+                        """
+                        INSERT INTO voice_sessions (
+                            guild_id, discord_id, channel_id, channel_name, is_tracked, started_at
+                        )
+                        VALUES ($1, $2, $3, $4, TRUE, $5)
+                        """,
+                        guild_id,
+                        discord_id,
+                        channel_id,
+                        channel_name,
+                        started_at,
+                    )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
     async def has_open_voice_session(self, guild_id: int, discord_id: int) -> bool:
         assert self._pool is not None, "Call init() first"
         async with self._pool.acquire() as conn:
@@ -1838,15 +2082,59 @@ class UserRepository(UserRepositoryBase):
         week_since: datetime,
         month_since: datetime,
     ) -> dict[int, dict[str, float]]:
-        all_time = await self.get_tracked_voice_totals(guild_id, now=now)
-        week = await self.get_tracked_voice_totals(guild_id, now=now, since=week_since)
-        month = await self.get_tracked_voice_totals(guild_id, now=now, since=month_since)
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT discord_id,
+                       started_at AS start_ts,
+                       LEAST(COALESCE(ended_at, $2), $2) AS end_ts
+                FROM voice_sessions
+                WHERE guild_id = $1
+                  AND is_tracked = TRUE
+                  AND started_at < $2
+                  AND COALESCE(ended_at, $2) > started_at
+                """,
+                guild_id,
+                now,
+            )
+
+        def _value(row: Any, key: str) -> Any:
+            try:
+                return row[key]
+            except (KeyError, TypeError):
+                return getattr(row, key)
+
+        def _clip_since(since: datetime) -> list[dict[str, Any]]:
+            clipped: list[dict[str, Any]] = []
+            for row in rows:
+                discord_id = int(_value(row, "discord_id"))
+                start = _value(row, "start_ts")
+                end = _value(row, "end_ts")
+                if not isinstance(start, datetime) or not isinstance(end, datetime):
+                    continue
+                clipped_start = max(start, since)
+                clipped_end = min(end, now)
+                if clipped_end <= clipped_start:
+                    continue
+                clipped.append(
+                    {
+                        "discord_id": discord_id,
+                        "start_ts": clipped_start,
+                        "end_ts": clipped_end,
+                    }
+                )
+            return clipped
+
+        all_time = _merge_voice_intervals(rows)
+        week = _merge_voice_intervals(_clip_since(week_since))
+        month = _merge_voice_intervals(_clip_since(month_since))
         summary: dict[int, dict[str, float]] = {}
-        for discord_id in all_time:
+        for discord_id in set(all_time) | set(week) | set(month):
             summary[discord_id] = {
                 "week": week.get(discord_id, 0.0),
                 "month": month.get(discord_id, 0.0),
-                "all_time": all_time[discord_id],
+                "all_time": all_time.get(discord_id, 0.0),
             }
         return summary
 
@@ -2296,6 +2584,28 @@ class UserRepository(UserRepositoryBase):
                 discord_id,
                 solved_count,
                 checked_at,
+            )
+
+    async def upsert_many_gym_participation_cache(
+        self,
+        rows: Iterable[tuple[int, int, int, int, datetime]],
+    ) -> None:
+        values = list(rows)
+        if not values:
+            return
+        assert self._pool is not None, "Call init() first"
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO gym_participation_cache (
+                    guild_id, contest_id, discord_id, solved_count, checked_at
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (guild_id, contest_id, discord_id)
+                DO UPDATE SET solved_count = EXCLUDED.solved_count,
+                              checked_at = EXCLUDED.checked_at
+                """,
+                values,
             )
 
     async def clear_gym_participation_cache(self, guild_id: int, contest_id: int) -> None:

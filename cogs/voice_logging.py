@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 _VOICE_SERVICE = VoiceService()
 logger = logging.getLogger(__name__)
+VOICE_SESSION_MIN_SECONDS = 60.0
 SoloRemovalAction = Literal["afk", "disconnect"]
 VoiceHoursAction = Literal[
     "leaderboard",
@@ -62,6 +63,16 @@ class TimesheetCommandRequest:
     action: TimesheetAction
     tokens: tuple[str, ...]
     max_lines: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingVoiceStart:
+    guild_id: int
+    member_id: int
+    member: discord.Member
+    channel_id: int
+    channel_name: str
+    started_at: datetime
 
 
 def _hours(seconds: float) -> str:
@@ -121,12 +132,21 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._coach_secretary = coach_secretary
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
+        self._pending_voice_starts: dict[
+            tuple[int, int],
+            tuple[PendingVoiceStart, asyncio.Task[None]],
+        ] = {}
+        self._persisted_voice_sessions: set[tuple[int, int]] = set()
         self._tracked_keywords_cache: dict[int, list[str]] = {}
 
     def cog_unload(self) -> None:
         for task in self._watchdogs.values():
             task.cancel()
         self._watchdogs.clear()
+        for _, task in self._pending_voice_starts.values():
+            task.cancel()
+        self._pending_voice_starts.clear()
+        self._persisted_voice_sessions.clear()
 
     async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
         cached = self._tracked_keywords_cache.get(guild_id)
@@ -172,6 +192,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         started_at: datetime,
     ) -> None:
         tracked = await self._is_tracked_channel(guild_id, channel)
+        if not tracked:
+            logger.info(
+                "Skipping untracked voice session: member=%s channel=%s (%s)",
+                member_id,
+                channel.name,
+                channel.id,
+            )
+            return
         logger.info(
             "Starting voice session: member=%s channel=%s (%s) tracked=%s",
             member_id,
@@ -187,6 +215,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             is_tracked=tracked,
             started_at=started_at,
         )
+        self._persisted_voice_sessions.add(self._voice_session_key(guild_id, member_id))
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
@@ -204,11 +233,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             active_member_ids = set(active_tracked_by_member)
             open_tracked_member_ids = await self._repo.get_open_tracked_voice_member_ids(guild.id)
+            for member_id in open_tracked_member_ids:
+                self._persisted_voice_sessions.add(self._voice_session_key(guild.id, member_id))
 
             for stale_member_id in open_tracked_member_ids - active_member_ids:
-                await self._repo.close_open_voice_sessions(guild.id, stale_member_id, now)
+                self._cancel_pending_voice_start(guild.id, stale_member_id)
+                await self._close_voice_session(guild.id, stale_member_id, now)
 
             for member_id, voice_channel in active_tracked_by_member.items():
+                self._cancel_pending_voice_start(guild.id, member_id)
                 if member_id not in open_tracked_member_ids:
                     await self._start_voice_session(
                         guild_id=guild.id,
@@ -242,15 +275,29 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             getattr(before.channel, "name", None),
             getattr(after.channel, "name", None),
         )
-        await self._repo.close_open_voice_sessions(member.guild.id, member.id, now)
+        canceled_pending = self._cancel_pending_voice_start(member.guild.id, member.id)
         self._stop_watchdog(member.id)
+
+        before_is_voice = isinstance(before.channel, discord.VoiceChannel)
+        if before_is_voice and (canceled_pending is None or canceled_pending[1].done()):
+            session_key = self._voice_session_key(member.guild.id, member.id)
+            should_close = session_key in self._persisted_voice_sessions
+            if not should_close:
+                should_close = await self._is_tracked_channel(member.guild.id, before.channel)
+            if should_close:
+                await self._close_voice_session(member.guild.id, member.id, now)
 
         if not isinstance(after.channel, discord.VoiceChannel):
             return
 
-        await self._start_voice_session(
+        after_is_tracked = await self._is_tracked_channel(member.guild.id, after.channel)
+        if not after_is_tracked:
+            return
+
+        self._schedule_pending_voice_start(
             guild_id=member.guild.id,
             member_id=member.id,
+            member=member,
             channel=after.channel,
             started_at=now,
         )
@@ -272,6 +319,99 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     def _clear_watchdog_if_current(self, member_id: int, task: asyncio.Task[None]) -> None:
         if self._watchdogs.get(member_id) is task:
             self._watchdogs.pop(member_id, None)
+
+    async def _close_voice_session(self, guild_id: int, member_id: int, ended_at: datetime) -> int:
+        closed = await self._repo.close_open_voice_sessions(guild_id, member_id, ended_at)
+        self._persisted_voice_sessions.discard(self._voice_session_key(guild_id, member_id))
+        return closed
+
+    async def _close_now_untracked_voice_sessions(self, guild: discord.Guild, ended_at: datetime) -> int:
+        closed_total = 0
+        for voice_channel in guild.voice_channels:
+            if await self._is_tracked_channel(guild.id, voice_channel):
+                continue
+            for member in voice_channel.members:
+                if member.bot:
+                    continue
+                session_key = self._voice_session_key(guild.id, member.id)
+                if session_key not in self._persisted_voice_sessions:
+                    continue
+                closed_total += await self._close_voice_session(guild.id, member.id, ended_at)
+        return closed_total
+
+    @staticmethod
+    def _voice_session_key(guild_id: int, member_id: int) -> tuple[int, int]:
+        return guild_id, member_id
+
+    def _cancel_pending_voice_start(
+        self,
+        guild_id: int,
+        member_id: int,
+    ) -> tuple[PendingVoiceStart, asyncio.Task[None]] | None:
+        key = self._voice_session_key(guild_id, member_id)
+        pending = self._pending_voice_starts.pop(key, None)
+        if pending is not None:
+            _, task = pending
+            task.cancel()
+        return pending
+
+    def _schedule_pending_voice_start(
+        self,
+        *,
+        guild_id: int,
+        member_id: int,
+        member: discord.Member,
+        channel: discord.VoiceChannel,
+        started_at: datetime,
+    ) -> None:
+        key = self._voice_session_key(guild_id, member_id)
+        self._cancel_pending_voice_start(guild_id, member_id)
+        pending = PendingVoiceStart(
+            guild_id=guild_id,
+            member_id=member_id,
+            member=member,
+            channel_id=channel.id,
+            channel_name=channel.name,
+            started_at=started_at,
+        )
+        task = asyncio.create_task(
+            self._delayed_start_voice_session(key, pending),
+            name=f"voice-session-start-{guild_id}-{member_id}",
+        )
+        self._pending_voice_starts[key] = (pending, task)
+
+    async def _delayed_start_voice_session(
+        self,
+        key: tuple[int, int],
+        pending: PendingVoiceStart,
+    ) -> None:
+        try:
+            await asyncio.sleep(VOICE_SESSION_MIN_SECONDS)
+            voice = pending.member.voice
+            current_channel = voice.channel if voice is not None else None
+            if current_channel is None or current_channel.id != pending.channel_id:
+                return
+            await self._repo.replace_voice_session(
+                pending.guild_id,
+                pending.member_id,
+                pending.started_at,
+                channel_id=pending.channel_id,
+                channel_name=pending.channel_name,
+                started_at=pending.started_at,
+            )
+            self._persisted_voice_sessions.add(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Failed starting delayed voice session for member %s in guild %s",
+                pending.member_id,
+                pending.guild_id,
+            )
+        finally:
+            current = self._pending_voice_starts.get(key)
+            if current is not None and current[0] is pending:
+                self._pending_voice_starts.pop(key, None)
 
     async def _resolve_handles(self, guild: discord.Guild) -> dict[int, str]:
         verified = await self._repo.get_all(guild.id)
@@ -725,7 +865,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                             pass
                     continue
 
-                await self._repo.close_open_voice_sessions(guild.id, member.id, datetime.now(tz=UTC))
+                await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
                     try:
                         if removal_action == "afk":
@@ -877,7 +1017,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
         config = await self._config.get(ctx.guild.id)
         now = datetime.now(tz=UTC)
-        handle_by_discord_id = await self._resolve_handles(ctx.guild)
 
         if args:
             try:
@@ -892,7 +1031,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     request.timesheet_tokens,
                     config=config,
                     now=now,
-                    handle_by_discord_id=handle_by_discord_id,
+                    handle_by_discord_id=await self._resolve_handles(ctx.guild),
                 )
                 return
 
@@ -902,7 +1041,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     request.max_tokens,
                     config=config,
                     now=now,
-                    handle_by_discord_id=handle_by_discord_id,
+                    handle_by_discord_id=await self._resolve_handles(ctx.guild),
                     max_lines=request.top_limit,
                 )
                 return
@@ -923,7 +1062,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("No tracked-channel voice logs found for that period.")
                     return
 
-                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                lines = self._leaderboard_lines(
+                    guild=ctx.guild,
+                    totals=totals,
+                    handle_by_discord_id=await self._resolve_handles(ctx.guild),
+                )
                 is_top = request.action == "top"
                 content = self._render_ranked_message(
                     title=f"**{'Top ' if is_top else ''}Tracked Voice Hours ({label})**",
@@ -1034,7 +1177,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send(f"No tracked voice logs found for role {target_role.mention} in {label}.")
                     return
 
-                lines = self._leaderboard_lines(guild=ctx.guild, totals=totals, handle_by_discord_id=handle_by_discord_id)
+                lines = self._leaderboard_lines(
+                    guild=ctx.guild,
+                    totals=totals,
+                    handle_by_discord_id=await self._resolve_handles(ctx.guild),
+                )
                 await send_context_text_chunks(
                     ctx,
                     self._render_ranked_message(
@@ -1136,6 +1283,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
         all_ids = set(week) | set(month) | set(all_time)
         ordered_ids = sorted(all_ids, key=lambda user_id: all_time.get(user_id, 0.0), reverse=True)
+        handle_by_discord_id = await self._resolve_handles(ctx.guild)
         lines: list[str] = []
         for discord_id in ordered_ids:
             handle = handle_by_discord_id.get(discord_id)
@@ -1239,7 +1387,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             else:
                 await self._config.reset_text(ctx.guild.id, "voice_tracked_keywords")
             self._tracked_keywords_cache.pop(ctx.guild.id, None)
-            await ctx.send(f"Removed `{keyword}` from tracked keywords.")
+            closed = await self._close_now_untracked_voice_sessions(ctx.guild, datetime.now(tz=UTC))
+            message = f"Removed `{keyword}` from tracked keywords."
+            if closed:
+                message = f"{message} Closed **{closed}** now-untracked voice session(s)."
+            await ctx.send(message)
             return
 
         await ctx.send(

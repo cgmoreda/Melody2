@@ -68,8 +68,10 @@ class _FakeRepoWithTotals:
         self._intervals = intervals or []
         self._open_tracked_by_guild: dict[int, set[int]] = {}
         self.interval_calls: list[tuple[int, datetime, datetime]] = []
+        self.get_all_calls = 0
 
     async def get_all(self, guild_id: int) -> list[Any]:
+        self.get_all_calls += 1
         return []
 
     async def get_tracked_voice_totals(
@@ -79,6 +81,19 @@ class _FakeRepoWithTotals:
 
     async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
         return set()
+
+    async def get_tracked_voice_summary(
+        self,
+        guild_id: int,
+        *,
+        now: datetime,
+        week_since: datetime,
+        month_since: datetime,
+    ) -> dict[int, dict[str, float]]:
+        return {
+            discord_id: {"week": seconds, "month": seconds, "all_time": seconds}
+            for discord_id, seconds in self._totals.items()
+        }
 
     async def get_tracked_voice_intervals(
         self,
@@ -104,14 +119,43 @@ class _FakeConfigServiceWithMaxLines:
         return ""
 
 
+class _MutableTrackedKeywordsConfig(_FakeConfigServiceWithMaxLines):
+    def __init__(self, raw_keywords: str) -> None:
+        self.raw_keywords = raw_keywords
+        self.set_calls: list[tuple[int, str, str]] = []
+        self.reset_calls: list[tuple[int, str]] = []
+
+    async def get_text(self, guild_id: int, key: str) -> str:
+        if key == "voice_tracked_keywords":
+            return self.raw_keywords
+        return await super().get_text(guild_id, key)
+
+    async def set_text(self, guild_id: int, key: str, value: str) -> str:
+        self.set_calls.append((guild_id, key, value))
+        if key == "voice_tracked_keywords":
+            self.raw_keywords = value
+        return value
+
+    async def reset_text(self, guild_id: int, key: str) -> str:
+        self.reset_calls.append((guild_id, key))
+        if key == "voice_tracked_keywords":
+            self.raw_keywords = ""
+        return ""
+
+
 class _FakeContext:
-    def __init__(self, guild: Any, author_id: int = 1) -> None:
+    def __init__(self, guild: Any, author_id: int = 1, *, administrator: bool = False) -> None:
         self.guild = guild
         self.sent_messages: list[str] = []
+        admin_value = administrator
+
+        class _Permissions:
+            administrator = admin_value
 
         class _Author:
             id = author_id
             display_name = "TestUser"
+            guild_permissions = _Permissions()
 
         self.author = _Author()
 
@@ -206,6 +250,7 @@ class _FakeRepo:
         self._open_tracked_by_guild = open_tracked_by_guild or {}
         self.closed_calls: list[tuple[int, int, datetime]] = []
         self.started_calls: list[dict[str, Any]] = []
+        self.replaced_calls: list[dict[str, Any]] = []
 
     async def get_open_tracked_voice_member_ids(self, guild_id: int) -> set[int]:
         return set(self._open_tracked_by_guild.get(guild_id, set()))
@@ -233,6 +278,28 @@ class _FakeRepo:
                 "started_at": started_at,
             }
         )
+
+    async def replace_voice_session(
+        self,
+        guild_id: int,
+        discord_id: int,
+        ended_at: datetime,
+        *,
+        channel_id: int | None = None,
+        channel_name: str | None = None,
+        started_at: datetime | None = None,
+    ) -> int:
+        self.replaced_calls.append(
+            {
+                "guild_id": guild_id,
+                "discord_id": discord_id,
+                "ended_at": ended_at,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "started_at": started_at,
+            }
+        )
+        return 1
 
 
 class _FakeConfigService:
@@ -502,16 +569,18 @@ def test_render_ranked_message_is_capped_to_discord_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_voice_state_switch_starts_new_session_and_watchdog_for_solo_channel(
+async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_solo_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+    monkeypatch.setattr(voice_logging_module, "VOICE_SESSION_MIN_SECONDS", 0.0)
 
     member = _FakeMember(42)
     source_channel = _FakeVoiceChannel(1001, "General VC", [member])
     target_channel = _FakeVoiceChannel(1002, "Solo Room B", [])
     guild = _FakeGuild(900, [source_channel, target_channel])
     member.guild = guild
+    member.voice = _FakeVoiceState(target_channel)
 
     repo = _FakeRepo()
     cog = VoiceLoggingCog(
@@ -530,20 +599,128 @@ async def test_voice_state_switch_starts_new_session_and_watchdog_for_solo_chann
         _FakeVoiceState(source_channel),  # type: ignore[arg-type]
         _FakeVoiceState(target_channel),  # type: ignore[arg-type]
     )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
 
     assert stopped == [member.id]
+    assert repo.closed_calls == []
+    assert repo.started_calls == []
+
+    assert len(repo.replaced_calls) == 1
+    replace_call = repo.replaced_calls[0]
+    assert replace_call["guild_id"] == guild.id
+    assert replace_call["discord_id"] == member.id
+    assert replace_call["channel_id"] == target_channel.id
+    assert replace_call["channel_name"] == target_channel.name
+    assert replace_call["started_at"] == replace_call["ended_at"]
+
+    assert started == [member.id]
+
+
+@pytest.mark.asyncio
+async def test_voice_state_leave_before_delay_writes_no_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(43)
+    target_channel = _FakeVoiceChannel(1003, "Solo Room C", [member])
+    guild = _FakeGuild(901, [target_channel])
+    member.guild = guild
+    member.voice = _FakeVoiceState(target_channel)
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigService(),  # type: ignore[arg-type]
+    )
+    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
+    cog._start_watchdog = lambda member_obj: None  # type: ignore[assignment]
+
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(None),  # type: ignore[arg-type]
+        _FakeVoiceState(target_channel),  # type: ignore[arg-type]
+    )
+    assert len(cog._pending_voice_starts) == 1
+
+    member.voice = None
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(target_channel),  # type: ignore[arg-type]
+        _FakeVoiceState(None),  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+
+    assert cog._pending_voice_starts == {}
+    assert repo.replaced_calls == []
+    assert repo.started_calls == []
+    assert repo.closed_calls == []
+
+
+@pytest.mark.asyncio
+async def test_voice_state_closes_persisted_session_after_channel_is_untracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(44)
+    office = _FakeVoiceChannel(1004, "Coach Office", [member])
+    coffee = _FakeVoiceChannel(1005, "Coffee Room", [])
+    guild = _FakeGuild(902, [office, coffee])
+    member.guild = guild
+    member.voice = _FakeVoiceState(coffee)
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_MutableTrackedKeywordsConfig(""),  # type: ignore[arg-type]
+    )
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
+
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(office),  # type: ignore[arg-type]
+        _FakeVoiceState(coffee),  # type: ignore[arg-type]
+    )
+
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+    assert repo.replaced_calls == []
 
-    assert len(repo.started_calls) == 1
-    start_call = repo.started_calls[0]
-    assert start_call["guild_id"] == guild.id
-    assert start_call["discord_id"] == member.id
-    assert start_call["channel_id"] == target_channel.id
-    assert start_call["is_tracked"] is True
 
-    assert started == [member.id]
+@pytest.mark.asyncio
+async def test_track_remove_closes_sessions_in_channels_that_become_untracked() -> None:
+    member = _FakeMember(45)
+    office = _FakeVoiceChannel(1006, "Coach Office", [member])
+    guild = _FakeGuild(903, [office])
+
+    repo = _FakeRepo()
+    config = _MutableTrackedKeywordsConfig("office")
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=config,  # type: ignore[arg-type]
+    )
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+    ctx = _FakeContext(guild, administrator=True)
+
+    await cog._handle_track(ctx, ("remove", "office"))  # type: ignore[arg-type]
+
+    assert config.raw_keywords == ""
+    assert config.reset_calls == [(guild.id, "voice_tracked_keywords")]
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+    assert ctx.sent_messages == [
+        "Removed `office` from tracked keywords. Closed **1** now-untracked voice session(s)."
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1271,7 @@ async def test_voicehours_window_before_user_mode(
     )
 
     assert ctx.sent_messages == ["**Target User** in last 1 week: **1.00h** (rank **#1**)"]
+    assert repo.get_all_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1322,7 +1500,12 @@ async def test_voicehours_roles_only_includes_team_prefixed_roles(
     guild = _FakeGuildWithRoles(10, [team_role, uni_role])
 
     totals = {1: 3600.0, 2: 7200.0}
-    cog = _make_cog_for_leaderboard(guild, totals)
+    repo = _FakeRepoWithTotals(totals=totals)
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigServiceWithMaxLines(),  # type: ignore[arg-type]
+    )
 
     sent: list[str] = []
 
@@ -1339,6 +1522,7 @@ async def test_voicehours_roles_only_includes_team_prefixed_roles(
     assert "Team Alpha" in output
     assert "UniRed" not in output
     assert "Team Role Voice Standings" in output
+    assert repo.get_all_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1351,7 +1535,12 @@ async def test_voicehours_teams_alias_behaves_like_roles(
     guild = _FakeGuildWithRoles(11, [team_role])
 
     totals = {3: 1800.0}
-    cog = _make_cog_for_leaderboard(guild, totals)
+    repo = _FakeRepoWithTotals(totals=totals)
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigServiceWithMaxLines(),  # type: ignore[arg-type]
+    )
 
     sent: list[str] = []
 
@@ -1365,6 +1554,7 @@ async def test_voicehours_teams_alias_behaves_like_roles(
 
     assert len(sent) == 1
     assert "Team Role Voice Standings" in sent[0]
+    assert repo.get_all_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1403,7 +1593,12 @@ async def test_voicehours_unis_only_includes_uni_roles(
     guild = _FakeGuildWithRoles(13, [uni_role, team_role, uni_upper_role])
 
     totals = {5: 1800.0, 6: 3600.0, 7: 900.0}
-    cog = _make_cog_for_leaderboard(guild, totals)
+    repo = _FakeRepoWithTotals(totals=totals)
+    cog = VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigServiceWithMaxLines(),  # type: ignore[arg-type]
+    )
 
     sent: list[str] = []
 
@@ -1421,6 +1616,7 @@ async def test_voicehours_unis_only_includes_uni_roles(
     assert "UniVersity" in output
     assert "Team Alpha" not in output
     assert "Uni Role Voice Standings" in output
+    assert repo.get_all_calls == 0
 
 
 @pytest.mark.asyncio

@@ -125,6 +125,7 @@ async def _setup_services(bot: commands.Bot) -> None:
         logger.info("Contest reminder service started")
 
         daily_sheet_reminder = DailySheetReminderService(bot=bot, repo=repo)
+        await daily_sheet_reminder.initialize()
         daily_sheet_reminder.start()
         bot.daily_sheet_reminder = daily_sheet_reminder  # type: ignore[attr-defined]
         logger.info("Daily sheet reminder service started")

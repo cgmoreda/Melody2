@@ -326,17 +326,19 @@ class ContestReminderService:
                 if key in self._sent_cache:
                     return
 
+            sent_at = datetime.now(tz=UTC)
             try:
-                already_sent = await self._repo.has_sent_contest_reminder(
+                claimed = await self._repo.claim_contest_reminder_sent(
                     guild_id=guild_id,
                     channel_id=channel.id,
                     contest_id=contest.contest_id,
                     reminder_type=reminder_type,
+                    sent_at=sent_at,
                     platform=contest.platform,
                 )
             except Exception:
                 logger.exception(
-                    "Failed reading reminder dedupe key (guild=%s channel=%s platform=%s contest=%s type=%s)",
+                    "Failed claiming reminder dedupe key (guild=%s channel=%s platform=%s contest=%s type=%s)",
                     guild_id,
                     channel.id,
                     contest.platform,
@@ -345,7 +347,7 @@ class ContestReminderService:
                 )
                 return
 
-            if already_sent:
+            if not claimed:
                 async with self._lock:
                     self._sent_cache.add(key)
                 return
@@ -353,6 +355,23 @@ class ContestReminderService:
             try:
                 await channel.send(message)
             except discord.Forbidden:
+                try:
+                    await self._repo.clear_contest_reminder_sent(
+                        guild_id=guild_id,
+                        channel_id=channel.id,
+                        contest_id=contest.contest_id,
+                        reminder_type=reminder_type,
+                        platform=contest.platform,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed clearing reminder dedupe claim (guild=%s channel=%s platform=%s contest=%s type=%s)",
+                        guild_id,
+                        channel.id,
+                        contest.platform,
+                        contest.contest_id,
+                        reminder_type,
+                    )
                 logger.warning(
                     "Cannot send reminder to channel %s in guild %s due to missing permissions",
                     channel.id,
@@ -366,27 +385,9 @@ class ContestReminderService:
                     guild_id,
                     exc,
                 )
+                async with self._lock:
+                    self._sent_cache.add(key)
                 return
-
-            sent_at = datetime.now(tz=UTC)
-            try:
-                await self._mark_sent_with_retry(
-                    guild_id=guild_id,
-                    channel_id=channel.id,
-                    contest_id=contest.contest_id,
-                    reminder_type=reminder_type,
-                    sent_at=sent_at,
-                    platform=contest.platform,
-                )
-            except Exception:
-                logger.exception(
-                    "Sent reminder but failed to persist dedupe row (guild=%s channel=%s platform=%s contest=%s type=%s)",
-                    guild_id,
-                    channel.id,
-                    contest.platform,
-                    contest.contest_id,
-                    reminder_type,
-                )
 
             async with self._lock:
                 self._sent_cache.add(key)
@@ -408,35 +409,6 @@ class ContestReminderService:
                 lock = asyncio.Lock()
                 self._dispatch_locks[key] = lock
             return lock
-
-    async def _mark_sent_with_retry(
-        self,
-        *,
-        guild_id: int,
-        channel_id: int,
-        contest_id: str,
-        reminder_type: str,
-        sent_at: datetime,
-        platform: str,
-    ) -> None:
-        delay_seconds = 0.25
-        for attempt in range(1, 4):
-            try:
-                await self._repo.mark_contest_reminder_sent(
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    contest_id=contest_id,
-                    reminder_type=reminder_type,
-                    sent_at=sent_at,
-                    platform=platform,
-                )
-                return
-            except Exception:
-                if attempt == 3:
-                    raise
-                await asyncio.sleep(delay_seconds)
-                delay_seconds *= 2.0
-
 
 def _is_div_contest_name(name: str) -> bool:
     lowered = name.lower()
