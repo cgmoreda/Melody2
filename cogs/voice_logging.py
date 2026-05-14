@@ -423,7 +423,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         *,
         now: datetime,
         tokens: tuple[str, ...],
-    ) -> tuple[Optional[datetime], str]:
+    ) -> tuple[Optional[datetime], datetime, str]:
         return self._voice_service.parse_window_tokens(now=now, tokens=tokens)
 
     @staticmethod
@@ -517,6 +517,19 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 raise CommandParseError(VoiceService.MAX_USAGE)
             return VoiceHoursCommandRequest(action="max", max_tokens=remaining[1:], top_limit=limit)
 
+        import re
+        date_pattern = re.compile(r"^\d{1,2}/\d{1,2}(?:/\d{2,4})?$")
+        date_tokens = ()
+        new_args = []
+        for arg in args:
+            if date_pattern.match(arg):
+                if date_tokens:
+                    raise CommandParseError("Only one date clause is allowed.")
+                date_tokens = (arg,)
+            else:
+                new_args.append(arg)
+        args = tuple(new_args)
+
         last_clause, remaining = extract_single_clause(
             args,
             {"last"},
@@ -524,8 +537,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             name="last",
             incomplete_message="Usage: `... [last <x> <hour/day/week/month>]`",
         )
+        if last_clause and date_tokens:
+            raise CommandParseError("Cannot specify both `last` and a specific date.")
+            
+        window_tokens = last_clause.tokens if last_clause is not None else date_tokens
         has_top, limit, remaining = cls._extract_top_clause(remaining, require_value=False)
-        window_tokens = last_clause.tokens if last_clause is not None else ()
         if has_top and limit is None:
             limit = default_top_limit
 
@@ -1051,13 +1067,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return
 
             try:
-                since, label = self._parse_window_tokens(now=now, tokens=request.window_tokens)
+                since, until, label = self._parse_window_tokens(now=now, tokens=request.window_tokens)
             except ValueError as err:
                 await ctx.send(str(err))
                 return
 
             if request.action in {"top", "leaderboard"}:
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 if not totals:
                     await ctx.send("No tracked-channel voice logs found for that period.")
                     return
@@ -1097,7 +1113,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     )
                     return
 
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 threshold_seconds = minimum_hours * 3600.0
                 if not members:
                     await ctx.send(
@@ -1138,7 +1154,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return
 
             if request.action == "me":
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 rank_data = self._find_rank(totals, ctx.author.id)
                 if rank_data is None:
                     await ctx.send(f"You have no tracked voice logs for {label}.")
@@ -1155,7 +1171,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("Could not resolve that member.")
                     return
 
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 seconds = totals.get(target_member.id, 0.0)
                 rank_data = self._find_rank(totals, target_member.id)
                 rank_text = f" (rank **#{rank_data[0]}**)" if rank_data is not None else ""
@@ -1170,7 +1186,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     await ctx.send("Could not resolve that role.")
                     return
 
-                all_totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                all_totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 member_ids = {member.id for member in target_role.members if not member.bot}
                 totals = {discord_id: value for discord_id, value in all_totals.items() if discord_id in member_ids}
                 if not totals:
@@ -1194,7 +1210,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return
 
             if request.action == "roles":
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 team_roles = [
                     role
                     for role in ctx.guild.roles
@@ -1230,7 +1246,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return
 
             if request.action == "unis":
-                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=now, since=since)
+                totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
                 uni_roles = [
                     role
                     for role in ctx.guild.roles
