@@ -587,7 +587,7 @@ class VoiceService:
                 
                 if not year_str and target_date > now_local + timedelta(days=1):
                     target_date = target_date.replace(year=year - 1)
-                if target_date > now_local:
+                if target_date.date() > now_local.date():
                     raise ValueError("Date cannot be in the future.")
                     
                 since_utc = target_date.astimezone(UTC)
