@@ -1084,7 +1084,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             if request.action == "tahzeeq":
                 if not ctx.author.guild_permissions.administrator:
-                    await ctx.send("You need Administrator permission for this.")
+                    await ctx.send("This is for coaches only...")
                     return
 
                 minimum_hours = request.minimum_hours
