@@ -13,13 +13,15 @@ def test_parse_window_tokens_aliases() -> None:
     service = VoiceService()
     now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
 
-    since, label = service.parse_window_tokens(now=now, tokens=("hrs",))
+    since, until, label = service.parse_window_tokens(now=now, tokens=("hrs",))
     assert label == "last 1 hour"
     assert since == now - timedelta(hours=1)
+    assert until == now
 
-    since2, label2 = service.parse_window_tokens(now=now, tokens=("last", "2", "weeks"))
+    since2, until2, label2 = service.parse_window_tokens(now=now, tokens=("last", "2", "weeks"))
     assert label2 == "last 2 weeks"
     assert since2 == now - timedelta(weeks=2)
+    assert until2 == now
 
 
 def test_parse_window_tokens_invalid_usage() -> None:
