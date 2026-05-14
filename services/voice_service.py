@@ -560,18 +560,46 @@ class VoiceService:
         *,
         now: datetime,
         tokens: tuple[str, ...],
-    ) -> tuple[Optional[datetime], str]:
+    ) -> tuple[Optional[datetime], datetime, str]:
         if not tokens:
-            return None, "all time"
+            return None, now, "all time"
 
         if len(tokens) == 1:
             short = tokens[0].strip().lower()
             if short in {"all", "alltime", "all-time"}:
-                return None, "all time"
+                return None, now, "all time"
+            
+            import re
+            date_match = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", short)
+            if date_match:
+                day = int(date_match.group(1))
+                month = int(date_match.group(2))
+                year_str = date_match.group(3)
+                now_local = now.astimezone(EGYPT_TZ)
+                year = int(year_str) if year_str else now_local.year
+                if year < 100:
+                    year += 2000
+                
+                try:
+                    target_date = datetime(year, month, day, EGYPT_DAY_START_HOUR, 0, 0, tzinfo=EGYPT_TZ)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid date: {short}") from exc
+                
+                if not year_str and target_date > now_local + timedelta(days=1):
+                    target_date = target_date.replace(year=year - 1)
+                if target_date.date() > now_local.date():
+                    raise ValueError("Date cannot be in the future.")
+                    
+                since_utc = target_date.astimezone(UTC)
+                until_utc = (target_date + timedelta(days=1)).astimezone(UTC)
+                
+                label = f"{day}/{month}" + (f"/{year}" if year_str else "")
+                return since_utc, min(now, until_utc), label
+
             normalized = self._normalize_window_unit(short)
             if normalized is not None:
-                return now - self._window_delta(1, normalized), f"last 1 {normalized}"
-            raise ValueError("Usage: `... [last <x> <hour/day/week/month>]`")
+                return now - self._window_delta(1, normalized), now, f"last 1 {normalized}"
+            raise ValueError("Usage: `... [last <x> <hour/day/week/month>]` or `... [DD/MM]`")
 
         if len(tokens) == 3 and tokens[0].strip().lower() == "last":
             try:
@@ -586,10 +614,11 @@ class VoiceService:
                 raise ValueError("Unit must be one of: `hour`, `day`, `week`, `month`.")
             return (
                 now - self._window_delta(amount, normalized_unit),
+                now,
                 f"last {amount} {normalized_unit}{'' if amount == 1 else 's'}",
             )
 
-        raise ValueError("Usage: `... [last <x> <hour/day/week/month>]`")
+        raise ValueError("Usage: `... [last <x> <hour/day/week/month>]` or `... [DD/MM]`")
 
     @staticmethod
     def sorted_totals(totals: dict[int, float]) -> list[tuple[int, float]]:

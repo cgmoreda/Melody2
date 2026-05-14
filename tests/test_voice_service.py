@@ -13,13 +13,15 @@ def test_parse_window_tokens_aliases() -> None:
     service = VoiceService()
     now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
 
-    since, label = service.parse_window_tokens(now=now, tokens=("hrs",))
+    since, until, label = service.parse_window_tokens(now=now, tokens=("hrs",))
     assert label == "last 1 hour"
     assert since == now - timedelta(hours=1)
+    assert until == now
 
-    since2, label2 = service.parse_window_tokens(now=now, tokens=("last", "2", "weeks"))
+    since2, until2, label2 = service.parse_window_tokens(now=now, tokens=("last", "2", "weeks"))
     assert label2 == "last 2 weeks"
     assert since2 == now - timedelta(weeks=2)
+    assert until2 == now
 
 
 def test_parse_window_tokens_invalid_usage() -> None:
@@ -27,6 +29,44 @@ def test_parse_window_tokens_invalid_usage() -> None:
     now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
     with pytest.raises(ValueError):
         service.parse_window_tokens(now=now, tokens=("last", "-1", "day"))
+
+
+def test_parse_window_tokens_specific_date_with_inferred_year() -> None:
+    service = VoiceService()
+    cairo = ZoneInfo("Africa/Cairo")
+    now = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+
+    since, until, label = service.parse_window_tokens(now=now, tokens=("25/12",))
+
+    expected_since = datetime(2025, 12, 25, 5, 0, tzinfo=cairo).astimezone(UTC)
+    expected_until = datetime(2025, 12, 26, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert since == expected_since
+    assert until == expected_until
+    assert label == "25/12"
+
+
+def test_parse_window_tokens_specific_date_with_explicit_year() -> None:
+    service = VoiceService()
+    cairo = ZoneInfo("Africa/Cairo")
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+
+    since, until, label = service.parse_window_tokens(now=now, tokens=("25/4/2024",))
+
+    expected_since = datetime(2024, 4, 25, 5, 0, tzinfo=cairo).astimezone(UTC)
+    expected_until = datetime(2024, 4, 26, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert since == expected_since
+    assert until == expected_until
+    assert label == "25/4/2024"
+
+
+def test_parse_window_tokens_invalid_or_future_date_raises() -> None:
+    service = VoiceService()
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="Invalid date"):
+        service.parse_window_tokens(now=now, tokens=("31/2",))
+    with pytest.raises(ValueError, match="future"):
+        service.parse_window_tokens(now=now, tokens=("25/4/2027",))
 
 
 def test_render_ranked_message_is_capped() -> None:
