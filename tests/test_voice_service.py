@@ -31,6 +31,44 @@ def test_parse_window_tokens_invalid_usage() -> None:
         service.parse_window_tokens(now=now, tokens=("last", "-1", "day"))
 
 
+def test_parse_window_tokens_specific_date_with_inferred_year() -> None:
+    service = VoiceService()
+    cairo = ZoneInfo("Africa/Cairo")
+    now = datetime(2026, 1, 5, 12, 0, tzinfo=UTC)
+
+    since, until, label = service.parse_window_tokens(now=now, tokens=("25/12",))
+
+    expected_since = datetime(2025, 12, 25, 5, 0, tzinfo=cairo).astimezone(UTC)
+    expected_until = datetime(2025, 12, 26, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert since == expected_since
+    assert until == expected_until
+    assert label == "25/12"
+
+
+def test_parse_window_tokens_specific_date_with_explicit_year() -> None:
+    service = VoiceService()
+    cairo = ZoneInfo("Africa/Cairo")
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+
+    since, until, label = service.parse_window_tokens(now=now, tokens=("25/4/2024",))
+
+    expected_since = datetime(2024, 4, 25, 5, 0, tzinfo=cairo).astimezone(UTC)
+    expected_until = datetime(2024, 4, 26, 5, 0, tzinfo=cairo).astimezone(UTC)
+    assert since == expected_since
+    assert until == expected_until
+    assert label == "25/4/2024"
+
+
+def test_parse_window_tokens_invalid_or_future_date_raises() -> None:
+    service = VoiceService()
+    now = datetime(2026, 4, 25, 12, 0, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="Invalid date"):
+        service.parse_window_tokens(now=now, tokens=("31/2",))
+    with pytest.raises(ValueError, match="future"):
+        service.parse_window_tokens(now=now, tokens=("25/4/2027",))
+
+
 def test_render_ranked_message_is_capped() -> None:
     lines = [f"#{index:03d} {'user' * 12} 1234.56h" for index in range(1, 300)]
     rendered = VoiceService.render_ranked_message(
