@@ -18,25 +18,30 @@ class ChannelType(Enum):
     SOLO = "solo"
     DUO = "duo"
     TEAM = "team"
+    INVITE = "invite"
 
 
 ENTRY_CHANNEL_NAMES: dict[str, ChannelType] = {
     "➕ | Solo (new)": ChannelType.SOLO,
     "➕ | Duo (new)": ChannelType.DUO,
     "➕ | Team (new)": ChannelType.TEAM,
+    "➕ | Invite (new)": ChannelType.INVITE,
 }
 
 USER_LIMITS: dict[ChannelType, int] = {
     ChannelType.SOLO: 1,
     ChannelType.DUO: 2,
     ChannelType.TEAM: 3,
+    ChannelType.INVITE: 1,
 }
 
 _SOLO_RE = re.compile(r"^solo #(\d+)$", re.IGNORECASE)
 _DUO_RE = re.compile(r"^(.+) Duo #(\d+)$")
 _TEAM_RE = re.compile(r"^(.+) Team #(\d+)$")
+_INVITE_RE = re.compile(r"^(.+) Invite #(\d+)$")
 
 _DELETE_DELAY_SECONDS = 2.0
+_DISCORD_MAX_VOICE_USER_LIMIT = 99
 
 
 @dataclass(slots=True)
@@ -94,6 +99,8 @@ class DynamicVoiceManager:
 
         Solo channels: always allowed.
         Duo channels: always allowed.
+        Invite channels: allowed only if the member has a connect=True
+            permission overwrite on the channel (granted via !invite).
         Coaches/admins are always allowed.
         Team channel creators are always allowed when known.
         Team channels otherwise require a role whose 'Team ' suffix
@@ -101,18 +108,25 @@ class DynamicVoiceManager:
         """
         info = self.get_tracked_info(channel.id)
         if info is None:
-            return True  # not tracked → no restriction
+            return True  # not tracked -> no restriction
         if self._is_coach_or_admin(member):
             return True
         if info.channel_type in (ChannelType.SOLO, ChannelType.DUO):
             return True
+
+        # Invite channels: only creator and explicitly invited members
+        if info.channel_type is ChannelType.INVITE:
+            if info.creator_id != 0 and member.id == info.creator_id:
+                return True
+            return self._has_connect_overwrite(channel, member)
+
         # Only apply the creator shortcut when the creator is known (creator_id > 0).
         # creator_id == 0 is set by rebuild_state() when the creator could not be inferred
         # from channel overwrites; in that case we fall through to the role-based check.
         if info.creator_id != 0 and member.id == info.creator_id:
             return True
 
-        # Extract the group name from the label (e.g. 'Assiut Duo' → 'Assiut')
+        # Extract the group name from the label (e.g. 'Assiut Duo' -> 'Assiut')
         required_group = self._extract_group_from_label(info.label, info.channel_type)
         if required_group is None:
             return True  # fallback: allow if we can't determine the group
@@ -125,6 +139,74 @@ class DynamicVoiceManager:
         task = self._delete_tasks.pop(channel_id, None)
         if task is not None:
             task.cancel()
+
+    async def invite_user(
+        self,
+        channel: discord.VoiceChannel,
+        invited: discord.Member,
+    ) -> bool:
+        """Grant *invited* member access to an invite-only channel.
+
+        Adds a member-specific ``connect=True`` permission overwrite and
+        increases the channel's ``user_limit`` by one (up to Discord's max 99).
+        If increasing the limit fails, the overwrite is rolled back.
+
+        Returns True on success, False on API failure.
+        """
+        def _log_invite_failure(error: Exception) -> None:
+            logger.error(
+                "Failed to invite member %s to channel %s: %s",
+                invited.id,
+                channel.name,
+                error,
+            )
+
+        try:
+            await channel.set_permissions(
+                invited,
+                connect=True,
+                reason="Invited by a channel member",
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            _log_invite_failure(exc)
+            return False
+
+        new_limit = min((channel.user_limit or 0) + 1, _DISCORD_MAX_VOICE_USER_LIMIT)
+        try:
+            await channel.edit(user_limit=new_limit, reason="Invite capacity increase")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            try:
+                await channel.set_permissions(
+                    invited,
+                    overwrite=None,
+                    reason="Rollback failed invite",
+                )
+            except (discord.Forbidden, discord.HTTPException) as rollback_exc:
+                logger.error(
+                    "Failed to rollback invite for member %s in channel %s: %s",
+                    invited.id,
+                    channel.name,
+                    rollback_exc,
+                )
+            _log_invite_failure(exc)
+            return False
+
+        logger.info(
+            "Invited member %s to channel %s (new limit=%d)",
+            invited.id,
+            channel.name,
+            new_limit,
+        )
+        return True
+
+    @staticmethod
+    def _has_connect_overwrite(
+        channel: discord.VoiceChannel,
+        member: discord.Member,
+    ) -> bool:
+        """Return True if *member* has an explicit connect=True overwrite on *channel*."""
+        overwrite = channel.overwrites_for(member)
+        return overwrite.connect is True
 
     async def handle_join(
         self,
@@ -284,7 +366,7 @@ class DynamicVoiceManager:
 
         Fallback chain:
         - Solo: always "solo"
-        - Duo/Team: Team role → Uni role → display_name
+        - Duo/Team/Invite: Team role -> Uni role -> display_name
         """
         if channel_type is ChannelType.SOLO:
             return "solo"
@@ -295,8 +377,12 @@ class DynamicVoiceManager:
         if name is None:
             name = member.display_name
 
-        suffix = " Duo" if channel_type is ChannelType.DUO else " Team"
-        return f"{name}{suffix}"
+        suffixes = {
+            ChannelType.DUO: " Duo",
+            ChannelType.TEAM: " Team",
+            ChannelType.INVITE: " Invite",
+        }
+        return f"{name}{suffixes[channel_type]}"
 
     def _build_overwrites(
         self,
@@ -306,6 +392,7 @@ class DynamicVoiceManager:
         """Build permission overwrites for a new dynamic channel.
 
         Solo/Duo: no restrictions (inherits category permissions).
+        Invite: deny @everyone connect, allow only creator and coach/admin roles.
         Team: deny @everyone connect, allow matching Team role and coach/admin roles.
         """
         if channel_type in (ChannelType.SOLO, ChannelType.DUO):
@@ -317,13 +404,17 @@ class DynamicVoiceManager:
         everyone_role = member.guild.default_role
         overwrites[everyone_role] = discord.PermissionOverwrite(connect=False)
 
-        # Find and allow the creator's Team role
-        team_role = self._find_team_role(member)
-        if team_role is not None:
-            overwrites[team_role] = discord.PermissionOverwrite(connect=True)
-        else:
-            # Fallback: allow creator explicitly when they have no Team role
+        if channel_type is ChannelType.INVITE:
+            # Invite channels: only the creator gets explicit access
             overwrites[member] = discord.PermissionOverwrite(connect=True)
+        else:
+            # Team channels: allow Team role or creator fallback
+            team_role = self._find_team_role(member)
+            if team_role is not None:
+                overwrites[team_role] = discord.PermissionOverwrite(connect=True)
+            else:
+                # Fallback: allow creator explicitly when they have no Team role
+                overwrites[member] = discord.PermissionOverwrite(connect=True)
 
         for role in getattr(member.guild, "roles", ()):
             if self._role_is_coach_or_admin(role):
@@ -362,6 +453,9 @@ class DynamicVoiceManager:
         m = _TEAM_RE.match(name)
         if m:
             return ChannelType.TEAM, f"{m.group(1)} Team", int(m.group(2))
+        m = _INVITE_RE.match(name)
+        if m:
+            return ChannelType.INVITE, f"{m.group(1)} Invite", int(m.group(2))
         return None
 
     async def _schedule_delete(self, channel: discord.VoiceChannel) -> None:

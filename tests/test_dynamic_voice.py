@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 from typing import Any, Generator
 
 import pytest
@@ -53,6 +54,55 @@ class _FakeVoiceChannel:
         self.name = name
         self.members = members or []
         self.overwrites = overwrites or {}
+
+    def overwrites_for(self, target: Any) -> _FakeOverwrite:
+        """Return the overwrite for *target*, or a neutral overwrite."""
+        for key, value in self.overwrites.items():
+            if getattr(key, "id", None) == getattr(target, "id", None):
+                return value
+        return _FakeOverwrite()
+
+
+def _http_exception(message: str = "boom") -> Exception:
+    return dv_module.discord.HTTPException(  # type: ignore[call-arg]
+        SimpleNamespace(status=500, reason="Server Error"),
+        message,
+    )
+
+
+class _FakeInviteVoiceChannel(_FakeVoiceChannel):
+    def __init__(
+        self,
+        channel_id: int,
+        name: str,
+        *,
+        user_limit: int = 1,
+        fail_edit: bool = False,
+    ) -> None:
+        super().__init__(channel_id, name)
+        self.user_limit = user_limit
+        self.fail_edit = fail_edit
+        self.set_permissions_calls: list[dict[str, Any]] = []
+        self.edit_calls: list[dict[str, Any]] = []
+
+    async def set_permissions(self, target: Any, **kwargs: Any) -> None:
+        self.set_permissions_calls.append({"target": target, **kwargs})
+
+        if kwargs.get("overwrite", ...) is None:
+            self.overwrites = {
+                key: value
+                for key, value in self.overwrites.items()
+                if getattr(key, "id", None) != getattr(target, "id", None)
+            }
+            return
+
+        self.overwrites[target] = _FakeOverwrite(connect=kwargs.get("connect"))
+
+    async def edit(self, **kwargs: Any) -> None:
+        self.edit_calls.append(kwargs)
+        if self.fail_edit:
+            raise _http_exception("edit failed")
+        self.user_limit = kwargs["user_limit"]
 
 
 class _FakeGuild:
@@ -367,3 +417,231 @@ def test_build_overwrites_allows_coach_and_admin_roles_for_team_channel() -> Non
     assert overwrites[coach].connect is True
     assert overwrites[admin].connect is True
 
+
+# ---------------------------------------------------------------------------
+# Invite channel – check_access
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_access_invite_allows_creator() -> None:
+    """Creator of an invite channel is always allowed."""
+    manager = DynamicVoiceManager()
+    channel_id = 200
+
+    tracked = TrackedChannel(
+        channel_id=channel_id,
+        guild_id=1,
+        channel_type=ChannelType.INVITE,
+        creator_id=50,
+        label="Alpha Invite",
+        number=1,
+    )
+    manager._channels[1] = {channel_id: tracked}
+
+    member = _FakeMember(50, roles=[])
+    channel = _FakeVoiceChannel(channel_id, "Alpha Invite #1")
+
+    result = await manager.check_access(member, channel)  # type: ignore[arg-type]
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_access_invite_blocks_uninvited_member() -> None:
+    """Members without a connect=True overwrite are blocked from invite channels."""
+    manager = DynamicVoiceManager()
+    channel_id = 201
+
+    tracked = TrackedChannel(
+        channel_id=channel_id,
+        guild_id=1,
+        channel_type=ChannelType.INVITE,
+        creator_id=50,
+        label="Alpha Invite",
+        number=1,
+    )
+    manager._channels[1] = {channel_id: tracked}
+
+    member = _FakeMember(60, roles=[])  # no overwrite
+    channel = _FakeVoiceChannel(channel_id, "Alpha Invite #1")
+
+    result = await manager.check_access(member, channel)  # type: ignore[arg-type]
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_check_access_invite_allows_invited_member() -> None:
+    """Members with a connect=True overwrite are allowed into invite channels."""
+    manager = DynamicVoiceManager()
+    channel_id = 202
+
+    tracked = TrackedChannel(
+        channel_id=channel_id,
+        guild_id=1,
+        channel_type=ChannelType.INVITE,
+        creator_id=50,
+        label="Alpha Invite",
+        number=1,
+    )
+    manager._channels[1] = {channel_id: tracked}
+
+    invited_target = _FakeMemberTarget(70)
+    member = _FakeMember(70, roles=[])
+    channel = _FakeVoiceChannel(
+        channel_id,
+        "Alpha Invite #1",
+        overwrites={invited_target: _FakeOverwrite(connect=True)},
+    )
+
+    result = await manager.check_access(member, channel)  # type: ignore[arg-type]
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_check_access_invite_allows_coach() -> None:
+    """Coaches bypass invite channel restrictions."""
+    manager = DynamicVoiceManager()
+    channel_id = 203
+
+    tracked = TrackedChannel(
+        channel_id=channel_id,
+        guild_id=1,
+        channel_type=ChannelType.INVITE,
+        creator_id=50,
+        label="Alpha Invite",
+        number=1,
+    )
+    manager._channels[1] = {channel_id: tracked}
+
+    member = _FakeMember(80, roles=[_FakeRole(12, "Coach")])
+    channel = _FakeVoiceChannel(channel_id, "Alpha Invite #1")
+
+    result = await manager.check_access(member, channel)  # type: ignore[arg-type]
+    assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – _build_overwrites
+# ---------------------------------------------------------------------------
+
+
+def test_build_overwrites_invite_allows_only_creator() -> None:
+    """Invite channel overwrites deny @everyone and allow only the creator."""
+    everyone = _FakeRole(0, "@everyone")
+    coach = _FakeRole(20, "Coach")
+    team = _FakeRole(22, "Team Alpha")
+    guild = _FakeGuild(1, [], roles=[everyone, coach, team])
+    member = _FakeMember(1, roles=[team], guild=guild)
+
+    manager = DynamicVoiceManager()
+    overwrites = manager._build_overwrites(member, ChannelType.INVITE)  # type: ignore[arg-type]
+
+    assert overwrites[everyone].connect is False
+    assert overwrites[member].connect is True
+    assert overwrites[coach].connect is True
+    # Team role should NOT be in overwrites for invite channels
+    assert team not in overwrites
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – _has_connect_overwrite
+# ---------------------------------------------------------------------------
+
+
+def test_has_connect_overwrite_true() -> None:
+    """Returns True when member has connect=True overwrite."""
+    target = _FakeMemberTarget(42)
+    channel = _FakeVoiceChannel(
+        1, "Test Invite #1",
+        overwrites={target: _FakeOverwrite(connect=True)},
+    )
+    member = _FakeMember(42)
+
+    assert DynamicVoiceManager._has_connect_overwrite(channel, member) is True  # type: ignore[arg-type]
+
+
+def test_has_connect_overwrite_false_when_no_overwrite() -> None:
+    """Returns False when member has no overwrite."""
+    channel = _FakeVoiceChannel(1, "Test Invite #1")
+    member = _FakeMember(42)
+
+    assert DynamicVoiceManager._has_connect_overwrite(channel, member) is False  # type: ignore[arg-type]
+
+
+def test_has_connect_overwrite_false_when_connect_false() -> None:
+    """Returns False when member overwrite has connect=False."""
+    target = _FakeMemberTarget(42)
+    channel = _FakeVoiceChannel(
+        1, "Test Invite #1",
+        overwrites={target: _FakeOverwrite(connect=False)},
+    )
+    member = _FakeMember(42)
+
+    assert DynamicVoiceManager._has_connect_overwrite(channel, member) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – invite_user
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invite_user_rolls_back_overwrite_when_edit_fails() -> None:
+    """Failed user_limit edit removes the newly-added invite overwrite."""
+    manager = DynamicVoiceManager()
+    invited = _FakeMember(90)
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=2, fail_edit=True)
+
+    success = await manager.invite_user(channel, invited)  # type: ignore[arg-type]
+
+    assert success is False
+    assert channel.overwrites_for(invited).connect is not True
+    assert len(channel.set_permissions_calls) == 2
+    assert channel.set_permissions_calls[1]["overwrite"] is None
+
+
+@pytest.mark.asyncio
+async def test_invite_user_caps_user_limit_at_ninety_nine() -> None:
+    """Invites never request a user_limit above Discord's max of 99."""
+    manager = DynamicVoiceManager()
+    invited = _FakeMember(91)
+    channel = _FakeInviteVoiceChannel(100, "Alpha Invite #2", user_limit=99)
+
+    success = await manager.invite_user(channel, invited)  # type: ignore[arg-type]
+
+    assert success is True
+    assert channel.edit_calls[-1]["user_limit"] == 99
+    assert channel.overwrites_for(invited).connect is True
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – _parse_channel_name / _build_label
+# ---------------------------------------------------------------------------
+
+
+def test_parse_channel_name_invite() -> None:
+    """Invite channel names are parsed correctly."""
+    result = DynamicVoiceManager._parse_channel_name("Alpha Invite #3")
+    assert result == (ChannelType.INVITE, "Alpha Invite", 3)
+
+
+def test_is_dynamic_channel_name_invite() -> None:
+    """is_dynamic_channel_name recognises invite channel patterns."""
+    assert DynamicVoiceManager.is_dynamic_channel_name("Alpha Invite #1") is True
+    assert DynamicVoiceManager.is_dynamic_channel_name("Invite #1") is False  # no group name
+
+
+def test_build_label_invite_with_team_role() -> None:
+    """Invite label uses Team role name when available."""
+    manager = DynamicVoiceManager()
+    member = _FakeMember(1, roles=[_FakeRole(10, "Team Alpha")])
+    label = manager._build_label(member, ChannelType.INVITE)  # type: ignore[arg-type]
+    assert label == "Alpha Invite"
+
+
+def test_build_label_invite_fallback_to_display_name() -> None:
+    """Invite label falls back to display_name when no role matches."""
+    manager = DynamicVoiceManager()
+    member = _FakeMember(1, roles=[])
+    label = manager._build_label(member, ChannelType.INVITE)  # type: ignore[arg-type]
+    assert label == "member-1 Invite"
