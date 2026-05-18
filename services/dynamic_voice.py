@@ -41,6 +41,7 @@ _TEAM_RE = re.compile(r"^(.+) Team #(\d+)$")
 _INVITE_RE = re.compile(r"^(.+) Invite #(\d+)$")
 
 _DELETE_DELAY_SECONDS = 2.0
+_DISCORD_MAX_VOICE_USER_LIMIT = 99
 
 
 @dataclass(slots=True)
@@ -152,6 +153,14 @@ class DynamicVoiceManager:
 
         Returns True on success, False on API failure.
         """
+        def _log_invite_failure(error: Exception) -> None:
+            logger.error(
+                "Failed to invite member %s to channel %s: %s",
+                invited.id,
+                channel.name,
+                error,
+            )
+
         try:
             await channel.set_permissions(
                 invited,
@@ -159,15 +168,10 @@ class DynamicVoiceManager:
                 reason="Invited by a channel member",
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.error(
-                "Failed to invite member %s to channel %s: %s",
-                invited.id,
-                channel.name,
-                exc,
-            )
+            _log_invite_failure(exc)
             return False
 
-        new_limit = min((channel.user_limit or 0) + 1, 99)
+        new_limit = min((channel.user_limit or 0) + 1, _DISCORD_MAX_VOICE_USER_LIMIT)
         try:
             await channel.edit(user_limit=new_limit, reason="Invite capacity increase")
         except (discord.Forbidden, discord.HTTPException) as exc:
@@ -184,12 +188,7 @@ class DynamicVoiceManager:
                     channel.name,
                     rollback_exc,
                 )
-            logger.error(
-                "Failed to invite member %s to channel %s: %s",
-                invited.id,
-                channel.name,
-                exc,
-            )
+            _log_invite_failure(exc)
             return False
 
         logger.info(
