@@ -147,7 +147,8 @@ class DynamicVoiceManager:
         """Grant *invited* member access to an invite-only channel.
 
         Adds a member-specific ``connect=True`` permission overwrite and
-        increases the channel's ``user_limit`` by one.
+        increases the channel's ``user_limit`` by one (up to Discord's max 99).
+        If increasing the limit fails, the overwrite is rolled back.
 
         Returns True on success, False on API failure.
         """
@@ -155,17 +156,8 @@ class DynamicVoiceManager:
             await channel.set_permissions(
                 invited,
                 connect=True,
-                reason=f"Invited by a channel member",
+                reason="Invited by a channel member",
             )
-            new_limit = (channel.user_limit or 0) + 1
-            await channel.edit(user_limit=new_limit, reason="Invite capacity increase")
-            logger.info(
-                "Invited member %s to channel %s (new limit=%d)",
-                invited.id,
-                channel.name,
-                new_limit,
-            )
-            return True
         except (discord.Forbidden, discord.HTTPException) as exc:
             logger.error(
                 "Failed to invite member %s to channel %s: %s",
@@ -174,6 +166,39 @@ class DynamicVoiceManager:
                 exc,
             )
             return False
+
+        new_limit = min((channel.user_limit or 0) + 1, 99)
+        try:
+            await channel.edit(user_limit=new_limit, reason="Invite capacity increase")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            try:
+                await channel.set_permissions(
+                    invited,
+                    overwrite=None,
+                    reason="Rollback failed invite",
+                )
+            except (discord.Forbidden, discord.HTTPException) as rollback_exc:
+                logger.error(
+                    "Failed to rollback invite for member %s in channel %s: %s",
+                    invited.id,
+                    channel.name,
+                    rollback_exc,
+                )
+            logger.error(
+                "Failed to invite member %s to channel %s: %s",
+                invited.id,
+                channel.name,
+                exc,
+            )
+            return False
+
+        logger.info(
+            "Invited member %s to channel %s (new limit=%d)",
+            invited.id,
+            channel.name,
+            new_limit,
+        )
+        return True
 
     @staticmethod
     def _has_connect_overwrite(

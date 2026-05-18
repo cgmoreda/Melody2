@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 from typing import Any, Generator
 
 import pytest
@@ -60,6 +61,48 @@ class _FakeVoiceChannel:
             if getattr(key, "id", None) == getattr(target, "id", None):
                 return value
         return _FakeOverwrite()
+
+
+def _http_exception(message: str = "boom") -> Exception:
+    return dv_module.discord.HTTPException(  # type: ignore[call-arg]
+        SimpleNamespace(status=500, reason="Server Error"),
+        message,
+    )
+
+
+class _FakeInviteVoiceChannel(_FakeVoiceChannel):
+    def __init__(
+        self,
+        channel_id: int,
+        name: str,
+        *,
+        user_limit: int = 1,
+        fail_edit: bool = False,
+    ) -> None:
+        super().__init__(channel_id, name)
+        self.user_limit = user_limit
+        self.fail_edit = fail_edit
+        self.set_permissions_calls: list[dict[str, Any]] = []
+        self.edit_calls: list[dict[str, Any]] = []
+
+    async def set_permissions(self, target: Any, **kwargs: Any) -> None:
+        self.set_permissions_calls.append({"target": target, **kwargs})
+
+        if kwargs.get("overwrite", ...) is None:
+            self.overwrites = {
+                key: value
+                for key, value in self.overwrites.items()
+                if getattr(key, "id", None) != getattr(target, "id", None)
+            }
+            return
+
+        self.overwrites[target] = _FakeOverwrite(connect=kwargs.get("connect"))
+
+    async def edit(self, **kwargs: Any) -> None:
+        self.edit_calls.append(kwargs)
+        if self.fail_edit:
+            raise _http_exception("edit failed")
+        self.user_limit = kwargs["user_limit"]
 
 
 class _FakeGuild:
@@ -535,6 +578,40 @@ def test_has_connect_overwrite_false_when_connect_false() -> None:
     member = _FakeMember(42)
 
     assert DynamicVoiceManager._has_connect_overwrite(channel, member) is False  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – invite_user
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invite_user_rolls_back_overwrite_when_edit_fails() -> None:
+    """Failed user_limit edit removes the newly-added invite overwrite."""
+    manager = DynamicVoiceManager()
+    invited = _FakeMember(90)
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=2, fail_edit=True)
+
+    success = await manager.invite_user(channel, invited)  # type: ignore[arg-type]
+
+    assert success is False
+    assert channel.overwrites_for(invited).connect is not True
+    assert len(channel.set_permissions_calls) == 2
+    assert channel.set_permissions_calls[1]["overwrite"] is None
+
+
+@pytest.mark.asyncio
+async def test_invite_user_caps_user_limit_at_ninety_nine() -> None:
+    """Invites never request a user_limit above Discord's max of 99."""
+    manager = DynamicVoiceManager()
+    invited = _FakeMember(91)
+    channel = _FakeInviteVoiceChannel(100, "Alpha Invite #2", user_limit=99)
+
+    success = await manager.invite_user(channel, invited)  # type: ignore[arg-type]
+
+    assert success is True
+    assert channel.edit_calls[-1]["user_limit"] == 99
+    assert channel.overwrites_for(invited).connect is True
 
 
 # ---------------------------------------------------------------------------
