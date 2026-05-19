@@ -68,12 +68,14 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
     # ── commands ─────────────────────────────────────────────────
 
     @commands.command(name="invite")
-    async def invite_cmd(self, ctx: commands.Context, target: discord.Member) -> None:
-        """Invite a user to your invite-only voice channel.
+    async def invite_cmd(self, ctx: commands.Context, target: str) -> None:
+        """Invite a user or role to your invite-only voice channel.
 
         Usage: !invite @user
+               !invite @role
         Only works when you are inside a tracked invite-only voice channel.
-        The invited user will receive a DM and a mention in the text channel.
+        Invited members receive a DM and a mention in the text channel.
+        Invited roles are granted access and confirmed in the text channel only.
         """
         # Ensure the author is in a voice channel
         voice_state = ctx.author.voice
@@ -101,6 +103,37 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
             )
             return
 
+        # Try resolving as a role first, then as a member
+        resolved_role: discord.Role | None = None
+        resolved_member: discord.Member | None = None
+
+        try:
+            resolved_role = await commands.RoleConverter().convert(ctx, target)
+        except commands.BadArgument:
+            pass
+
+        if resolved_role is not None:
+            await self._invite_role(ctx, channel, resolved_role)
+            return
+
+        try:
+            resolved_member = await commands.MemberConverter().convert(ctx, target)
+        except commands.BadArgument:
+            await ctx.send(
+                "\u274c Could not resolve that as a member or role.",
+                delete_after=10,
+            )
+            return
+
+        await self._invite_member(ctx, channel, resolved_member)
+
+    async def _invite_member(
+        self,
+        ctx: commands.Context,
+        channel: discord.VoiceChannel,
+        target: discord.Member,
+    ) -> None:
+        """Invite a single member to an invite-only channel."""
         # Cannot invite bots
         if target.bot:
             await ctx.send("\u274c You cannot invite a bot.", delete_after=10)
@@ -152,6 +185,52 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
         except (discord.Forbidden, discord.HTTPException):
             # DMs might be disabled; the text-channel mention is enough
             logger.info("Could not DM invite notification to member %s", target.id)
+
+    async def _invite_role(
+        self,
+        ctx: commands.Context,
+        channel: discord.VoiceChannel,
+        role: discord.Role,
+    ) -> None:
+        """Invite all non-bot members of a role to an invite-only channel."""
+        # Prevent inviting @everyone role
+        if role == ctx.guild.default_role:
+            await ctx.send(
+                "\u274c You cannot invite the @everyone role.",
+                delete_after=10,
+            )
+            return
+
+        # Check if role already has a connect overwrite
+        overwrite = channel.overwrites_for(role)
+        if overwrite.connect is True:
+            await ctx.send(
+                f"\u2139\ufe0f Role **{role.name}** has already been invited.",
+                delete_after=10,
+            )
+            return
+
+        non_bot_count = sum(1 for m in role.members if not getattr(m, "bot", False))
+        if non_bot_count == 0:
+            await ctx.send(
+                f"\u274c Role **{role.name}** has no non-bot members.",
+                delete_after=10,
+            )
+            return
+
+        success, count = await self._manager.invite_role(channel, role)
+        if not success:
+            await ctx.send(
+                "\u274c Failed to invite the role. Please try again.",
+                delete_after=10,
+            )
+            return
+
+        await ctx.send(
+            f"\u2705 Role **{role.name}** ({count} members) has been invited to "
+            f"**{channel.name}** by {ctx.author.mention}! "
+            f"All members of this role can now join."
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

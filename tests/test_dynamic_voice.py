@@ -645,3 +645,87 @@ def test_build_label_invite_fallback_to_display_name() -> None:
     member = _FakeMember(1, roles=[])
     label = manager._build_label(member, ChannelType.INVITE)  # type: ignore[arg-type]
     assert label == "member-1 Invite"
+
+
+# ---------------------------------------------------------------------------
+# Invite channel – invite_role
+# ---------------------------------------------------------------------------
+
+
+class _FakeRoleForInvite:
+    """Minimal fake role with a .members list for invite_role tests."""
+
+    def __init__(self, role_id: int, name: str, members: list[Any]) -> None:
+        self.id = role_id
+        self.name = name
+        self.members = members
+
+
+@pytest.mark.asyncio
+async def test_invite_role_grants_role_overwrite_and_increases_limit() -> None:
+    """invite_role sets connect=True for the role and increases user_limit."""
+    manager = DynamicVoiceManager()
+    m1 = _FakeMember(10)
+    m2 = _FakeMember(20)
+    role = _FakeRoleForInvite(100, "Team Alpha", [m1, m2])
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=1)
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 2
+    # Role overwrite should have been set
+    assert len(channel.set_permissions_calls) == 1
+    assert channel.set_permissions_calls[0]["target"] is role
+    assert channel.set_permissions_calls[0]["connect"] is True
+    # user_limit increased by member count
+    assert channel.user_limit == 3  # 1 + 2
+
+
+@pytest.mark.asyncio
+async def test_invite_role_rolls_back_when_edit_fails() -> None:
+    """Failed user_limit edit removes the role overwrite."""
+    manager = DynamicVoiceManager()
+    m1 = _FakeMember(10)
+    role = _FakeRoleForInvite(100, "Team Alpha", [m1])
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=1, fail_edit=True)
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is False
+    assert count == 0
+    # Two set_permissions calls: one to set, one to rollback
+    assert len(channel.set_permissions_calls) == 2
+    assert channel.set_permissions_calls[1]["overwrite"] is None
+
+
+@pytest.mark.asyncio
+async def test_invite_role_caps_limit_at_ninety_nine() -> None:
+    """invite_role caps user_limit at Discord's maximum of 99."""
+    manager = DynamicVoiceManager()
+    members = [_FakeMember(i) for i in range(50)]
+    role = _FakeRoleForInvite(100, "BigRole", members)
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=80)
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 50
+    assert channel.user_limit == 99  # capped at 99, not 130
+
+
+@pytest.mark.asyncio
+async def test_invite_role_excludes_bots_from_count() -> None:
+    """invite_role counts only non-bot members."""
+    manager = DynamicVoiceManager()
+    m1 = _FakeMember(10)
+    bot = _FakeMember(20)
+    bot.bot = True
+    role = _FakeRoleForInvite(100, "MixedRole", [m1, bot])
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=1)
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 1
+    assert channel.user_limit == 2  # 1 + 1 (bot excluded)

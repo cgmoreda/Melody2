@@ -199,6 +199,71 @@ class DynamicVoiceManager:
         )
         return True
 
+    async def invite_role(
+        self,
+        channel: discord.VoiceChannel,
+        role: discord.Role,
+    ) -> tuple[bool, int]:
+        """Grant all non-bot members of *role* access to an invite-only channel.
+
+        Adds a role-level ``connect=True`` permission overwrite and increases
+        the channel's ``user_limit`` by the number of non-bot role members
+        (capped at Discord's max 99).
+
+        Returns (success, invited_count).
+        """
+        non_bot_members = [m for m in role.members if not getattr(m, "bot", False)]
+        count = len(non_bot_members)
+
+        try:
+            await channel.set_permissions(
+                role,
+                connect=True,
+                reason="Role invited by a channel member",
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.error(
+                "Failed to set role invite overwrite for %s on channel %s: %s",
+                role.name,
+                channel.name,
+                exc,
+            )
+            return False, 0
+
+        new_limit = min((channel.user_limit or 0) + max(count, 1), _DISCORD_MAX_VOICE_USER_LIMIT)
+        try:
+            await channel.edit(user_limit=new_limit, reason="Role invite capacity increase")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            try:
+                await channel.set_permissions(
+                    role,
+                    overwrite=None,
+                    reason="Rollback failed role invite",
+                )
+            except (discord.Forbidden, discord.HTTPException) as rollback_exc:
+                logger.error(
+                    "Failed to rollback role invite for %s in channel %s: %s",
+                    role.name,
+                    channel.name,
+                    rollback_exc,
+                )
+            logger.error(
+                "Failed to increase capacity for role invite %s on channel %s: %s",
+                role.name,
+                channel.name,
+                exc,
+            )
+            return False, 0
+
+        logger.info(
+            "Invited role %s (%d members) to channel %s (new limit=%d)",
+            role.name,
+            count,
+            channel.name,
+            new_limit,
+        )
+        return True, count
+
     @staticmethod
     def _has_connect_overwrite(
         channel: discord.VoiceChannel,
