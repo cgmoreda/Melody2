@@ -74,7 +74,8 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
         Usage: !invite @user
                !invite @role
         Only works when you are inside a tracked invite-only voice channel.
-        The invited user(s) will receive a DM and a mention in the text channel.
+        Invited members receive a DM and a mention in the text channel.
+        Invited roles are granted access and confirmed in the text channel only.
         """
         # Ensure the author is in a voice channel
         voice_state = ctx.author.voice
