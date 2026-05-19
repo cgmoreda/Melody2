@@ -767,7 +767,7 @@ async def test_voicehours_tahzeeq_excludes_guest_role_members() -> None:
         config_service=_FakeTahzeeqConfigService(),  # type: ignore[arg-type]
     )
 
-    ctx = _FakeContext(guild)
+    ctx = _FakeContext(guild, administrator=True)
     await cog.voicehours.callback(cog, ctx, "tahzeeq", "2", "last", "1", "days")  # type: ignore[union-attr]
 
     output = "\n".join(ctx.sent_messages)
@@ -1325,7 +1325,7 @@ async def test_voicehours_window_before_tahzeeq_mode() -> None:
         config_service=_FakeTahzeeqConfigService(),  # type: ignore[arg-type]
     )
 
-    ctx = _FakeContext(guild)
+    ctx = _FakeContext(guild, administrator=True)
     await cog.voicehours.callback(  # type: ignore[union-attr]
         cog,
         ctx,
