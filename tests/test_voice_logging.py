@@ -10,6 +10,7 @@ import pytest
 
 import cogs.voice_logging as voice_logging_module
 from cogs.voice_logging import VoiceLoggingCog, WorkConfirmationResult
+from discord.ext import commands
 from db.repository import CoachConfig
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 from services.dynamic_voice import DynamicVoiceManager
@@ -1638,3 +1639,318 @@ async def test_voicehours_unis_empty_state_message(
 
     assert len(ctx.sent_messages) == 1
     assert "`uni`" in ctx.sent_messages[0]
+
+
+# ---------------------------------------------------------------------------
+# Tests for voicehours total subcommand — parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_voicehours_total_single_role() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "<@&111>"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("<@&111>",)
+    assert request.window_tokens == ()
+
+
+def test_parse_voicehours_total_everyone() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "everyone"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("everyone",)
+
+
+def test_parse_voicehours_total_multiple_targets() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "<@&111>", "<@&222>"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("<@&111>", "<@&222>")
+    assert request.window_tokens == ()
+
+
+def test_parse_voicehours_total_with_window() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "<@&111>", "last", "1", "week"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("<@&111>",)
+    assert request.window_tokens == ("last", "1", "week")
+
+
+def test_parse_voicehours_total_with_date() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "<@&111>", "15/5"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("<@&111>",)
+    assert request.window_tokens == ("15/5",)
+
+
+def test_parse_voicehours_total_role_and_user_with_window() -> None:
+    request = VoiceLoggingCog._parse_voicehours_request(
+        ("total", "<@&111>", "<@222>", "last", "2", "days"), default_top_limit=50,
+    )
+    assert request.action == "total"
+    assert request.total_targets == ("<@&111>", "<@222>")
+    assert request.window_tokens == ("last", "2", "days")
+
+
+def test_parse_voicehours_total_no_targets_raises() -> None:
+    with pytest.raises(ValueError, match="Usage"):
+        VoiceLoggingCog._parse_voicehours_request(("total",), default_top_limit=50)
+
+
+# ---------------------------------------------------------------------------
+# Tests for voicehours total subcommand — integration (handler)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRoleForTotal:
+    def __init__(self, role_id: int, name: str, members: list[Any]) -> None:
+        self.id = role_id
+        self.name = name
+        self.members = members
+
+
+class _FakeGuildForTotal:
+    def __init__(
+        self,
+        guild_id: int,
+        members: list[_FakeMemberWithBot],
+        roles: list[_FakeRoleForTotal] | None = None,
+    ) -> None:
+        self.id = guild_id
+        self.roles = roles or []
+        self.voice_channels: list[Any] = []
+        self._members_by_id = {m.id: m for m in members}
+        self.members = members
+
+    def get_member(self, member_id: int) -> _FakeMemberWithBot | None:
+        return self._members_by_id.get(member_id)
+
+
+class _FakeContextForTotal:
+    """Context with role/member converter support for total tests."""
+
+    def __init__(
+        self,
+        guild: _FakeGuildForTotal,
+        *,
+        role_map: dict[str, _FakeRoleForTotal] | None = None,
+        member_map: dict[str, _FakeMemberWithBot] | None = None,
+    ) -> None:
+        self.guild = guild
+        self.sent_messages: list[str] = []
+        self._role_map = role_map or {}
+        self._member_map = member_map or {}
+
+        class _Author:
+            id = 1
+            display_name = "TestUser"
+
+            class guild_permissions:
+                administrator = False
+
+        self.author = _Author()
+
+    async def send(self, message: str) -> None:
+        self.sent_messages.append(message)
+
+
+def _make_total_cog(
+    guild: Any,
+    totals: dict[int, float],
+) -> VoiceLoggingCog:
+    repo = _FakeRepoWithTotals(totals=totals)
+    config_service = _FakeConfigServiceWithMaxLines()
+    return VoiceLoggingCog(
+        bot=object(),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=config_service,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_single_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Total for a single role sums only members in that role."""
+    m1 = _FakeMemberWithBot(10, display_name="Alice")
+    m2 = _FakeMemberWithBot(20, display_name="Bob")
+    m3 = _FakeMemberWithBot(30, display_name="Charlie")
+    role = _FakeRoleForTotal(111, "TeamA", [m1, m2])
+    guild = _FakeGuildForTotal(1, [m1, m2, m3], [role])
+
+    totals = {10: 3600.0, 20: 7200.0, 30: 1800.0}
+    cog = _make_total_cog(guild, totals)
+
+    # Patch RoleConverter to return our fake role
+    async def _convert_role(self, ctx, arg):
+        if arg == "<@&111>":
+            return role
+        raise commands.BadArgument()
+
+    async def _convert_member(self, ctx, arg):
+        raise commands.BadArgument()
+
+    monkeypatch.setattr(commands.RoleConverter, "convert", _convert_role)
+    monkeypatch.setattr(commands.MemberConverter, "convert", _convert_member)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "<@&111>")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "TeamA" in msg
+    assert "3.00h" in msg  # 3600 + 7200 = 10800 = 3.00h
+    assert "2 members" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_everyone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Total for 'everyone' sums all non-bot guild members."""
+    m1 = _FakeMemberWithBot(10)
+    m2 = _FakeMemberWithBot(20)
+    bot_member = _FakeMemberWithBot(99, bot=True)
+    guild = _FakeGuildForTotal(1, [m1, m2, bot_member])
+
+    totals = {10: 3600.0, 20: 7200.0, 99: 9999.0}
+    cog = _make_total_cog(guild, totals)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "everyone")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "everyone" in msg
+    assert "3.00h" in msg  # 3600 + 7200 = 10800 = 3.00h (bot excluded)
+    assert "2 members" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_two_roles_deduplicates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a member is in both roles, their hours are counted once."""
+    m1 = _FakeMemberWithBot(10, display_name="Alice")
+    m2 = _FakeMemberWithBot(20, display_name="Bob")
+    roleA = _FakeRoleForTotal(111, "TeamA", [m1, m2])
+    roleB = _FakeRoleForTotal(222, "TeamB", [m2])  # Bob in both roles
+    guild = _FakeGuildForTotal(1, [m1, m2], [roleA, roleB])
+
+    totals = {10: 3600.0, 20: 7200.0}
+    cog = _make_total_cog(guild, totals)
+
+    async def _convert_role(self, ctx, arg):
+        if arg == "<@&111>":
+            return roleA
+        if arg == "<@&222>":
+            return roleB
+        raise commands.BadArgument()
+
+    async def _convert_member(self, ctx, arg):
+        raise commands.BadArgument()
+
+    monkeypatch.setattr(commands.RoleConverter, "convert", _convert_role)
+    monkeypatch.setattr(commands.MemberConverter, "convert", _convert_member)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "<@&111>", "<@&222>")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "TeamA + TeamB" in msg
+    assert "3.00h" in msg  # 3600 + 7200 = 10800 = 3.00h (Bob counted once)
+    assert "2 members" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_role_plus_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Total for a role + user combines both, de-duplicating."""
+    m1 = _FakeMemberWithBot(10, display_name="Alice")
+    m2 = _FakeMemberWithBot(20, display_name="Bob")
+    m3 = _FakeMemberWithBot(30, display_name="Charlie")
+    role = _FakeRoleForTotal(111, "TeamA", [m1])
+    guild = _FakeGuildForTotal(1, [m1, m2, m3], [role])
+
+    totals = {10: 3600.0, 30: 1800.0}
+    cog = _make_total_cog(guild, totals)
+
+    async def _convert_role(self, ctx, arg):
+        if arg == "<@&111>":
+            return role
+        raise commands.BadArgument()
+
+    async def _convert_member(self, ctx, arg):
+        if arg == "<@30>":
+            return m3
+        raise commands.BadArgument()
+
+    monkeypatch.setattr(commands.RoleConverter, "convert", _convert_role)
+    monkeypatch.setattr(commands.MemberConverter, "convert", _convert_member)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "<@&111>", "<@30>")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "TeamA + Charlie" in msg
+    assert "1.50h" in msg  # 3600 + 1800 = 5400 = 1.50h
+    assert "2 members" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_with_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Total respects the window tokens in the output label."""
+    m1 = _FakeMemberWithBot(10)
+    guild = _FakeGuildForTotal(1, [m1])
+
+    totals = {10: 3600.0}
+    cog = _make_total_cog(guild, totals)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "everyone", "last", "1", "week")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "last 1 week" in msg
+    assert "everyone" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_zero_hours(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Total with no voice data shows 0.00h."""
+    m1 = _FakeMemberWithBot(10)
+    guild = _FakeGuildForTotal(1, [m1])
+
+    cog = _make_total_cog(guild, {})
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "everyone")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    msg = ctx.sent_messages[0]
+    assert "0.00h" in msg
+    assert "1 members" in msg
+
+
+@pytest.mark.asyncio
+async def test_voicehours_total_unresolvable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a target cannot be resolved, an error message is sent."""
+    guild = _FakeGuildForTotal(1, [_FakeMemberWithBot(10)])
+    cog = _make_total_cog(guild, {})
+
+    async def _convert_role(self, ctx, arg):
+        raise commands.BadArgument()
+
+    async def _convert_member(self, ctx, arg):
+        raise commands.BadArgument()
+
+    monkeypatch.setattr(commands.RoleConverter, "convert", _convert_role)
+    monkeypatch.setattr(commands.MemberConverter, "convert", _convert_member)
+
+    ctx = _FakeContextForTotal(guild)
+    await cog.voicehours.callback(cog, ctx, "total", "unknown_thing")  # type: ignore[union-attr]
+
+    assert len(ctx.sent_messages) == 1
+    assert "Could not resolve" in ctx.sent_messages[0]
