@@ -207,13 +207,22 @@ class DynamicVoiceManager:
         """Grant all non-bot members of *role* access to an invite-only channel.
 
         Adds a role-level ``connect=True`` permission overwrite and increases
-        the channel's ``user_limit`` by the number of non-bot role members
-        (capped at Discord's max 99).
+        the channel's ``user_limit`` only for members who do not already have
+        access (not already in the channel and not already individually invited).
 
-        Returns (success, invited_count).
+        Returns (success, new_member_count).
         """
         non_bot_members = [m for m in role.members if not getattr(m, "bot", False)]
         count = len(non_bot_members)
+
+        # Only increase capacity for members who don't already have access
+        existing_member_ids = {m.id for m in channel.members}
+        new_members = [
+            m for m in non_bot_members
+            if m.id not in existing_member_ids
+            and not self._has_connect_overwrite(channel, m)
+        ]
+        capacity_increase = len(new_members)
 
         try:
             await channel.set_permissions(
@@ -230,37 +239,41 @@ class DynamicVoiceManager:
             )
             return False, 0
 
-        new_limit = min((channel.user_limit or 0) + max(count, 1), _DISCORD_MAX_VOICE_USER_LIMIT)
-        try:
-            await channel.edit(user_limit=new_limit, reason="Role invite capacity increase")
-        except (discord.Forbidden, discord.HTTPException) as exc:
+        if capacity_increase > 0:
+            new_limit = min(
+                (channel.user_limit or 0) + capacity_increase,
+                _DISCORD_MAX_VOICE_USER_LIMIT,
+            )
             try:
-                await channel.set_permissions(
-                    role,
-                    overwrite=None,
-                    reason="Rollback failed role invite",
-                )
-            except (discord.Forbidden, discord.HTTPException) as rollback_exc:
+                await channel.edit(user_limit=new_limit, reason="Role invite capacity increase")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                try:
+                    await channel.set_permissions(
+                        role,
+                        overwrite=None,
+                        reason="Rollback failed role invite",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as rollback_exc:
+                    logger.error(
+                        "Failed to rollback role invite for %s in channel %s: %s",
+                        role.name,
+                        channel.name,
+                        rollback_exc,
+                    )
                 logger.error(
-                    "Failed to rollback role invite for %s in channel %s: %s",
+                    "Failed to increase capacity for role invite %s on channel %s: %s",
                     role.name,
                     channel.name,
-                    rollback_exc,
+                    exc,
                 )
-            logger.error(
-                "Failed to increase capacity for role invite %s on channel %s: %s",
-                role.name,
-                channel.name,
-                exc,
-            )
-            return False, 0
+                return False, 0
 
         logger.info(
-            "Invited role %s (%d members) to channel %s (new limit=%d)",
+            "Invited role %s (%d total, %d new) to channel %s",
             role.name,
             count,
+            capacity_increase,
             channel.name,
-            new_limit,
         )
         return True, count
 

@@ -729,3 +729,62 @@ async def test_invite_role_excludes_bots_from_count() -> None:
     assert success is True
     assert count == 1
     assert channel.user_limit == 2  # 1 + 1 (bot excluded)
+
+
+@pytest.mark.asyncio
+async def test_invite_role_excludes_members_already_in_channel() -> None:
+    """Members already in the channel should not increase the capacity."""
+    manager = DynamicVoiceManager()
+    invoker = _FakeMember(10)
+    other = _FakeMember(20)
+    role = _FakeRoleForInvite(100, "Team Alpha", [invoker, other])
+    # invoker is already in the channel
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=1)
+    channel.members = [invoker]
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 2  # total non-bot role members
+    # Only 'other' is new, so limit should increase by 1
+    assert channel.user_limit == 2  # 1 + 1 (invoker excluded)
+
+
+@pytest.mark.asyncio
+async def test_invite_role_excludes_already_individually_invited_members() -> None:
+    """Members with an existing connect=True overwrite should not increase capacity."""
+    manager = DynamicVoiceManager()
+    previously_invited = _FakeMember(10)
+    new_member = _FakeMember(20)
+    role = _FakeRoleForInvite(100, "Team Alpha", [previously_invited, new_member])
+
+    invited_target = _FakeMemberTarget(10)
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=2)
+    channel.overwrites = {invited_target: _FakeOverwrite(connect=True)}
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 2  # total non-bot role members
+    # Only new_member is truly new, so limit increases by 1
+    assert channel.user_limit == 3  # 2 + 1
+
+
+@pytest.mark.asyncio
+async def test_invite_role_no_capacity_increase_when_all_have_access() -> None:
+    """When all role members already have access, no edit call is made."""
+    manager = DynamicVoiceManager()
+    m1 = _FakeMember(10)
+    role = _FakeRoleForInvite(100, "Team Alpha", [m1])
+
+    # m1 is already in the channel
+    channel = _FakeInviteVoiceChannel(99, "Alpha Invite #1", user_limit=1)
+    channel.members = [m1]
+
+    success, count = await manager.invite_role(channel, role)  # type: ignore[arg-type]
+
+    assert success is True
+    assert count == 1
+    # No edit call should have been made (capacity_increase == 0)
+    assert len(channel.edit_calls) == 0
+    assert channel.user_limit == 1  # unchanged
