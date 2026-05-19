@@ -42,6 +42,7 @@ VoiceHoursAction = Literal[
     "timesheet",
     "max",
     "track",
+    "total",
 ]
 TimesheetAction = Literal["last", "max"]
 
@@ -56,6 +57,7 @@ class VoiceHoursCommandRequest:
     timesheet_tokens: tuple[str, ...] = ()
     max_tokens: tuple[str, ...] = ()
     track_tokens: tuple[str, ...] = ()
+    total_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,7 +433,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return (
             "Unknown mode.\n"
             "Use one of: `last`, `tahzeeq`, `me`, `user`, `role`, `roles`, `teams`, `unis`, "
-            "`top`, `timesheet`, `max`, `track`.\n"
+            "`top`, `timesheet`, `max`, `track`, `total`.\n"
             "Example: `!voicehours top 20 last 2 weeks`"
         )
 
@@ -507,6 +509,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             return VoiceHoursCommandRequest(action="track", track_tokens=args[1:])
         if first == "timesheet":
             return VoiceHoursCommandRequest(action="timesheet", timesheet_tokens=args[1:])
+        if first == "total":
+            return cls._parse_total_request(args[1:])
 
         normalized = [normalize_token(arg) for arg in args]
         if "max" in normalized:
@@ -585,6 +589,50 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             )
 
         raise CommandParseError(cls._voicehours_unknown_message())
+
+    @classmethod
+    def _parse_total_request(cls, args: tuple[str, ...]) -> VoiceHoursCommandRequest:
+        """Parse ``!voicehours total <targets...> [last ...]`` into a request."""
+        TOTAL_USAGE = (
+            "Usage: `!voicehours total <@role|@user|everyone> "
+            "[<@role|@user>...] [last <x> <hour/day/week/month>]`"
+        )
+        if not args:
+            raise CommandParseError(TOTAL_USAGE)
+
+        import re
+        date_pattern = re.compile(r"^\d{1,2}/\d{1,2}(?:/\d{2,4})?$")
+        date_tokens: tuple[str, ...] = ()
+        clean_args: list[str] = []
+        for arg in args:
+            if date_pattern.match(arg):
+                if date_tokens:
+                    raise CommandParseError("Only one date clause is allowed.")
+                date_tokens = (arg,)
+            else:
+                clean_args.append(arg)
+
+        last_clause, remaining = extract_single_clause(
+            tuple(clean_args),
+            {"last"},
+            3,
+            name="last",
+            incomplete_message="Usage: `... [last <x> <hour/day/week/month>]`",
+        )
+        if last_clause and date_tokens:
+            raise CommandParseError("Cannot specify both `last` and a specific date.")
+
+        window_tokens = last_clause.tokens if last_clause is not None else date_tokens
+
+        targets = tuple(remaining)
+        if not targets:
+            raise CommandParseError(TOTAL_USAGE)
+
+        return VoiceHoursCommandRequest(
+            action="total",
+            total_targets=targets,
+            window_tokens=window_tokens,
+        )
 
     @staticmethod
     def _sorted_totals(totals: dict[int, float]) -> list[tuple[int, float]]:
@@ -1021,6 +1069,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         - `!voicehours last <x> <hour/day/week/month> user <@member>`
         - `!voicehours last <x> <hour/day/week/month> role <@role>`
         - `!voicehours last <x> <hour/day/week/month> tahzeeq <x>`
+        - `!voicehours total <@role|@user|everyone> [<@role|@user>...] [last ...]`
         - `!voicehours timesheet last <days> days`
         - `!voicehours max <day/week/month/range> ...`
         - `!voicehours top <limit> max <day/week/month/range> ...`
@@ -1064,6 +1113,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             if request.action == "track":
                 await self._handle_track(ctx, request.track_tokens)
+                return
+
+            if request.action == "total":
+                await self._handle_total(ctx, request, now=now)
                 return
 
             try:
@@ -1324,6 +1377,73 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             message_lines.append(f"Your all-time rank: **#{rank}** with **{_hours(seconds)}**")
         for chunk in split_lines_chunks(message_lines):
             await ctx.send(chunk)
+
+    # ── total subcommand logic ─────────────────────────────────
+
+    async def _handle_total(
+        self,
+        ctx: commands.Context,
+        request: VoiceHoursCommandRequest,
+        *,
+        now: datetime,
+    ) -> None:
+        """Handle ``!voicehours total <targets...> [last ...]``."""
+        assert ctx.guild is not None
+
+        try:
+            since, until, label = self._parse_window_tokens(now=now, tokens=request.window_tokens)
+        except ValueError as err:
+            await ctx.send(str(err))
+            return
+
+        member_ids: set[int] = set()
+        label_parts: list[str] = []
+
+        for raw_target in request.total_targets:
+            normalized = normalize_token(raw_target)
+            if normalized == "everyone":
+                for member in ctx.guild.members:
+                    if not getattr(member, "bot", False):
+                        member_ids.add(member.id)
+                label_parts.append("everyone")
+                continue
+
+            # Try as role mention first
+            resolved_role = None
+            try:
+                resolved_role = await commands.RoleConverter().convert(ctx, raw_target)
+            except commands.BadArgument:
+                pass
+
+            if resolved_role is not None:
+                for member in resolved_role.members:
+                    if not getattr(member, "bot", False):
+                        member_ids.add(member.id)
+                label_parts.append(resolved_role.name)
+                continue
+
+            # Try as user mention
+            try:
+                resolved_member = await commands.MemberConverter().convert(ctx, raw_target)
+            except commands.BadArgument:
+                await ctx.send(f"Could not resolve `{raw_target}` as a role or member.")
+                return
+
+            member_ids.add(resolved_member.id)
+            label_parts.append(resolved_member.display_name)
+
+        if not member_ids:
+            await ctx.send("No members found for the given targets.")
+            return
+
+        totals = await self._repo.get_tracked_voice_totals(ctx.guild.id, now=until, since=since)
+        total_seconds = sum(totals.get(mid, 0.0) for mid in member_ids)
+
+        group_label = " + ".join(label_parts)
+        await ctx.send(
+            f"**Total Tracked Voice Hours for {group_label} ({label}):** "
+            f"**{_hours(total_seconds)}** ({len(member_ids)} members)"
+        )
 
     # ── track subcommand logic ──────────────────────────────────
 
