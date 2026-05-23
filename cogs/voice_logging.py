@@ -1009,7 +1009,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 removal_action: SoloRemovalAction | None = None
                 if member.voice is not None:
+                    current_task = self._watchdogs.pop(member.id, None)
                     removal_action = await self._move_member_out_of_solo_check(member)
+                    if removal_action is None and current_task is not None:
+                        self._watchdogs[member.id] = current_task
 
                 if removal_action is None:
                     if confirmation is WorkConfirmationResult.TIMED_OUT:
@@ -1022,10 +1025,13 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     continue
 
                 if removal_action == "afk" and self._coach_secretary is not None:
+                    logger.info("Checking coach config for AFK escalation in guild %s", guild.id)
                     coach_config = await self._coach_secretary.get_config(guild.id)
                     if coach_config is not None:
+                        logger.info("Found coach config, fetching coach ID %s", coach_config.coach_id)
                         coach = guild.get_member(coach_config.coach_id)
                         if coach is not None:
+                            logger.info("Coach %s found in guild, preparing to send DM", coach.id)
                             try:
                                 view = AfkEscalationView(
                                     member=member,
@@ -1044,6 +1050,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                                 logger.info("Triggered AFK escalation for %s to coach %s in guild %s", member.id, coach.id, guild.id)
                             except discord.Forbidden:
                                 logger.warning("Could not DM coach %s for AFK escalation in guild %s", coach.id, guild.id)
+                            except Exception as e:
+                                logger.exception("Failed to send AFK escalation to coach %s in guild %s", coach.id, guild.id)
 
                 await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
