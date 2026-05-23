@@ -1021,6 +1021,30 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                             pass
                     continue
 
+                if removal_action == "afk" and self._coach_secretary is not None:
+                    coach_config = await self._coach_secretary.get_config(guild.id)
+                    if coach_config is not None:
+                        coach = guild.get_member(coach_config.coach_id)
+                        if coach is not None:
+                            try:
+                                view = AfkEscalationView(
+                                    member=member,
+                                    guild=guild,
+                                    original_channel=voice_channel,
+                                    config=coach_config,
+                                )
+                                await coach.send(
+                                    f"{member.mention} was moved to the AFK room after failing the AFK confirmation check.\n"
+                                    f"Original channel: {voice_channel.name if voice_channel else 'Unknown'}\n"
+                                    f"Time: <t:{int(datetime.now(tz=UTC).timestamp())}:F>\n"
+                                    f"Reason: AFK timeout\n\n"
+                                    f"Do you want me to move them to your office for a warning?",
+                                    view=view,
+                                )
+                                logger.info("Triggered AFK escalation for %s to coach %s in guild %s", member.id, coach.id, guild.id)
+                            except discord.Forbidden:
+                                logger.warning("Could not DM coach %s for AFK escalation in guild %s", coach.id, guild.id)
+
                 await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
                     try:
