@@ -177,6 +177,7 @@ class _FakeMember:
         self.bot = is_bot
         self.name = name or f"user-{member_id}"
         self.display_name = display_name or self.name
+        self.mention = f"<@{member_id}>"
         self.global_name = None
         self.guild: _FakeGuild | None = None
         self.voice: _FakeVoiceState | None = None
@@ -228,6 +229,14 @@ class _FakeGuild:
 
     def get_member(self, member_id: int) -> _FakeMember | None:
         return self._members.get(member_id)
+
+    def get_channel(self, channel_id: int) -> _FakeVoiceChannel | None:
+        for channel in self.voice_channels:
+            if channel.id == channel_id:
+                return channel
+        if self.afk_channel and self.afk_channel.id == channel_id:
+            return self.afk_channel
+        return None
 
 
 class _FakeVoiceState:
@@ -419,8 +428,9 @@ async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session(
 
     await cog._watchdog_loop(guild.id, member.id)
 
-    assert len(coach.sent_messages) == 1
+    assert len(coach.sent_messages) == 2
     assert "Worker" in coach.sent_messages[0]
+    assert "AFK room" in coach.sent_messages[1]
     assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id

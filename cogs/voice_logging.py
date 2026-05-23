@@ -23,6 +23,7 @@ from services.guild_config import GuildConfigService
 from services.voice_service import VoiceService
 
 if TYPE_CHECKING:
+    from db.repository import CoachConfig
     from services.coach_secretary import CoachSecretaryBase
     from services.dynamic_voice import DynamicVoiceManager
 
@@ -116,6 +117,97 @@ class WorkConfirmationView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(content="Confirmed. Keeping your session active.", view=self)
         self.stop()
+
+
+class AfkEscalationView(discord.ui.View):
+    def __init__(
+        self,
+        member: discord.Member,
+        guild: discord.Guild,
+        original_channel: discord.VoiceChannel,
+        config: "CoachConfig",
+    ) -> None:
+        super().__init__(timeout=300)
+        self._member = member
+        self._guild = guild
+        self._original_channel = original_channel
+        self._config = config
+        self._responded = False
+
+    def _finalize(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self._responded:
+            await interaction.response.send_message("You already responded.", ephemeral=True)
+            return
+        self._responded = True
+
+        member = self._guild.get_member(self._member.id)
+        if member is None or member.voice is None or member.voice.channel is None:
+            await interaction.response.edit_message(
+                content=f"{self._member.display_name} is no longer in voice.",
+                view=None,
+            )
+            self._finalize()
+            return
+
+        if self._guild.afk_channel is None or member.voice.channel.id != self._guild.afk_channel.id:
+            await interaction.response.edit_message(
+                content=f"{self._member.display_name} is no longer in the AFK room.",
+                view=None,
+            )
+            self._finalize()
+            return
+
+        coach_channel = self._guild.get_channel(self._config.coach_channel_id)
+        if not isinstance(coach_channel, discord.VoiceChannel):
+            await interaction.response.edit_message(content="Coach office was deleted.", view=None)
+            self._finalize()
+            return
+
+        coach = self._guild.get_member(self._config.coach_id)
+        if coach is None or coach.voice is None or coach.voice.channel is None or coach.voice.channel.id != coach_channel.id:
+            await interaction.response.edit_message(content="You are not connected to your office.", view=None)
+            self._finalize()
+            return
+
+        try:
+            await member.move_to(coach_channel, reason="Coach escalated AFK warning")
+        except discord.Forbidden:
+            await interaction.response.edit_message(content="Missing permissions to move that member.", view=None)
+            self._finalize()
+            return
+        except discord.HTTPException as exc:
+            await interaction.response.edit_message(content=f"Could not move member: {exc}", view=None)
+            self._finalize()
+            return
+
+        await interaction.response.edit_message(
+            content=f"Moved {self._member.display_name} to {coach_channel.name} for an AFK warning.",
+            view=None,
+        )
+        logger.info("Coach %s escalated AFK for %s in guild %s", self._config.coach_id, self._member.id, self._guild.id)
+        self._finalize()
+
+    @discord.ui.button(label="Ignore", style=discord.ButtonStyle.secondary)
+    async def ignore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self._responded:
+            await interaction.response.send_message("You already responded.", ephemeral=True)
+            return
+        self._responded = True
+
+        await interaction.response.edit_message(
+            content=f"Ignored AFK escalation for {self._member.display_name}.",
+            view=None,
+        )
+        self._finalize()
+
+    async def on_timeout(self) -> None:
+        self._finalize()
 
 
 class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
@@ -917,7 +1009,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
                 removal_action: SoloRemovalAction | None = None
                 if member.voice is not None:
+                    current_task = self._watchdogs.pop(member.id, None)
                     removal_action = await self._move_member_out_of_solo_check(member)
+                    if removal_action is None and current_task is not None:
+                        self._watchdogs[member.id] = current_task
 
                 if removal_action is None:
                     if confirmation is WorkConfirmationResult.TIMED_OUT:
@@ -928,6 +1023,35 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         except discord.Forbidden:
                             pass
                     continue
+
+                if removal_action == "afk" and self._coach_secretary is not None:
+                    logger.info("Checking coach config for AFK escalation in guild %s", guild.id)
+                    coach_config = await self._coach_secretary.get_config(guild.id)
+                    if coach_config is not None:
+                        logger.info("Found coach config, fetching coach ID %s", coach_config.coach_id)
+                        coach = guild.get_member(coach_config.coach_id)
+                        if coach is not None:
+                            logger.info("Coach %s found in guild, preparing to send DM", coach.id)
+                            try:
+                                view = AfkEscalationView(
+                                    member=member,
+                                    guild=guild,
+                                    original_channel=voice_channel,
+                                    config=coach_config,
+                                )
+                                await coach.send(
+                                    f"{member.mention} was moved to the AFK room after failing the AFK confirmation check.\n"
+                                    f"Original channel: {voice_channel.name if voice_channel else 'Unknown'}\n"
+                                    f"Time: <t:{int(datetime.now(tz=UTC).timestamp())}:F>\n"
+                                    f"Reason: AFK timeout\n\n"
+                                    f"Do you want me to move them to your office for a warning?",
+                                    view=view,
+                                )
+                                logger.info("Triggered AFK escalation for %s to coach %s in guild %s", member.id, coach.id, guild.id)
+                            except discord.Forbidden:
+                                logger.warning("Could not DM coach %s for AFK escalation in guild %s", coach.id, guild.id)
+                            except Exception as e:
+                                logger.exception("Failed to send AFK escalation to coach %s in guild %s", coach.id, guild.id)
 
                 await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
                 if confirmation is WorkConfirmationResult.TIMED_OUT:
