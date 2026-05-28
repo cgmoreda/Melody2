@@ -8,7 +8,7 @@ from typing import Union
 import discord
 from discord.ext import commands
 
-from db.repository import CoachConfig
+from db.repository import CoachConfig, DatabaseReadDisabled
 from services.coach_secretary import SUMMON_BYPASS_SECONDS, CoachSecretaryBase
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,10 @@ class CoachSecretaryCog(commands.Cog, name="CoachSecretary"):
         if member.bot:
             return
 
-        config = await self._secretary.get_config(member.guild.id)
+        try:
+            config = await self._secretary.get_config(member.guild.id)
+        except DatabaseReadDisabled:
+            return
         if config is None:
             return
 

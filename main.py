@@ -6,7 +6,12 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from db.repository import UserRepository
+from db.repository import (
+    DatabaseReadDisabled,
+    READ_QUERIES_DISABLED_MESSAGE,
+    ReadBlockingRepository,
+    UserRepository,
+)
 from services.cf_client import CodeforcesClient
 from services.coach_secretary import CoachSecretary
 from services.atcoder_client import AtCoderProvider
@@ -37,6 +42,13 @@ EXTENSIONS: tuple[str, ...] = (
 )
 
 
+def _is_db_read_disabled(error: BaseException) -> bool:
+    current: BaseException = error
+    while isinstance(current, commands.CommandInvokeError) and getattr(current, "original", None) is not None:
+        current = current.original  # type: ignore[assignment]
+    return isinstance(current, DatabaseReadDisabled)
+
+
 class MelodyBot(commands.Bot):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -62,6 +74,12 @@ class MelodyBot(commands.Bot):
             except Exception:
                 logger.exception("Failed to sync app command tree")
             self._tree_synced = True
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        if _is_db_read_disabled(error):
+            await ctx.send(READ_QUERIES_DISABLED_MESSAGE)
+            return
+        raise error
 
     async def close(self) -> None:
         await _teardown_services(self)
@@ -91,7 +109,7 @@ async def _setup_services(bot: commands.Bot) -> None:
         raise RuntimeError("DATABASE_URL is not set")
 
     session: aiohttp.ClientSession | None = None
-    repo: UserRepository | None = None
+    repo: UserRepository | ReadBlockingRepository | None = None
     reminder: ContestReminderService | None = None
     daily_sheet_reminder: DailySheetReminderService | None = None
 
@@ -104,6 +122,7 @@ async def _setup_services(bot: commands.Bot) -> None:
 
         repo = UserRepository(database_url)
         await repo.init()
+        repo = ReadBlockingRepository(repo)
         bot.user_repo = repo  # type: ignore[attr-defined]
 
         poll_raw = os.getenv("CF_REMINDER_POLL_SECONDS", "300")
@@ -125,7 +144,10 @@ async def _setup_services(bot: commands.Bot) -> None:
         logger.info("Contest reminder service started")
 
         daily_sheet_reminder = DailySheetReminderService(bot=bot, repo=repo)
-        await daily_sheet_reminder.initialize()
+        try:
+            await daily_sheet_reminder.initialize()
+        except DatabaseReadDisabled:
+            logger.warning("DB reads disabled; daily sheet reminders start without persisted state")
         daily_sheet_reminder.start()
         bot.daily_sheet_reminder = daily_sheet_reminder  # type: ignore[attr-defined]
         logger.info("Daily sheet reminder service started")

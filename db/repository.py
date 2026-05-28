@@ -12,6 +12,36 @@ import asyncpg
 
 logger = logging.getLogger(__name__)
 
+READ_QUERIES_DISABLED_MESSAGE = "Voice hours queries are frozen"
+
+
+class DatabaseReadDisabled(RuntimeError):
+    """Raised when database read methods are disabled."""
+
+    def __init__(self, message: str = READ_QUERIES_DISABLED_MESSAGE) -> None:
+        super().__init__(message)
+
+
+_READ_METHOD_PREFIXES = ("get_", "list_", "has_")
+
+
+def _is_read_method(name: str) -> bool:
+    return name.startswith(_READ_METHOD_PREFIXES)
+
+
+class ReadBlockingRepository:
+    def __init__(self, repo: "UserRepositoryBase") -> None:
+        self._repo = repo
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._repo, name)
+        if callable(attr) and _is_read_method(name):
+            async def _blocked(*_: Any, **__: Any) -> Any:
+                raise DatabaseReadDisabled()
+
+            return _blocked
+        return attr
+
 
 class VerifiedHandleConflict(Exception):
     """Raised when a Codeforces handle is already linked in a guild."""

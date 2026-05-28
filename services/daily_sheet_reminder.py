@@ -8,7 +8,7 @@ from typing import Optional
 
 import discord
 
-from db.repository import DailySheetReminderConfig, DailySheetReminderRepository
+from db.repository import DailySheetReminderConfig, DailySheetReminderRepository, DatabaseReadDisabled
 from services.discord_output import DISCORD_MESSAGE_CHAR_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,7 @@ class DailySheetReminderService:
         self._reminders: dict[int, DailySheetReminderConfig] = {}
         self._initialized = False
         self._init_lock = asyncio.Lock()
+        self._reads_disabled = False
 
     async def initialize(self) -> None:
         async with self._init_lock:
@@ -77,6 +78,8 @@ class DailySheetReminderService:
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
+        if self._reads_disabled:
+            raise DatabaseReadDisabled()
         await self.initialize()
 
     def start(self) -> None:
@@ -150,8 +153,13 @@ class DailySheetReminderService:
             now = now.replace(tzinfo=UTC)
         else:
             now = now.astimezone(UTC)
-
-        await self._ensure_initialized()
+        try:
+            await self._ensure_initialized()
+        except DatabaseReadDisabled:
+            if not self._reads_disabled:
+                logger.warning("DB reads disabled; daily sheet reminders paused")
+                self._reads_disabled = True
+            return
         reminders = list(self._reminders.values())
         for reminder in reminders:
             if not self._is_due(reminder, now):

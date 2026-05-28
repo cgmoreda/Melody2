@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 import discord
 from discord.ext import commands
 
-from db.repository import VoiceFeatureRepository
+from db.repository import DatabaseReadDisabled, VoiceFeatureRepository
 from services.command_parser import (
     CommandParseError,
     extract_single_clause,
@@ -246,7 +246,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         cached = self._tracked_keywords_cache.get(guild_id)
         if cached is not None:
             return cached
-        raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
+        try:
+            raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
+        except DatabaseReadDisabled:
+            return []
         keywords = [k.strip().lower() for k in raw.split(",") if k.strip()]
         self._tracked_keywords_cache[guild_id] = keywords
         return keywords
@@ -326,7 +329,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                     active_tracked_by_member[member.id] = voice_channel
 
             active_member_ids = set(active_tracked_by_member)
-            open_tracked_member_ids = await self._repo.get_open_tracked_voice_member_ids(guild.id)
+            try:
+                open_tracked_member_ids = await self._repo.get_open_tracked_voice_member_ids(guild.id)
+            except DatabaseReadDisabled:
+                logger.warning("DB reads disabled; skipping voice tracking sync for guild %s", guild.id)
+                continue
             for member_id in open_tracked_member_ids:
                 self._persisted_voice_sessions.add(self._voice_session_key(guild.id, member_id))
 

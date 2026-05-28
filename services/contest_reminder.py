@@ -10,7 +10,7 @@ from typing import Optional, Protocol, runtime_checkable
 import aiohttp
 import discord
 
-from db.repository import ReminderRepository
+from db.repository import DatabaseReadDisabled, ReminderRepository
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +151,13 @@ class ContestReminderService:
         self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
-        channels = await self._repo.get_reminder_channels()
+        try:
+            channels = await self._repo.get_reminder_channels()
+        except DatabaseReadDisabled:
+            async with self._lock:
+                self._enabled_channels = set()
+            logger.warning("DB reads disabled; contest reminders start without persisted channels")
+            return
         retention_cutoff = datetime.now(tz=UTC) - timedelta(days=REMINDER_DEDUPE_RETENTION_DAYS)
         try:
             deleted = await self._repo.cleanup_old_sent_contest_reminders(retention_cutoff)
