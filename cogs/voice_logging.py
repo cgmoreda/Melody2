@@ -1117,15 +1117,20 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             return WorkConfirmationResult.DM_FAILED
 
         if voice_task is not None:
-            try:
-                await voice_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Voice alert playback failed for member %s", member.id)
+            def _log_voice_task(task: asyncio.Task[bool]) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Voice alert playback failed for member %s", member.id)
+
+            voice_task.add_done_callback(_log_voice_task)
 
         await view.wait()
 
+        if voice_task is not None and not voice_task.done():
+            voice_task.cancel()
         if view.confirmed:
             return WorkConfirmationResult.CONFIRMED
 
