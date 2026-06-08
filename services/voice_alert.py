@@ -22,7 +22,7 @@ _DEFAULT_AUDIO_PATH = os.path.join(
 _PLAY_TIMEOUT_SECONDS = 30.0
 
 # Time to wait after playback finishes to allow buffered audio packets to flush.
-_POST_PLAYBACK_DELAY = 1.5
+_POST_PLAYBACK_DELAY = 2.5
 
 
 
