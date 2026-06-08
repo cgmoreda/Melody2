@@ -184,7 +184,8 @@ class VoiceAlertService:
                 logger.info("[CLEANUP_START] guild=%s", guild.id)
                 try:
                     if voice_client.is_connected():
-                        await voice_client.disconnect()
+                        # Protect disconnect from cancellation to guarantee bot leaves the channel.
+                        await asyncio.shield(voice_client.disconnect())
                     logger.info("[CLEANUP_DONE] guild=%s", guild.id)
                 except Exception:
                     logger.exception(
