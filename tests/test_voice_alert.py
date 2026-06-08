@@ -100,10 +100,9 @@ async def test_play_alert_timeout(mock_channel: MagicMock, mock_voice_client: As
     mock_channel.connect.side_effect = _connect
     
     # Simulate play_audio hanging
-    async def hanging_play(*args, **kwargs) -> bool:
-        await asyncio.sleep(_PLAY_TIMEOUT_SECONDS + 1.0)
+    async def hanging_play(*args: object, **kwargs: object) -> bool:
+        await asyncio.sleep(0.2)
         return True
-
     # Use a shorter timeout just for the test to avoid waiting 15s
     with patch("services.voice_alert._PLAY_TIMEOUT_SECONDS", 0.1):
         with patch.object(service, "_play_audio", side_effect=hanging_play):
