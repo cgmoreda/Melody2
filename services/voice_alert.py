@@ -176,8 +176,16 @@ class VoiceAlertService:
                 logger.warning("[PLAYBACK_DONE] failed — guild=%s. Fallback activated.", guild.id)
             return played
         finally:
-            await self._safe_disconnect(guild)
-
+            if voice_client is not None:
+                logger.info("[CLEANUP_START] guild=%s", guild.id)
+                try:
+                    if voice_client.is_connected():
+                        await voice_client.disconnect()
+                    logger.info("[CLEANUP_DONE] guild=%s", guild.id)
+                except Exception:
+                    logger.exception(
+                        "[CLEANUP_DONE] error disconnecting voice client in guild %s", guild.id
+                    )
     async def _play_audio(
         self,
         voice_client: discord.VoiceClient,
