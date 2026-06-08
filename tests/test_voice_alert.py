@@ -9,6 +9,12 @@ import pytest
 from services.voice_alert import VoiceAlertService, _PLAY_TIMEOUT_SECONDS
 
 
+@pytest.fixture(autouse=True)
+def fast_tests():
+    with patch("services.voice_alert._POST_PLAYBACK_DELAY", 0.0):
+        yield
+
+
 @pytest.fixture
 def mock_channel() -> MagicMock:
     channel = MagicMock(spec=discord.VoiceChannel)

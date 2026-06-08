@@ -21,6 +21,10 @@ _DEFAULT_AUDIO_PATH = os.path.join(
 # Maximum time to wait for the entire play_alert operation.
 _PLAY_TIMEOUT_SECONDS = 30.0
 
+# Time to wait after playback finishes to allow buffered audio packets to flush.
+_POST_PLAYBACK_DELAY = 1.5
+
+
 
 def _create_audio_source(audio_path: str) -> discord.AudioSource:
     """Create an audio source, preferring OpusAudio over PCMAudio.
@@ -171,6 +175,7 @@ class VoiceAlertService:
             played = await self._play_audio(voice_client, audio_path)
             if played:
                 logger.info("[PLAYBACK_DONE] success — guild=%s", guild.id)
+                await asyncio.sleep(_POST_PLAYBACK_DELAY)
             else:
                 logger.warning("[PLAYBACK_DONE] failed — guild=%s. Fallback activated.", guild.id)
             return played
