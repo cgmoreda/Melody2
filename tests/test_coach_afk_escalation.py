@@ -62,7 +62,7 @@ async def test_afk_escalation_triggers_coach_dm() -> None:
         coach_secretary=_FakeCoachSecretary(coach.id),  # type: ignore[arg-type]
     )
 
-    async def _timed_out(_: Any, __: int) -> WorkConfirmationResult:
+    async def _timed_out(*args: Any, **kwargs: Any) -> WorkConfirmationResult:
         return WorkConfirmationResult.TIMED_OUT
 
     cog._ask_still_working = _timed_out  # type: ignore[method-assign]
