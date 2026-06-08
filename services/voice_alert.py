@@ -89,20 +89,19 @@ class VoiceAlertService:
                 self._play_locked(lock, channel, path),
                 timeout=_PLAY_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "Voice alert timed out after %.0fs in guild %s",
                 _PLAY_TIMEOUT_SECONDS,
                 guild.id,
             )
-            # Force-disconnect on timeout.
-            await self._safe_disconnect(guild)
             return False
         except Exception:
             logger.exception(
                 "Unexpected error during voice alert in guild %s", guild.id
             )
-            await self._safe_disconnect(guild)
             return False
 
     async def _play_locked(
