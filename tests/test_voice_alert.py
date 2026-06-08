@@ -25,6 +25,9 @@ def mock_channel() -> MagicMock:
 @pytest.fixture
 def mock_voice_client() -> AsyncMock:
     vc = AsyncMock(spec=discord.VoiceClient)
+    vc.is_connected.return_value = True
+    vc.guild = MagicMock(spec=discord.Guild)
+    vc.guild.id = 123
     return vc
 
 
@@ -32,8 +35,15 @@ def mock_voice_client() -> AsyncMock:
 async def test_play_alert_success(mock_channel: MagicMock, mock_voice_client: AsyncMock) -> None:
     """Test successful voice alert playback."""
     service = VoiceAlertService("dummy.mp3")
-    mock_channel.connect.return_value = mock_voice_client
-    
+    guild = mock_channel.guild
+
+    async def _connect(**kwargs: object) -> AsyncMock:
+        # Simulate discord.py setting guild.voice_client after connect.
+        guild.voice_client = mock_voice_client
+        return mock_voice_client
+
+    mock_channel.connect.side_effect = _connect
+
     # Mock play_audio to just return True immediately
     with patch.object(service, "_play_audio", return_value=True):
         with patch("os.path.isfile", return_value=True):
@@ -41,7 +51,7 @@ async def test_play_alert_success(mock_channel: MagicMock, mock_voice_client: As
             
     assert result is True
     mock_channel.connect.assert_called_once()
-    mock_voice_client.disconnect.assert_called_once_with(force=True)
+    mock_voice_client.disconnect.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -81,7 +91,13 @@ async def test_play_alert_missing_permissions(mock_channel: MagicMock) -> None:
 async def test_play_alert_timeout(mock_channel: MagicMock, mock_voice_client: AsyncMock) -> None:
     """Test that a long playback times out and forces disconnect."""
     service = VoiceAlertService("dummy.mp3")
-    mock_channel.connect.return_value = mock_voice_client
+    guild = mock_channel.guild
+
+    async def _connect(**kwargs: object) -> AsyncMock:
+        guild.voice_client = mock_voice_client
+        return mock_voice_client
+
+    mock_channel.connect.side_effect = _connect
     
     # Simulate play_audio hanging
     async def hanging_play(*args, **kwargs) -> bool:
@@ -95,4 +111,6 @@ async def test_play_alert_timeout(mock_channel: MagicMock, mock_voice_client: As
                 result = await service.play_alert(mock_channel)
                 
     assert result is False
-    mock_voice_client.disconnect.assert_called_once_with(force=True)
+    # disconnect may be called more than once (both _play_inner finally and
+    # play_alert timeout handler invoke _safe_disconnect for safety).
+    mock_voice_client.disconnect.assert_called_with()

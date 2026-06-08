@@ -19,7 +19,30 @@ _DEFAULT_AUDIO_PATH = os.path.join(
 )
 
 # Maximum time to wait for the entire play_alert operation.
-_PLAY_TIMEOUT_SECONDS = 15.0
+_PLAY_TIMEOUT_SECONDS = 30.0
+
+
+def _create_audio_source(audio_path: str) -> discord.AudioSource:
+    """Create an audio source, preferring OpusAudio over PCMAudio.
+
+    ``FFmpegOpusAudio`` lets FFmpeg encode directly to Opus, which
+    removes the requirement for ``libopus`` to be installed on the
+    host system.  ``FFmpegPCMAudio`` is kept as a fallback in case
+    ``FFmpegOpusAudio`` fails to initialise for any reason.
+    """
+    try:
+        source = discord.FFmpegOpusAudio(audio_path)
+        logger.debug("Using FFmpegOpusAudio for %s", audio_path)
+        return source
+    except Exception:
+        logger.warning(
+            "FFmpegOpusAudio unavailable, falling back to FFmpegPCMAudio for %s",
+            audio_path,
+            exc_info=True,
+        )
+    source = discord.FFmpegPCMAudio(audio_path)
+    logger.debug("Using FFmpegPCMAudio for %s", audio_path)
+    return source
 
 
 class VoiceAlertService:
@@ -99,29 +122,33 @@ class VoiceAlertService:
         guild = channel.guild
         voice_client: Optional[discord.VoiceClient] = None
 
-        logger.info("Voice alert started in guild %s for channel %s", guild.id, channel.name)
+        # If the bot is already connected in this guild, DO NOT disconnect it.
+        # Skip the voice alert and fall back to normal flow.
+        if guild.voice_client is not None:
+            logger.info(
+                "Bot is already connected in guild %s. Voice alert fallback activated.",
+                guild.id,
+            )
+            return False
+
+        logger.info(
+            "[VOICE_CONNECT_START] guild=%s channel=%s",
+            guild.id,
+            channel.name,
+        )
 
         try:
-            # If the bot is already connected in this guild, DO NOT disconnect it.
-            # Skip the voice alert and fall back to normal flow.
-            if guild.voice_client is not None:
-                logger.info(
-                    "Bot is already connected in guild %s. Voice alert fallback activated.",
-                    guild.id,
-                )
-                return False
-
-            voice_client = await channel.connect(timeout=5.0, self_deaf=True)
+            voice_client = await channel.connect(timeout=15.0, self_deaf=True)
         except discord.Forbidden:
             logger.warning(
-                "Missing voice permissions for channel %s in guild %s. Voice alert fallback activated.",
+                "[VOICE_CONNECT_START] FAILED — missing voice permissions for channel %s in guild %s. Fallback activated.",
                 channel.name,
                 guild.id,
             )
             return False
         except discord.ClientException as exc:
             logger.warning(
-                "ClientException connecting to %s in guild %s: %s. Voice alert fallback activated.",
+                "[VOICE_CONNECT_START] FAILED — ClientException for %s in guild %s: %s. Fallback activated.",
                 channel.name,
                 guild.id,
                 exc,
@@ -129,18 +156,24 @@ class VoiceAlertService:
             return False
         except Exception:
             logger.exception(
-                "Failed to connect to voice channel %s in guild %s. Voice alert fallback activated.",
+                "[VOICE_CONNECT_START] FAILED — exception connecting to %s in guild %s. Fallback activated.",
                 channel.name,
                 guild.id,
             )
             return False
 
+        logger.info(
+            "[VOICE_CONNECT_OK] guild=%s channel=%s",
+            guild.id,
+            channel.name,
+        )
+
         try:
             played = await self._play_audio(voice_client, audio_path)
             if played:
-                logger.info("Voice alert completed successfully in guild %s", guild.id)
+                logger.info("[PLAYBACK_DONE] success — guild=%s", guild.id)
             else:
-                logger.warning("Voice alert fallback activated in guild %s due to playback failure", guild.id)
+                logger.warning("[PLAYBACK_DONE] failed — guild=%s. Fallback activated.", guild.id)
             return played
         finally:
             await self._safe_disconnect(guild)
@@ -161,15 +194,17 @@ class VoiceAlertService:
                 loop.call_soon_threadsafe(finished.set_result, error is None)
 
         try:
-            source = discord.FFmpegPCMAudio(audio_path)
+            source = _create_audio_source(audio_path)
         except Exception:
-            logger.exception("Failed to create FFmpegPCMAudio source")
+            logger.exception("Failed to create audio source for %s", audio_path)
             return False
 
         try:
+            await asyncio.sleep(1.0)
+            logger.info("[PLAYBACK_START] guild=%s file=%s", voice_client.guild.id, audio_path)
             voice_client.play(source, after=_after)
         except discord.ClientException:
-            logger.exception("Failed to start playback (already playing?)")
+            logger.exception("[PLAYBACK_START] FAILED — already playing? guild=%s", voice_client.guild.id)
             return False
 
         return await finished
@@ -180,10 +215,12 @@ class VoiceAlertService:
         vc = guild.voice_client
         if vc is None:
             return
+        logger.info("[CLEANUP_START] guild=%s", guild.id)
         try:
-            await vc.disconnect(force=True)
-            logger.info("Voice alert cleanup completed: disconnected from voice in guild %s", guild.id)
+            if vc.is_connected():
+                await vc.disconnect()
+            logger.info("[CLEANUP_DONE] guild=%s", guild.id)
         except Exception:
             logger.exception(
-                "Error disconnecting voice client in guild %s", guild.id
+                "[CLEANUP_DONE] error disconnecting voice client in guild %s", guild.id
             )
