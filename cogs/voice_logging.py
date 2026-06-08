@@ -20,6 +20,7 @@ from services.command_parser import (
 )
 from services.discord_output import send_context_lines_chunks, send_context_text_chunks, split_lines_chunks
 from services.guild_config import GuildConfigService
+from services.voice_alert import VoiceAlertService
 from services.voice_service import VoiceService
 
 if TYPE_CHECKING:
@@ -218,12 +219,14 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         config_service: GuildConfigService,
         dynamic_voice: Optional[DynamicVoiceManager] = None,
         coach_secretary: Optional[CoachSecretaryBase] = None,
+        voice_alert: Optional[VoiceAlertService] = None,
     ) -> None:
         self.bot = bot
         self._repo = repo
         self._config = config_service
         self._dynamic_voice = dynamic_voice
         self._coach_secretary = coach_secretary
+        self._voice_alert = voice_alert
         self._voice_service = VoiceService()
         self._watchdogs: dict[int, asyncio.Task[None]] = {}
         self._pending_voice_starts: dict[
@@ -1000,7 +1003,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if not _is_solo_channel(voice_channel):
                     break
 
-                confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds)
+                confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds, voice_channel)
                 if confirmation is WorkConfirmationResult.CONFIRMED:
                     continue
 
@@ -1086,19 +1089,48 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         except (discord.Forbidden, discord.HTTPException):
             return None
 
-    async def _ask_still_working(self, member: discord.Member, timeout_seconds: int) -> WorkConfirmationResult:
+    async def _ask_still_working(
+        self, 
+        member: discord.Member, 
+        timeout_seconds: int,
+        voice_channel: Optional[discord.VoiceChannel] = None,
+    ) -> WorkConfirmationResult:
         view = WorkConfirmationView(member.id, timeout_seconds)
         timeout_minutes = max(1, timeout_seconds // 60)
         prompt = (
             "Are you still working in the solo channel?\n"
             f"Click **Yes, still working** within {timeout_minutes} minutes to keep your session."
         )
+
+        voice_task: asyncio.Task[bool] | None = None
+        if self._voice_alert is not None and voice_channel is not None:
+            voice_task = asyncio.create_task(
+                self._voice_alert.play_alert(voice_channel),
+                name=f"afk-voice-alert-{member.id}",
+            )
+
         try:
             message = await member.send(prompt, view=view)
         except (discord.Forbidden, discord.HTTPException):
+            if voice_task is not None:
+                voice_task.cancel()
             return WorkConfirmationResult.DM_FAILED
 
+        if voice_task is not None:
+            def _log_voice_task(task: asyncio.Task[bool]) -> None:
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Voice alert playback failed for member %s", member.id)
+
+            voice_task.add_done_callback(_log_voice_task)
+
         await view.wait()
+
+        if voice_task is not None and not voice_task.done():
+            voice_task.cancel()
         if view.confirmed:
             return WorkConfirmationResult.CONFIRMED
 
@@ -1108,6 +1140,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             await message.edit(content="No response received in time.", view=view)
         except discord.HTTPException:
             pass
+
         return WorkConfirmationResult.TIMED_OUT
 
     async def _resolve_watchdog_alert_recipient(self, guild: discord.Guild) -> Optional[discord.Member]:
@@ -1665,6 +1698,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 async def setup(bot: commands.Bot) -> None:
     dynamic_voice: Optional[DynamicVoiceManager] = getattr(bot, "dynamic_voice", None)
     coach_secretary: Optional[CoachSecretaryBase] = getattr(bot, "coach_secretary", None)
+    voice_alert = VoiceAlertService()
     await bot.add_cog(
         VoiceLoggingCog(
             bot,
@@ -1672,6 +1706,7 @@ async def setup(bot: commands.Bot) -> None:
             getattr(bot, "guild_config"),
             dynamic_voice=dynamic_voice,
             coach_secretary=coach_secretary,
+            voice_alert=voice_alert,
         )
     )
 

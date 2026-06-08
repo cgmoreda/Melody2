@@ -421,7 +421,7 @@ async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session(
         coach_secretary=_FakeCoachSecretary(coach.id),  # type: ignore[arg-type]
     )
 
-    async def _dm_failed(_: Any, __: int) -> WorkConfirmationResult:
+    async def _dm_failed(*args: Any, **kwargs: Any) -> WorkConfirmationResult:
         return WorkConfirmationResult.DM_FAILED
 
     cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
@@ -452,7 +452,7 @@ async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config()
         coach_secretary=_FakeCoachSecretary(None),  # type: ignore[arg-type]
     )
 
-    async def _dm_failed(_: Any, __: int) -> WorkConfirmationResult:
+    async def _dm_failed(*args: Any, **kwargs: Any) -> WorkConfirmationResult:
         return WorkConfirmationResult.DM_FAILED
 
     cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
@@ -479,7 +479,7 @@ async def test_watchdog_disconnects_when_no_afk_channel_is_configured() -> None:
         config_service=_FakeFastConfigService(),  # type: ignore[arg-type]
     )
 
-    async def _timed_out(_: Any, __: int) -> WorkConfirmationResult:
+    async def _timed_out(*args: Any, **kwargs: Any) -> WorkConfirmationResult:
         return WorkConfirmationResult.TIMED_OUT
 
     cog._ask_still_working = _timed_out  # type: ignore[method-assign]
