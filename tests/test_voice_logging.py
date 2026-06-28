@@ -1964,3 +1964,99 @@ async def test_voicehours_total_unresolvable_target(monkeypatch: pytest.MonkeyPa
 
     assert len(ctx.sent_messages) == 1
     assert "Could not resolve" in ctx.sent_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_on_guild_channel_delete_closes_sessions_for_disconnected_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(46)
+    target_channel = _FakeVoiceChannel(1007, "Solo Room D", [])
+    # Member is not in any voice channel right now, but has a persisted session
+    guild = _FakeGuild(904, [target_channel], extra_members=[member])
+    member.guild = guild
+    member.voice = None
+
+    # The listener reads channel.guild
+    target_channel.guild = guild  # type: ignore[attr-defined]
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigService(),  # type: ignore[arg-type]
+    )
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+
+    await cog.on_guild_channel_delete(target_channel)  # type: ignore[arg-type]
+
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+
+
+@pytest.mark.asyncio
+async def test_on_voice_state_update_closes_persisted_session_even_if_pending_task_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
+
+    member = _FakeMember(47)
+    tracked_channel = _FakeVoiceChannel(1008, "Solo Room E", [member])
+    guild = _FakeGuild(905, [tracked_channel])
+    member.guild = guild
+    member.voice = _FakeVoiceState(tracked_channel)
+
+    repo = _FakeRepo()
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([guild]),  # type: ignore[arg-type]
+        repo=repo,  # type: ignore[arg-type]
+        config_service=_FakeConfigService(),  # type: ignore[arg-type]
+    )
+    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
+    cog._start_watchdog = lambda member_obj: None  # type: ignore[assignment]
+
+    # Session is already persisted
+    cog._persisted_voice_sessions.add((guild.id, member.id))
+
+    # Add a dummy pending task that is not done (simulating a just-cancelled task)
+    dummy_task = asyncio.create_task(asyncio.sleep(10))
+    dummy_pending = voice_logging_module.PendingVoiceStart(
+        guild_id=guild.id,
+        member_id=member.id,
+        member=member,
+        channel_id=tracked_channel.id,
+        channel_name=tracked_channel.name,
+        started_at=datetime.now(tz=UTC),
+    )
+    cog._pending_voice_starts[(guild.id, member.id)] = (dummy_pending, dummy_task)
+
+    # Member leaves the channel
+    member.voice = None
+    await cog.on_voice_state_update(
+        member,  # type: ignore[arg-type]
+        _FakeVoiceState(tracked_channel),  # type: ignore[arg-type]
+        _FakeVoiceState(None),  # type: ignore[arg-type]
+    )
+
+    # Give the event loop a tick so the cancelled task can process its CancelledError
+    await asyncio.sleep(0)
+
+    # Task was cancelled by the handler
+    assert dummy_task.cancelled() or dummy_task.done()
+
+    # The persisted session MUST be closed despite the pending task existing
+    assert len(repo.closed_calls) == 1
+    assert repo.closed_calls[0][0] == guild.id
+    assert repo.closed_calls[0][1] == member.id
+    assert cog._persisted_voice_sessions == set()
+
+    # Clean up the task
+    try:
+        await dummy_task
+    except asyncio.CancelledError:
+        pass
+

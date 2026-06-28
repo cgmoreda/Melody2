@@ -376,10 +376,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._stop_watchdog(member.id)
 
         before_is_voice = isinstance(before.channel, discord.VoiceChannel)
-        if before_is_voice and (canceled_pending is None or canceled_pending[1].done()):
+        if before_is_voice:
             session_key = self._voice_session_key(member.guild.id, member.id)
             should_close = session_key in self._persisted_voice_sessions
-            if not should_close:
+            if not should_close and canceled_pending is None:
                 should_close = await self._is_tracked_channel(member.guild.id, before.channel)
             if should_close:
                 await self._close_voice_session(member.guild.id, member.id, now)
@@ -400,6 +400,30 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         )
         if _is_solo_channel(after.channel):
             self._start_watchdog(member)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+
+        guild = channel.guild
+        now = datetime.now(tz=UTC)
+        
+        # Safety net: If a tracked channel is deleted, Discord fires on_voice_state_update
+        # for members inside it. But due to race conditions (e.g. between tracking updates
+        # and voice state events), a session might leak. We verify all open sessions for
+        # this guild and close any that belong to members no longer in a tracked channel.
+        for session_key in list(self._persisted_voice_sessions):
+            if session_key[0] == guild.id:
+                member_id = session_key[1]
+                member = guild.get_member(member_id)
+                
+                in_tracked = False
+                if member is not None and member.voice is not None and isinstance(member.voice.channel, discord.VoiceChannel):
+                    in_tracked = await self._is_tracked_channel(guild.id, member.voice.channel)
+                
+                if not in_tracked:
+                    await self._close_voice_session(guild.id, member_id, now)
 
     def _start_watchdog(self, member: discord.Member) -> None:
         self._stop_watchdog(member.id)

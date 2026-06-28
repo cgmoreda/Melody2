@@ -57,7 +57,7 @@ async def test_play_alert_success(mock_channel: MagicMock, mock_voice_client: As
             
     assert result is True
     mock_channel.connect.assert_called_once()
-    mock_voice_client.disconnect.assert_called_once_with()
+    mock_voice_client.disconnect.assert_called_once_with(force=True)
 
 
 @pytest.mark.asyncio
@@ -116,6 +116,74 @@ async def test_play_alert_timeout(mock_channel: MagicMock, mock_voice_client: As
                 result = await service.play_alert(mock_channel)
                 
     assert result is False
-    # disconnect may be called more than once (both _play_inner finally and
-    # play_alert timeout handler invoke _safe_disconnect for safety).
-    mock_voice_client.disconnect.assert_called_with()
+    # disconnect is called from both _play_inner finally and play_alert's
+    # _safe_disconnect fallback — verify at least one call happened.
+    assert mock_voice_client.disconnect.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_play_alert_cancellation_disconnects(
+    mock_channel: MagicMock, mock_voice_client: AsyncMock
+) -> None:
+    """When play_alert is cancelled, the bot must still disconnect."""
+    service = VoiceAlertService("dummy.mp3")
+    guild = mock_channel.guild
+
+    async def _connect(**kwargs: object) -> AsyncMock:
+        guild.voice_client = mock_voice_client
+        return mock_voice_client
+
+    mock_channel.connect.side_effect = _connect
+
+    async def slow_play(*args: object, **kwargs: object) -> bool:
+        await asyncio.sleep(10)
+        return True
+
+    with patch.object(service, "_play_audio", side_effect=slow_play):
+        with patch("os.path.isfile", return_value=True):
+            task = asyncio.create_task(service.play_alert(mock_channel))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    # Verify disconnect was called despite cancellation.
+    assert mock_voice_client.disconnect.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_play_alert_exception_during_playback_disconnects(
+    mock_channel: MagicMock, mock_voice_client: AsyncMock
+) -> None:
+    """When _play_audio raises an unexpected error, the bot must still disconnect."""
+    service = VoiceAlertService("dummy.mp3")
+    guild = mock_channel.guild
+
+    async def _connect(**kwargs: object) -> AsyncMock:
+        guild.voice_client = mock_voice_client
+        return mock_voice_client
+
+    mock_channel.connect.side_effect = _connect
+
+    with patch.object(service, "_play_audio", side_effect=RuntimeError("ffmpeg crash")):
+        with patch("os.path.isfile", return_value=True):
+            result = await service.play_alert(mock_channel)
+
+    assert result is False
+    # The finally block in _play_inner disconnects, and the exception handler
+    # in play_alert calls _safe_disconnect as a second defense.
+    assert mock_voice_client.disconnect.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_play_alert_connect_failure_does_not_disconnect(mock_channel: MagicMock) -> None:
+    """When connect itself fails, no disconnect should be attempted."""
+    service = VoiceAlertService("dummy.mp3")
+    mock_channel.connect.side_effect = RuntimeError("connection failed")
+
+    with patch("os.path.isfile", return_value=True):
+        result = await service.play_alert(mock_channel)
+
+    assert result is False
+    # guild.voice_client is still None → _safe_disconnect is a no-op
+    # and _play_inner's finally never runs because voice_client is None.

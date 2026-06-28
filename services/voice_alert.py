@@ -93,19 +93,22 @@ class VoiceAlertService:
                 self._play_locked(lock, channel, path),
                 timeout=_PLAY_TIMEOUT_SECONDS,
             )
-        except asyncio.CancelledError:
-            raise
         except asyncio.TimeoutError:
             logger.warning(
                 "Voice alert timed out after %.0fs in guild %s",
                 _PLAY_TIMEOUT_SECONDS,
                 guild.id,
             )
+            await self._safe_disconnect(guild)
             return False
+        except asyncio.CancelledError:
+            await self._safe_disconnect(guild)
+            raise
         except Exception:
             logger.exception(
                 "Unexpected error during voice alert in guild %s", guild.id
             )
+            await self._safe_disconnect(guild)
             return False
 
     async def _play_locked(
@@ -184,8 +187,7 @@ class VoiceAlertService:
                 logger.info("[CLEANUP_START] guild=%s", guild.id)
                 try:
                     if voice_client.is_connected():
-                        # Protect disconnect from cancellation to guarantee bot leaves the channel.
-                        await asyncio.shield(voice_client.disconnect())
+                        await voice_client.disconnect(force=True)
                     logger.info("[CLEANUP_DONE] guild=%s", guild.id)
                 except Exception:
                     logger.exception(
