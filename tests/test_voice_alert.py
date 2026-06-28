@@ -57,7 +57,7 @@ async def test_play_alert_success(mock_channel: MagicMock, mock_voice_client: As
             
     assert result is True
     mock_channel.connect.assert_called_once()
-    mock_voice_client.disconnect.assert_called_once_with()
+    mock_voice_client.disconnect.assert_called_once_with(force=True)
 
 
 @pytest.mark.asyncio
