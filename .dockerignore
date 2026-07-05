@@ -1,0 +1,33 @@
+# Version control
+.git/
+.github/
+
+# Secrets / environment
+.env
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python bytecode & caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local database / data files
+data/
+*.db
+*.sqlite3
+
+# IDE / editor settings
+.vscode/
+.idea/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Deployment config not needed at runtime
+nixpacks.toml
+.python-version
