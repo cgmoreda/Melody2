@@ -26,7 +26,7 @@ The bot uses the `!` command prefix and stores persistent state in PostgreSQL. D
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.13 or newer
 - PostgreSQL
 - Discord bot token with these privileged intents enabled:
   - Message Content Intent
