@@ -87,6 +87,9 @@ class RoleAssigner(RoleAssignerBase):
             except discord.Forbidden:
                 logger.error("Missing permissions to create role %s", rule.name)
                 return None
+            except discord.HTTPException as exc:
+                logger.error("Discord error creating role %s: %s", rule.name, exc)
+                return None
 
         stale_roles = [role_ for role_ in member.roles if role_.name in self.all_role_names and role_.id != role.id]
         if stale_roles:
@@ -94,12 +97,17 @@ class RoleAssigner(RoleAssignerBase):
                 await member.remove_roles(*stale_roles, reason="CF rating role update")
             except discord.Forbidden:
                 logger.warning("Could not remove stale roles from %s", member)
+            except discord.HTTPException as exc:
+                logger.warning("Discord error removing stale roles from %s: %s", member, exc)
 
         if role not in member.roles:
             try:
                 await member.add_roles(role, reason="CF rating role assignment")
             except discord.Forbidden:
                 logger.error("Missing permissions to assign role %s", rule.name)
+                return None
+            except discord.HTTPException as exc:
+                logger.error("Discord error assigning role %s: %s", rule.name, exc)
                 return None
 
         return role
