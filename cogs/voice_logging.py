@@ -234,7 +234,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             tuple[PendingVoiceStart, asyncio.Task[None]],
         ] = {}
         self._persisted_voice_sessions: set[tuple[int, int]] = set()
-        self._tracked_keywords_cache: dict[int, list[str]] = {}
 
     def cog_unload(self) -> None:
         for task in self._watchdogs.values():
@@ -246,12 +245,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._persisted_voice_sessions.clear()
 
     async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
-        cached = self._tracked_keywords_cache.get(guild_id)
-        if cached is not None:
-            return cached
         raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
         keywords = [k.strip().lower() for k in raw.split(",") if k.strip()]
-        self._tracked_keywords_cache[guild_id] = keywords
         return keywords
 
     async def _is_tracked_channel(self, guild_id: int, channel: discord.VoiceChannel) -> bool:
@@ -1679,7 +1674,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
             existing.append(keyword)
             await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
-            self._tracked_keywords_cache.pop(ctx.guild.id, None)
             await ctx.send(f"Added `{keyword}`. Channels containing it will now count in voice hours.")
             return
 
@@ -1703,7 +1697,6 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 await self._config.set_text(ctx.guild.id, "voice_tracked_keywords", ",".join(existing))
             else:
                 await self._config.reset_text(ctx.guild.id, "voice_tracked_keywords")
-            self._tracked_keywords_cache.pop(ctx.guild.id, None)
             closed = await self._close_now_untracked_voice_sessions(ctx.guild, datetime.now(tz=UTC))
             message = f"Removed `{keyword}` from tracked keywords."
             if closed:

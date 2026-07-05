@@ -734,6 +734,30 @@ async def test_track_remove_closes_sessions_in_channels_that_become_untracked() 
     ]
 
 
+@pytest.mark.asyncio
+async def test_voice_tracked_keywords_update_takes_effect_immediately() -> None:
+    guild_id = 904
+    first_channel = _FakeVoiceChannel(1007, "first room", [])
+    second_channel = _FakeVoiceChannel(1008, "second room", [])
+    
+    config = _MutableTrackedKeywordsConfig("first")
+    cog = VoiceLoggingCog(
+        bot=_FakeBot([]),  # type: ignore[arg-type]
+        repo=_FakeRepo(),  # type: ignore[arg-type]
+        config_service=config,  # type: ignore[arg-type]
+    )
+
+    # Initially, "first" is tracked, "second" is not.
+    assert await cog._is_tracked_channel(guild_id, first_channel) is True  # type: ignore[arg-type]
+    assert await cog._is_tracked_channel(guild_id, second_channel) is False  # type: ignore[arg-type]
+
+    # Update config directly (simulating !config text set voice_tracked_keywords first,second)
+    await config.set_text(guild_id, "voice_tracked_keywords", "first,second")
+
+    # The cog should pick up the change immediately without needing to be reloaded
+    assert await cog._is_tracked_channel(guild_id, second_channel) is True  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # Tests for voicehours roles/teams/unis leaderboard filtering
 # ---------------------------------------------------------------------------
