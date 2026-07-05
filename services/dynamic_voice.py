@@ -282,9 +282,17 @@ class DynamicVoiceManager:
         channel: discord.VoiceChannel,
         member: discord.Member,
     ) -> bool:
-        """Return True if *member* has an explicit connect=True overwrite on *channel*."""
-        overwrite = channel.overwrites_for(member)
-        return overwrite.connect is True
+        """Return True if *member* has an explicit connect=True overwrite on *channel*.
+
+        Checks both member-specific and role-level overwrites so that members
+        invited via ``!invite @role`` are recognised.
+        """
+        if channel.overwrites_for(member).connect is True:
+            return True
+        for role in member.roles:
+            if channel.overwrites_for(role).connect is True:
+                return True
+        return False
 
     async def handle_join(
         self,
