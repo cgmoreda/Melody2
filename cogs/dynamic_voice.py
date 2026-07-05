@@ -68,6 +68,7 @@ class DynamicVoiceCog(commands.Cog, name="DynamicVoice"):
     # ── commands ─────────────────────────────────────────────────
 
     @commands.command(name="invite")
+    @commands.guild_only()
     async def invite_cmd(self, ctx: commands.Context, target: str) -> None:
         """Invite a user or role to your invite-only voice channel.
 
