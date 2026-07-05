@@ -59,9 +59,9 @@ class MelodyBot(commands.Bot):
             try:
                 await self.tree.sync()
                 logger.info("Synced app command tree")
+                self._tree_synced = True
             except Exception:
                 logger.exception("Failed to sync app command tree")
-            self._tree_synced = True
 
     async def close(self) -> None:
         await _teardown_services(self)
