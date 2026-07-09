@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
+import re
 from typing import Callable, Iterable, Optional, TypeVar
 
 
@@ -109,3 +111,44 @@ def parse_single_value_clause(
     if clause is None:
         return None, remaining
     return parser(clause.tokens[1]), remaining
+
+
+def parse_timeout_duration(duration_raw: str, unit_raw: Optional[str] = None) -> tuple[timedelta, str]:
+    if unit_raw is None:
+        match = re.match(r"^([\-\d\.]+)([a-zA-Z]+)$", duration_raw.strip())
+        if not match:
+            raise CommandParseError("Invalid duration format. Use a number followed by a unit (e.g., '15m' or '15 min').")
+        val_str, unit_str = match.groups()
+    else:
+        val_str = duration_raw.strip()
+        unit_str = unit_raw.strip()
+
+    try:
+        val = float(val_str)
+    except ValueError as exc:
+        raise CommandParseError(f"Invalid duration value: '{val_str}' is not a valid number.") from exc
+
+    if val <= 0:
+        raise CommandParseError("Duration must be strictly positive.")
+
+    unit_str = unit_str.lower()
+    
+    if unit_str in ("m", "min", "mins", "minute", "minutes"):
+        delta = timedelta(minutes=val)
+        human_unit = "minute" if val == 1 else "minutes"
+    elif unit_str in ("h", "hr", "hrs", "hour", "hours"):
+        delta = timedelta(hours=val)
+        human_unit = "hour" if val == 1 else "hours"
+    elif unit_str in ("d", "day", "days"):
+        delta = timedelta(days=val)
+        human_unit = "day" if val == 1 else "days"
+    else:
+        raise CommandParseError(f"Invalid duration unit: '{unit_str}'. Supported units are minutes, hours, and days.")
+
+    if delta > timedelta(days=28):
+        raise CommandParseError("Timeout duration cannot exceed 28 days.")
+    
+    val_fmt = f"{int(val)}" if val.is_integer() else f"{val}"
+    human_readable = f"{val_fmt} {human_unit}"
+
+    return delta, human_readable
