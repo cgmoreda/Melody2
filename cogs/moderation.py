@@ -46,7 +46,12 @@ class ModerationCog(commands.Cog, name="Moderation"):
                     await ctx.send("You cannot time out a member with an equal or higher top role.")
                     return
 
-        if ctx.guild.me.top_role <= member.top_role:
+        bot_member = ctx.guild.me
+        if bot_member is None:
+            await ctx.send("I cannot determine my role in this server.")
+            return
+
+        if bot_member.top_role <= member.top_role:
             await ctx.send("I cannot time out a member with an equal or higher top role.")
             return
 
