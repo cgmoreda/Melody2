@@ -34,6 +34,7 @@ EXTENSIONS: tuple[str, ...] = (
     "cogs.dynamic_voice",
     "cogs.voice_logging",
     "cogs.orders",
+    "cogs.moderation",
 )
 
 
