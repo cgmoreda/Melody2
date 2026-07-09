@@ -122,7 +122,7 @@ def test_parse_timeout_duration_case_insensitive() -> None:
     delta, label = parse_timeout_duration("15", "MIN")
     assert delta == timedelta(minutes=15)
     assert label == "15 minutes"
-    
+
     delta, label = parse_timeout_duration("15M")
     assert delta == timedelta(minutes=15)
     assert label == "15 minutes"

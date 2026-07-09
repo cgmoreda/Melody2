@@ -32,12 +32,12 @@ def ctx() -> AsyncMock:
     ctx.guild = MagicMock(spec=discord.Guild)
     ctx.guild.owner_id = 999
     ctx.author.id = 100
-    
+
     ctx.author.top_role = DummyRole(50)
-    
+
     ctx.guild.me = MagicMock(spec=discord.Member)
     ctx.guild.me.top_role = DummyRole(50)
-    
+
     return ctx
 
 

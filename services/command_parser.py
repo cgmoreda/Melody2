@@ -132,7 +132,7 @@ def parse_timeout_duration(duration_raw: str, unit_raw: Optional[str] = None) ->
         raise CommandParseError("Duration must be strictly positive.")
 
     unit_str = unit_str.lower()
-    
+
     if unit_str in ("m", "min", "mins", "minute", "minutes"):
         delta = timedelta(minutes=val)
         human_unit = "minute" if val == 1 else "minutes"
@@ -147,7 +147,7 @@ def parse_timeout_duration(duration_raw: str, unit_raw: Optional[str] = None) ->
 
     if delta > timedelta(days=28):
         raise CommandParseError("Timeout duration cannot exceed 28 days.")
-    
+
     val_fmt = f"{int(val)}" if val.is_integer() else f"{val}"
     human_readable = f"{val_fmt} {human_unit}"
 
