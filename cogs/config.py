@@ -54,12 +54,53 @@ class ConfigCog(commands.Cog, name="Config"):
     @config.command(name="set")
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
-    async def config_set(self, ctx: commands.Context, key: str, value: int) -> None:
-        """Set one config key to an integer value."""
+    async def config_set(self, ctx: commands.Context, key: str, *args: str) -> None:
+        """Set one config key to a value."""
         assert ctx.guild is not None
         normalized_key = key.lower()
+
+        if normalized_key == "voice_check_interval":
+            if len(args) != 2:
+                await ctx.send("Usage: `!config set voice_check_interval <channel_type> <range>`")
+                return
+            channel_type = args[0].lower()
+            interval = args[1]
+            if channel_type not in ("solo", "duo", "team", "invite"):
+                await ctx.send("Channel type must be one of: solo, duo, team, invite.")
+                return
+
+            try:
+                if "-" not in interval:
+                    raise ValueError
+                min_str, max_str = interval.split("-", 1)
+                min_val = int(min_str.strip())
+                max_val = int(max_str.strip())
+                if min_val <= 0 or max_val <= 0 or min_val > max_val:
+                    raise ValueError
+            except ValueError:
+                await ctx.send("Interval must be in the format MIN-MAX (e.g. '45-60'), where MIN and MAX are positive integers and MIN <= MAX.")
+                return
+
+            text_key = f"voice_check_interval_{channel_type}"
+            try:
+                await self._config.set_text(ctx.guild.id, text_key, interval)
+                await ctx.send(f"Set `{text_key}` to `{interval}`.")
+            except ValueError as exc:
+                await ctx.send(str(exc))
+            return
+
+        if len(args) != 1:
+            await ctx.send("Usage: `!config set <key> <value>`")
+            return
+
         try:
-            cfg = await self._config.set_value(ctx.guild.id, normalized_key, value)
+            value_int = int(args[0])
+        except ValueError:
+            await ctx.send("Value must be an integer.")
+            return
+
+        try:
+            cfg = await self._config.set_value(ctx.guild.id, normalized_key, value_int)
         except ValueError as exc:
             await ctx.send(str(exc))
             return
