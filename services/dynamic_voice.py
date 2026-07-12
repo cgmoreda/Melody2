@@ -54,7 +54,6 @@ class TrackedChannel:
     creator_id: int
     label: str  # e.g. "solo", "Assiut Duo", "Assiut Team"
     number: int  # the N in #N
-    expected_capacity: int = 1  # Total allowed members (including creator and invites)
 
 
 class DynamicVoiceManager:
@@ -175,11 +174,6 @@ class DynamicVoiceManager:
         new_limit = min((channel.user_limit or 0) + 1, _DISCORD_MAX_VOICE_USER_LIMIT)
         try:
             await channel.edit(user_limit=new_limit, reason="Invite capacity increase")
-            # Update tracked metadata so VerificationManager respects the new size
-            async with self._lock:
-                info = self.get_tracked_info(channel.id)
-                if info is not None:
-                    info.expected_capacity += 1
         except (discord.Forbidden, discord.HTTPException) as exc:
             try:
                 await channel.set_permissions(
@@ -252,11 +246,6 @@ class DynamicVoiceManager:
             )
             try:
                 await channel.edit(user_limit=new_limit, reason="Role invite capacity increase")
-                # Update tracked metadata so VerificationManager respects the new size
-                async with self._lock:
-                    info = self.get_tracked_info(channel.id)
-                    if info is not None:
-                        info.expected_capacity += count
             except (discord.Forbidden, discord.HTTPException) as exc:
                 try:
                     await channel.set_permissions(
@@ -341,7 +330,6 @@ class DynamicVoiceManager:
                 creator_id=member.id,
                 label=label,
                 number=number,
-                expected_capacity=user_limit,
             )
             self._channels.setdefault(member.guild.id, {})[new_channel.id] = tracked
             logger.info(
@@ -386,8 +374,6 @@ class DynamicVoiceManager:
                         logger.error("Failed to delete orphan %s: %s", vc.name, exc)
                     continue
 
-                expected_capacity = vc.user_limit or USER_LIMITS[channel_type]
-
                 tracked = TrackedChannel(
                     channel_id=vc.id,
                     guild_id=guild.id,
@@ -395,7 +381,6 @@ class DynamicVoiceManager:
                     creator_id=self._infer_creator_id_from_channel(vc),
                     label=label,
                     number=number,
-                    expected_capacity=expected_capacity,
                 )
                 guild_channels[vc.id] = tracked
                 logger.info("Recovered tracked channel %s (id=%s)", vc.name, vc.id)

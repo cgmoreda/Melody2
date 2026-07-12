@@ -115,7 +115,6 @@ class VerificationManager:
         channel_id: int,
         channel_type: str,
         human_member_ids: list[int],
-        expected_capacity: int = 1,
     ) -> None:
         """Evaluate occupancy and schedule or cancel verification sessions.
         
@@ -124,14 +123,11 @@ class VerificationManager:
             channel_id: The ID of the channel being evaluated.
             channel_type: The type of the channel (e.g., 'solo', 'duo').
             human_member_ids: A list of non-bot member IDs currently in the channel.
-            expected_capacity: The expected capacity of the channel (used for 'invite' channels).
         """
         num_humans = len(human_member_ids)
         
         if channel_type == "solo":
             should_schedule = num_humans > 0
-        elif channel_type == "invite":
-            should_schedule = num_humans > 0 and num_humans < expected_capacity
         else:
             should_schedule = num_humans == 1
 
