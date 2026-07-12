@@ -34,8 +34,9 @@ class ConfigCog(commands.Cog, name="Config"):
         embed.add_field(name="voice_check_interval_seconds", value=str(cfg.voice_check_interval_seconds), inline=True)
         embed.add_field(name="voice_confirm_timeout_seconds", value=str(cfg.voice_confirm_timeout_seconds), inline=True)
         text_cfg = await self._config.get_text_all(ctx.guild.id)
-        embed.add_field(name="training_role_substring", value=text_cfg["training_role_substring"], inline=False)
-        embed.add_field(name="coach_role_substring", value=text_cfg["coach_role_substring"], inline=False)
+        for key in TEXT_CONFIG_SPECS:
+            val = text_cfg.get(key, "")
+            embed.add_field(name=key, value=val if val else "*(not set)*", inline=True)
         await ctx.send(embed=embed)
 
     @config.command(name="keys")
