@@ -428,12 +428,17 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
     async def _evaluate_verification(self, channel: discord.VoiceChannel) -> None:
         """Evaluate and schedule verifications for a tracked channel."""
         channel_type: str | None = None
+        expected_capacity: int = 1
+
         if _is_solo_channel(channel):
             channel_type = "solo"
         elif self._dynamic_voice is not None:
             parsed = self._dynamic_voice.channel_type_from_name(channel.name)
             if parsed is not None:
                 channel_type = parsed.value
+                info = self._dynamic_voice.get_tracked_info(channel.id)
+                if info is not None:
+                    expected_capacity = info.expected_capacity
 
         if channel_type is not None:
             human_member_ids = [m.id for m in channel.members if not m.bot]
@@ -442,6 +447,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 channel_id=channel.id,
                 channel_type=channel_type,
                 human_member_ids=human_member_ids,
+                expected_capacity=expected_capacity,
             )
 
     async def _close_voice_session(self, guild_id: int, member_id: int, ended_at: datetime) -> int:

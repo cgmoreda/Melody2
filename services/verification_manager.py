@@ -115,6 +115,7 @@ class VerificationManager:
         channel_id: int,
         channel_type: str,
         human_member_ids: list[int],
+        expected_capacity: int = 1,
     ) -> None:
         """Evaluate occupancy and schedule or cancel verification sessions.
         
@@ -123,14 +124,16 @@ class VerificationManager:
             channel_id: The ID of the channel being evaluated.
             channel_type: The type of the channel (e.g., 'solo', 'duo').
             human_member_ids: A list of non-bot member IDs currently in the channel.
+            expected_capacity: The expected capacity of the channel (used for 'invite' channels).
         """
-        # Exclude bots; only care about human members in the channel
-        is_solo_type = channel_type == "solo"
+        num_humans = len(human_member_ids)
         
-        # Determine if members in this channel should have verification checks
-        # Solo channels: always run checks for all members inside.
-        # Other dynamic channels: only run checks if exactly 1 member is inside.
-        should_schedule = is_solo_type or len(human_member_ids) == 1
+        if channel_type == "solo":
+            should_schedule = num_humans > 0
+        elif channel_type == "invite":
+            should_schedule = num_humans > 0 and num_humans < expected_capacity
+        else:
+            should_schedule = num_humans == 1
 
         if not should_schedule:
             self.cancel_for_channel(channel_id)
