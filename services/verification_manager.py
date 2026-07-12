@@ -117,7 +117,7 @@ class VerificationManager:
         human_member_ids: list[int],
     ) -> None:
         """Evaluate occupancy and schedule or cancel verification sessions.
-        
+
         Args:
             guild_id: The ID of the guild.
             channel_id: The ID of the channel being evaluated.
@@ -125,7 +125,7 @@ class VerificationManager:
             human_member_ids: A list of non-bot member IDs currently in the channel.
         """
         num_humans = len(human_member_ids)
-        
+
         if channel_type == "solo":
             should_schedule = num_humans > 0
         else:
@@ -167,7 +167,7 @@ class VerificationManager:
             created_at=datetime.now(timezone.utc),
             generation=generation,
         )
-        
+
         self._sessions[member_id] = session
         session.task = asyncio.create_task(
             self._timer_loop(session, delay)

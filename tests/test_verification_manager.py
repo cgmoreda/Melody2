@@ -110,7 +110,7 @@ async def test_timer_loop_generation_mismatch(manager):
         human_member_ids=[2],
     )
     session = manager._sessions[2]
-    
+
     # Simulate a new session replacing the old one
     new_session = VerificationSession(
         member_id=2, guild_id=1, channel_id=101, channel_type="solo",
@@ -120,7 +120,7 @@ async def test_timer_loop_generation_mismatch(manager):
 
     # Run the timer loop manually with the OLD session
     await manager._timer_loop(session, 0)
-    
+
     # Callback should not have been called
     manager._on_verification_due.assert_not_called()
     assert manager.metrics.completed == 0
@@ -129,7 +129,7 @@ async def test_timer_loop_generation_mismatch(manager):
 @pytest.mark.asyncio
 async def test_timer_loop_reschedules_on_success(manager, on_due):
     on_due.return_value = True
-    
+
     await manager.evaluate_channel(
         guild_id=1,
         channel_id=101,
@@ -137,10 +137,10 @@ async def test_timer_loop_reschedules_on_success(manager, on_due):
         human_member_ids=[2],
     )
     session = manager._sessions[2]
-    
+
     # Run loop manually (delay=0)
     await manager._timer_loop(session, 0)
-    
+
     on_due.assert_called_once_with(1, 2, 101, "solo")
     assert manager.metrics.completed == 1
     assert manager.metrics.verification_passed == 1
@@ -151,7 +151,7 @@ async def test_timer_loop_reschedules_on_success(manager, on_due):
 @pytest.mark.asyncio
 async def test_timer_loop_cancels_on_failure(manager, on_due):
     on_due.return_value = False
-    
+
     await manager.evaluate_channel(
         guild_id=1,
         channel_id=101,
@@ -159,10 +159,10 @@ async def test_timer_loop_cancels_on_failure(manager, on_due):
         human_member_ids=[2],
     )
     session = manager._sessions[2]
-    
+
     # Run loop manually
     await manager._timer_loop(session, 0)
-    
+
     on_due.assert_called_once_with(1, 2, 101, "solo")
     assert manager.metrics.completed == 1
     assert manager.metrics.verification_failed == 1
