@@ -544,6 +544,12 @@ class DynamicVoiceManager:
             return ChannelType.INVITE, f"{m.group(1)} Invite", int(m.group(2))
         return None
 
+    @classmethod
+    def channel_type_from_name(cls, name: str) -> Optional[ChannelType]:
+        """Return the ChannelType for a given dynamic channel name."""
+        parsed = cls._parse_channel_name(name)
+        return parsed[0] if parsed else None
+
     async def _schedule_delete(self, channel: discord.VoiceChannel) -> None:
         """Wait briefly, then delete *channel* if still empty."""
         existing = self._delete_tasks.pop(channel.id, None)
