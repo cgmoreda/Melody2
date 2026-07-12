@@ -20,8 +20,11 @@ from services.command_parser import (
 )
 from services.discord_output import send_context_lines_chunks, send_context_text_chunks, split_lines_chunks
 from services.guild_config import GuildConfigService
+from services.verification_manager import VerificationManager
 from services.voice_alert import VoiceAlertService
 from services.voice_service import VoiceService
+
+import random
 
 if TYPE_CHECKING:
     from db.repository import CoachConfig
@@ -228,7 +231,11 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._coach_secretary = coach_secretary
         self._voice_alert = voice_alert
         self._voice_service = VoiceService()
-        self._watchdogs: dict[int, asyncio.Task[None]] = {}
+        self._verification_manager = VerificationManager(
+            get_interval=self._get_interval,
+            on_verification_due=self._handle_verification_due,
+            random_fn=random.randint,
+        )
         self._pending_voice_starts: dict[
             tuple[int, int],
             tuple[PendingVoiceStart, asyncio.Task[None]],
@@ -236,13 +243,15 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         self._persisted_voice_sessions: set[tuple[int, int]] = set()
 
     def cog_unload(self) -> None:
-        for task in self._watchdogs.values():
-            task.cancel()
-        self._watchdogs.clear()
+        if self._verification_manager:
+            self._verification_manager.shutdown()
         for _, task in self._pending_voice_starts.values():
             task.cancel()
         self._pending_voice_starts.clear()
         self._persisted_voice_sessions.clear()
+
+    async def _get_interval(self, guild_id: int, channel_type: str) -> tuple[int, int]:
+        return await self._config.get_voice_check_interval(guild_id, channel_type)
 
     async def _get_tracked_keywords(self, guild_id: int) -> list[str]:
         raw = await self._config.get_text(guild_id, "voice_tracked_keywords")
@@ -342,11 +351,8 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                         started_at=now,
                     )
 
-                # Watchdog only for strict solo channels
-                if _is_solo_channel(voice_channel):
-                    member = guild.get_member(member_id)
-                    if member is not None:
-                        self._start_watchdog(member)
+                # Evaluate verification checks
+                await self._evaluate_verification(voice_channel)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -368,10 +374,10 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             getattr(after.channel, "name", None),
         )
         canceled_pending = self._cancel_pending_voice_start(member.guild.id, member.id)
-        self._stop_watchdog(member.id)
 
         before_is_voice = isinstance(before.channel, discord.VoiceChannel)
         if before_is_voice:
+            await self._evaluate_verification(before.channel)
             session_key = self._voice_session_key(member.guild.id, member.id)
             should_close = session_key in self._persisted_voice_sessions
             if not should_close and canceled_pending is None:
@@ -393,8 +399,7 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             channel=after.channel,
             started_at=now,
         )
-        if _is_solo_channel(after.channel):
-            self._start_watchdog(member)
+        await self._evaluate_verification(after.channel)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
@@ -420,21 +425,24 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 if not in_tracked:
                     await self._close_voice_session(guild.id, member_id, now)
 
-    def _start_watchdog(self, member: discord.Member) -> None:
-        self._stop_watchdog(member.id)
-        self._watchdogs[member.id] = asyncio.create_task(
-            self._watchdog_loop(member.guild.id, member.id),
-            name=f"solo-watchdog-{member.id}",
-        )
+    async def _evaluate_verification(self, channel: discord.VoiceChannel) -> None:
+        """Evaluate and schedule verifications for a tracked channel."""
+        channel_type: str | None = None
+        if _is_solo_channel(channel):
+            channel_type = "solo"
+        elif self._dynamic_voice is not None:
+            parsed = self._dynamic_voice.channel_type_from_name(channel.name)
+            if parsed is not None:
+                channel_type = parsed.value
 
-    def _stop_watchdog(self, member_id: int) -> None:
-        task = self._watchdogs.pop(member_id, None)
-        if task is not None:
-            task.cancel()
-
-    def _clear_watchdog_if_current(self, member_id: int, task: asyncio.Task[None]) -> None:
-        if self._watchdogs.get(member_id) is task:
-            self._watchdogs.pop(member_id, None)
+        if channel_type is not None:
+            human_member_ids = [m.id for m in channel.members if not m.bot]
+            await self._verification_manager.evaluate_channel(
+                guild_id=channel.guild.id,
+                channel_id=channel.id,
+                channel_type=channel_type,
+                human_member_ids=human_member_ids,
+            )
 
     async def _close_voice_session(self, guild_id: int, member_id: int, ended_at: datetime) -> int:
         closed = await self._repo.close_open_voice_sessions(guild_id, member_id, ended_at)
@@ -1004,93 +1012,80 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             )
             return
 
-    async def _watchdog_loop(self, guild_id: int, member_id: int) -> None:
-        try:
-            while True:
-                config = await self._config.get(guild_id)
-                await asyncio.sleep(config.voice_check_interval_seconds)
+    async def _handle_verification_due(self, guild_id: int, member_id: int, channel_id: int, channel_type: str) -> bool:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return False
 
-                guild = self.bot.get_guild(guild_id)
-                if guild is None:
-                    break
+        member = guild.get_member(member_id)
+        if member is None:
+            return False
 
-                member = guild.get_member(member_id)
-                if member is None:
-                    break
+        voice_channel = member.voice.channel if member.voice else None
+        if voice_channel is None or voice_channel.id != channel_id:
+            return False
 
-                voice_channel = member.voice.channel if member.voice else None
-                if not _is_solo_channel(voice_channel):
-                    break
+        config = await self._config.get(guild_id)
+        confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds, voice_channel)
+        if confirmation is WorkConfirmationResult.CONFIRMED:
+            return True
 
-                confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds, voice_channel)
-                if confirmation is WorkConfirmationResult.CONFIRMED:
-                    continue
+        if confirmation is WorkConfirmationResult.DM_FAILED:
+            await self._notify_watchdog_dm_failure(guild, member)
 
-                if confirmation is WorkConfirmationResult.DM_FAILED:
-                    await self._notify_watchdog_dm_failure(guild, member)
+        removal_action: SoloRemovalAction | None = None
+        if member.voice is not None:
+            removal_action = await self._move_member_out_of_solo_check(member)
 
-                removal_action: SoloRemovalAction | None = None
-                if member.voice is not None:
-                    current_task = self._watchdogs.pop(member.id, None)
-                    removal_action = await self._move_member_out_of_solo_check(member)
-                    if removal_action is None and current_task is not None:
-                        self._watchdogs[member.id] = current_task
+        if removal_action is None:
+            if confirmation is WorkConfirmationResult.TIMED_OUT:
+                try:
+                    await member.send(
+                        "You did not confirm in time. I could not move you to AFK or disconnect you due to missing permissions."
+                    )
+                except discord.Forbidden:
+                    pass
+            return True
 
-                if removal_action is None:
-                    if confirmation is WorkConfirmationResult.TIMED_OUT:
-                        try:
-                            await member.send(
-                                "You did not confirm in time. I could not move you to AFK or disconnect you due to missing permissions."
-                            )
-                        except discord.Forbidden:
-                            pass
-                    continue
-
-                if removal_action == "afk" and self._coach_secretary is not None:
-                    logger.info("Checking coach config for AFK escalation in guild %s", guild.id)
-                    coach_config = await self._coach_secretary.get_config(guild.id)
-                    if coach_config is not None:
-                        logger.info("Found coach config, fetching coach ID %s", coach_config.coach_id)
-                        coach = guild.get_member(coach_config.coach_id)
-                        if coach is not None:
-                            logger.info("Coach %s found in guild, preparing to send DM", coach.id)
-                            try:
-                                view = AfkEscalationView(
-                                    member=member,
-                                    guild=guild,
-                                    original_channel=voice_channel,
-                                    config=coach_config,
-                                )
-                                await coach.send(
-                                    f"{member.mention} was moved to the AFK room after failing the AFK confirmation check.\n"
-                                    f"Original channel: {voice_channel.name if voice_channel else 'Unknown'}\n"
-                                    f"Time: <t:{int(datetime.now(tz=UTC).timestamp())}:F>\n"
-                                    f"Reason: AFK timeout\n\n"
-                                    f"Do you want me to move them to your office for a warning?",
-                                    view=view,
-                                )
-                                logger.info("Triggered AFK escalation for %s to coach %s in guild %s", member.id, coach.id, guild.id)
-                            except discord.Forbidden:
-                                logger.warning("Could not DM coach %s for AFK escalation in guild %s", coach.id, guild.id)
-                            except Exception as e:
-                                logger.exception("Failed to send AFK escalation to coach %s in guild %s", coach.id, guild.id)
-
-                await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
-                if confirmation is WorkConfirmationResult.TIMED_OUT:
+        if removal_action == "afk" and self._coach_secretary is not None:
+            logger.info("Checking coach config for AFK escalation in guild %s", guild.id)
+            coach_config = await self._coach_secretary.get_config(guild.id)
+            if coach_config is not None:
+                logger.info("Found coach config, fetching coach ID %s", coach_config.coach_id)
+                coach = guild.get_member(coach_config.coach_id)
+                if coach is not None:
+                    logger.info("Coach %s found in guild, preparing to send DM", coach.id)
                     try:
-                        if removal_action == "afk":
-                            await member.send("You were moved to AFK because you did not confirm in time.")
-                        else:
-                            await member.send("You were disconnected because you did not confirm in time.")
+                        view = AfkEscalationView(
+                            member=member,
+                            guild=guild,
+                            original_channel=voice_channel,
+                            config=coach_config,
+                        )
+                        await coach.send(
+                            f"{member.mention} was moved to the AFK room after failing the AFK confirmation check.\n"
+                            f"Original channel: {voice_channel.name if voice_channel else 'Unknown'}\n"
+                            f"Time: <t:{int(datetime.now(tz=UTC).timestamp())}:F>\n"
+                            f"Reason: AFK timeout\n\n"
+                            f"Do you want me to move them to your office for a warning?",
+                            view=view,
+                        )
+                        logger.info("Triggered AFK escalation for %s to coach %s in guild %s", member.id, coach.id, guild.id)
                     except discord.Forbidden:
-                        pass
-                break
-        except asyncio.CancelledError:
-            pass
-        finally:
-            task = asyncio.current_task()
-            if task is not None:
-                self._clear_watchdog_if_current(member_id, task)
+                        logger.warning("Could not DM coach %s for AFK escalation in guild %s", coach.id, guild.id)
+                    except Exception:
+                        logger.exception("Failed to send AFK escalation to coach %s in guild %s", coach.id, guild.id)
+
+        await self._close_voice_session(guild.id, member.id, datetime.now(tz=UTC))
+        if confirmation is WorkConfirmationResult.TIMED_OUT:
+            try:
+                if removal_action == "afk":
+                    await member.send("You were moved to AFK because you did not confirm in time.")
+                else:
+                    await member.send("You were disconnected because you did not confirm in time.")
+            except discord.Forbidden:
+                pass
+        return False
 
     @staticmethod
     async def _move_member_out_of_solo_check(member: discord.Member) -> SoloRemovalAction | None:
