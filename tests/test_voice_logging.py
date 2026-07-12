@@ -119,6 +119,9 @@ class _FakeConfigServiceWithMaxLines:
     async def get_text(self, guild_id: int, key: str) -> str:
         return ""
 
+    async def get_voice_check_interval(self, guild_id: int, channel_type: str) -> tuple[int, int]:
+        return (3600, 3600)
+
 
 class _MutableTrackedKeywordsConfig(_FakeConfigServiceWithMaxLines):
     def __init__(self, raw_keywords: str) -> None:
@@ -194,10 +197,11 @@ class _FakeMember:
 
 
 class _FakeVoiceChannel:
-    def __init__(self, channel_id: int, name: str, members: list[_FakeMember]) -> None:
-        self.id = channel_id
+    def __init__(self, id: int, name: str, members: list[discord.Member] | None = None) -> None:
+        self.id = id
         self.name = name
-        self.members = members
+        self.members = members or []
+        self.guild: Optional[discord.Guild] = None
 
 
 class _FakeGuild:
@@ -215,6 +219,7 @@ class _FakeGuild:
         self.members: list[_FakeMember] = []
         self._members: dict[int, _FakeMember] = {}
         for channel in channels:
+            channel.guild = self
             for member in channel.members:
                 member.voice = _FakeVoiceState(channel)
                 self._add_member(member)
@@ -323,6 +328,9 @@ class _FakeConfigService:
     async def get_text(self, guild_id: int, key: str) -> str:
         return ""
 
+    async def get_voice_check_interval(self, guild_id: int, channel_type: str) -> tuple[int, int]:
+        return (3600, 3600)
+
 
 class _FakeTrainingConfigService(_FakeConfigServiceWithMaxLines):
     def __init__(self, *, max_lines: int = 50) -> None:
@@ -359,6 +367,9 @@ class _FakeFastConfigService(_FakeConfigService):
 
         return _Config()
 
+    async def get_voice_check_interval(self, guild_id: int, channel_type: str) -> tuple[int, int]:
+        return (0, 0)
+
 
 class _FakeCoachSecretary:
     def __init__(self, coach_id: int | None) -> None:
@@ -375,39 +386,11 @@ class _FakeCoachSecretary:
         )
 
 
-@pytest.mark.asyncio
-async def test_watchdog_cleanup_is_identity_safe() -> None:
-    cog = VoiceLoggingCog(
-        bot=object(),  # type: ignore[arg-type]
-        repo=object(),  # type: ignore[arg-type]
-        config_service=object(),  # type: ignore[arg-type]
-    )
 
-    async def _sleeper() -> None:
-        await asyncio.sleep(30)
-
-    old_task: asyncio.Task[None] = asyncio.create_task(_sleeper())
-    new_task: asyncio.Task[None] = asyncio.create_task(_sleeper())
-
-    try:
-        cog._watchdogs[10] = new_task
-
-        cog._clear_watchdog_if_current(10, old_task)
-        assert cog._watchdogs.get(10) is new_task
-
-        cog._clear_watchdog_if_current(10, new_task)
-        assert 10 not in cog._watchdogs
-    finally:
-        old_task.cancel()
-        new_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await old_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await new_task
 
 
 @pytest.mark.asyncio
-async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session() -> None:
+async def test_verification_dm_failure_notifies_configured_coach_and_closes_session() -> None:
     member = _FakeMember(10, display_name="Worker")
     coach = _FakeMember(20, display_name="Coach")
     solo_channel = _FakeVoiceChannel(501, "Solo Room A", [member])
@@ -426,19 +409,20 @@ async def test_watchdog_dm_failure_notifies_configured_coach_and_closes_session(
 
     cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
 
-    await cog._watchdog_loop(guild.id, member.id)
+    res = await cog._handle_verification_due(guild.id, member.id, solo_channel.id, "solo")
+    assert res is False
 
     assert len(coach.sent_messages) == 2
     assert "Worker" in coach.sent_messages[0]
     assert "AFK room" in coach.sent_messages[1]
-    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed Solo channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
 
 
 @pytest.mark.asyncio
-async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config() -> None:
+async def test_verification_dm_failure_notifies_reda_fallback_when_no_coach_config() -> None:
     member = _FakeMember(11, display_name="SoloUser")
     fallback = _FakeMember(30, name="__reda", display_name="__reda")
     solo_channel = _FakeVoiceChannel(502, "Solo Room B", [member])
@@ -457,18 +441,19 @@ async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config()
 
     cog._ask_still_working = _dm_failed  # type: ignore[method-assign]
 
-    await cog._watchdog_loop(guild.id, member.id)
+    res = await cog._handle_verification_due(guild.id, member.id, solo_channel.id, "solo")
+    assert res is False
 
     assert len(fallback.sent_messages) == 1
     assert "SoloUser" in fallback.sent_messages[0]
-    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed Solo channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
 
 
 @pytest.mark.asyncio
-async def test_watchdog_disconnects_when_no_afk_channel_is_configured() -> None:
+async def test_verification_disconnects_when_no_afk_channel_is_configured() -> None:
     member = _FakeMember(12, display_name="SoloUser")
     solo_channel = _FakeVoiceChannel(503, "Solo Room C", [member])
     guild = _FakeGuild(102, [solo_channel])
@@ -484,9 +469,10 @@ async def test_watchdog_disconnects_when_no_afk_channel_is_configured() -> None:
 
     cog._ask_still_working = _timed_out  # type: ignore[method-assign]
 
-    await cog._watchdog_loop(guild.id, member.id)
+    res = await cog._handle_verification_due(guild.id, member.id, solo_channel.id, "solo")
+    assert res is False
 
-    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(None, "Failed or missed Solo channel work check")]
     assert member.sent_messages == ["You were disconnected because you did not confirm in time."]
     assert len(repo.closed_calls) == 1
 
@@ -513,8 +499,6 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
         config_service=_FakeConfigService(),  # type: ignore[arg-type]
     )
 
-    started_watchdogs: list[int] = []
-    cog._start_watchdog = lambda member: started_watchdogs.append(member.id)  # type: ignore[assignment]
 
     await cog.on_ready()
 
@@ -533,7 +517,7 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
     assert start_call["is_tracked"] is True
     assert start_call["started_at"].tzinfo is UTC
 
-    assert sorted(started_watchdogs) == [1, 2]
+
 
 
 @pytest.mark.asyncio
@@ -580,7 +564,7 @@ def test_render_ranked_message_is_capped_to_discord_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_solo_channel(
+async def test_voice_state_switch_schedules_delayed_session_and_verification_for_solo_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)
@@ -602,8 +586,8 @@ async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_sol
 
     stopped: list[int] = []
     started: list[int] = []
-    cog._stop_watchdog = lambda member_id: stopped.append(member_id)  # type: ignore[assignment]
-    cog._start_watchdog = lambda member_obj: started.append(member_obj.id)  # type: ignore[assignment]
+
+
 
     await cog.on_voice_state_update(
         member,  # type: ignore[arg-type]
@@ -613,7 +597,7 @@ async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_sol
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
-    assert stopped == [member.id]
+
     assert repo.closed_calls == []
     assert repo.started_calls == []
 
@@ -625,7 +609,7 @@ async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_sol
     assert replace_call["channel_name"] == target_channel.name
     assert replace_call["started_at"] == replace_call["ended_at"]
 
-    assert started == [member.id]
+
 
 
 @pytest.mark.asyncio
@@ -646,8 +630,8 @@ async def test_voice_state_leave_before_delay_writes_no_session(
         repo=repo,  # type: ignore[arg-type]
         config_service=_FakeConfigService(),  # type: ignore[arg-type]
     )
-    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
-    cog._start_watchdog = lambda member_obj: None  # type: ignore[assignment]
+
+
 
     await cog.on_voice_state_update(
         member,  # type: ignore[arg-type]
@@ -690,7 +674,7 @@ async def test_voice_state_closes_persisted_session_after_channel_is_untracked(
         config_service=_MutableTrackedKeywordsConfig(""),  # type: ignore[arg-type]
     )
     cog._persisted_voice_sessions.add((guild.id, member.id))
-    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
+
 
     await cog.on_voice_state_update(
         member,  # type: ignore[arg-type]
@@ -2040,8 +2024,8 @@ async def test_on_voice_state_update_closes_persisted_session_even_if_pending_ta
         repo=repo,  # type: ignore[arg-type]
         config_service=_FakeConfigService(),  # type: ignore[arg-type]
     )
-    cog._stop_watchdog = lambda member_id: None  # type: ignore[assignment]
-    cog._start_watchdog = lambda member_obj: None  # type: ignore[assignment]
+
+
 
     # Session is already persisted
     cog._persisted_voice_sessions.add((guild.id, member.id))

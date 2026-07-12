@@ -67,12 +67,12 @@ async def test_afk_escalation_triggers_coach_dm() -> None:
 
     cog._ask_still_working = _timed_out  # type: ignore[method-assign]
 
-    await cog._watchdog_loop(guild.id, member.id)
+    await cog._handle_verification_due(guild.id, member.id, solo_channel.id, "solo")
 
     assert len(coach.sent_messages) == 1
     assert "<@10> was moved to the AFK room" in coach.sent_messages[0]
     assert "Solo Room A" in coach.sent_messages[0]
-    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed Solo channel work check")]
 
 
 @pytest.mark.asyncio

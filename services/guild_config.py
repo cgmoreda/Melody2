@@ -48,10 +48,21 @@ CONFIG_SPECS: dict[str, tuple[str, int, int, str]] = {
     ),
 }
 
+VOICE_CHECK_INTERVAL_KEYS: frozenset[str] = frozenset({
+    "voice_check_interval_solo",
+    "voice_check_interval_duo",
+    "voice_check_interval_team",
+    "voice_check_interval_invite",
+})
+
 DEFAULT_TEXT_CONFIG: dict[str, str] = {
     "training_role_substring": "training arc",
     "coach_role_substring": "coach",
     "voice_tracked_keywords": "",
+    "voice_check_interval_solo": "",
+    "voice_check_interval_duo": "",
+    "voice_check_interval_team": "",
+    "voice_check_interval_invite": "",
 }
 
 TEXT_CONFIG_SPECS: dict[str, tuple[int, str]] = {
@@ -66,6 +77,22 @@ TEXT_CONFIG_SPECS: dict[str, tuple[int, str]] = {
     "voice_tracked_keywords": (
         256,
         "Comma-separated keywords. Channels whose name contains any keyword count in voice hours.",
+    ),
+    "voice_check_interval_solo": (
+        16,
+        "Random interval range in minutes for solo channel AFK checks (e.g. 45-60).",
+    ),
+    "voice_check_interval_duo": (
+        16,
+        "Random interval range in minutes for duo channel AFK checks (e.g. 60-90).",
+    ),
+    "voice_check_interval_team": (
+        16,
+        "Random interval range in minutes for team channel AFK checks (e.g. 75-120).",
+    ),
+    "voice_check_interval_invite": (
+        16,
+        "Random interval range in minutes for invite channel AFK checks (e.g. 90-150).",
     ),
 }
 
@@ -145,6 +172,47 @@ class GuildConfigService:
         cached = self._text_cache[guild_id]
         return dict(cached)
 
+    async def get_voice_check_interval(
+        self, guild_id: int, channel_type: str,
+    ) -> tuple[int, int]:
+        """Return ``(min_seconds, max_seconds)`` for the voice check interval.
+
+        If a per-channel-type range is configured (e.g. ``"45-60"`` minutes),
+        it is parsed and converted to seconds.  Otherwise the legacy
+        ``voice_check_interval_seconds`` integer value is used for both
+        bounds, providing transparent backwards compatibility.
+        """
+        key = f"voice_check_interval_{channel_type}"
+        raw = await self.get_text(guild_id, key)
+        if raw:
+            return self.parse_interval_range(raw)
+        config = await self.get(guild_id)
+        s = config.voice_check_interval_seconds
+        return (s, s)
+
+    @staticmethod
+    def parse_interval_range(raw: str) -> tuple[int, int]:
+        """Parse ``'MIN-MAX'`` minutes into ``(min_seconds, max_seconds)``."""
+        parts = raw.strip().split("-")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid interval range: {raw!r}. Expected format: MIN-MAX"
+            )
+        try:
+            min_minutes = int(parts[0].strip())
+            max_minutes = int(parts[1].strip())
+        except ValueError:
+            raise ValueError(
+                f"Invalid interval range: {raw!r}. MIN and MAX must be integers."
+            )
+        if min_minutes <= 0 or max_minutes <= 0:
+            raise ValueError("Interval values must be positive.")
+        if min_minutes > max_minutes:
+            raise ValueError(
+                f"MIN ({min_minutes}) must be <= MAX ({max_minutes})."
+            )
+        return (min_minutes * 60, max_minutes * 60)
+
     async def set_text(self, guild_id: int, key: str, value: str) -> str:
         normalized = key.lower()
         if normalized not in TEXT_CONFIG_SPECS:
@@ -155,6 +223,9 @@ class GuildConfigService:
             raise ValueError(f"{normalized} cannot be empty")
         if len(clean) > max_len:
             raise ValueError(f"{normalized} is too long (max {max_len} chars)")
+
+        if normalized in VOICE_CHECK_INTERVAL_KEYS:
+            self.parse_interval_range(clean)
 
         await self._repo.upsert_guild_text_config(guild_id, normalized, clean)
         cached = await self.get_text_all(guild_id)
