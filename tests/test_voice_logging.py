@@ -197,7 +197,7 @@ class _FakeMember:
 
 
 class _FakeVoiceChannel:
-    def __init__(self, id: int, name: str, members: list[discord.Member] = None) -> None:
+    def __init__(self, id: int, name: str, members: list[discord.Member] | None = None) -> None:
         self.id = id
         self.name = name
         self.members = members or []
@@ -415,14 +415,14 @@ async def test_verification_dm_failure_notifies_configured_coach_and_closes_sess
     assert len(coach.sent_messages) == 2
     assert "Worker" in coach.sent_messages[0]
     assert "AFK room" in coach.sent_messages[1]
-    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed Solo channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
 
 
 @pytest.mark.asyncio
-async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config() -> None:
+async def test_verification_dm_failure_notifies_reda_fallback_when_no_coach_config() -> None:
     member = _FakeMember(11, display_name="SoloUser")
     fallback = _FakeMember(30, name="__reda", display_name="__reda")
     solo_channel = _FakeVoiceChannel(502, "Solo Room B", [member])
@@ -446,7 +446,7 @@ async def test_watchdog_dm_failure_notifies_reda_fallback_when_no_coach_config()
 
     assert len(fallback.sent_messages) == 1
     assert "SoloUser" in fallback.sent_messages[0]
-    assert member.move_calls == [(afk_channel, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(afk_channel, "Failed or missed Solo channel work check")]
     assert len(repo.closed_calls) == 1
     assert repo.closed_calls[0][0] == guild.id
     assert repo.closed_calls[0][1] == member.id
@@ -472,7 +472,7 @@ async def test_verification_disconnects_when_no_afk_channel_is_configured() -> N
     res = await cog._handle_verification_due(guild.id, member.id, solo_channel.id, "solo")
     assert res is False
 
-    assert member.move_calls == [(None, "Failed or missed solo-channel work check")]
+    assert member.move_calls == [(None, "Failed or missed Solo channel work check")]
     assert member.sent_messages == ["You were disconnected because you did not confirm in time."]
     assert len(repo.closed_calls) == 1
 
@@ -498,8 +498,6 @@ async def test_on_ready_reconciles_stale_open_sessions_without_duplicate_starts(
         repo=repo,  # type: ignore[arg-type]
         config_service=_FakeConfigService(),  # type: ignore[arg-type]
     )
-
-    started_watchdogs: list[int] = []
 
 
     await cog.on_ready()
@@ -566,7 +564,7 @@ def test_render_ranked_message_is_capped_to_discord_limit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_voice_state_switch_schedules_delayed_session_and_watchdog_for_solo_channel(
+async def test_voice_state_switch_schedules_delayed_session_and_verification_for_solo_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(voice_logging_module.discord, "VoiceChannel", _FakeVoiceChannel)

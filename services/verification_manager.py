@@ -10,6 +10,22 @@ from typing import Awaitable, Callable, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
+# ── Channel type display names ──────────────────────────────────────
+
+_CHANNEL_TYPE_DISPLAY: dict[str, str] = {
+    "solo": "Solo",
+    "duo": "Duo",
+    "team": "Team",
+    "invite": "Invite",
+}
+
+
+def channel_type_display_name(channel_type: str) -> str:
+    """Return a user-facing display name for a channel type."""
+    return _CHANNEL_TYPE_DISPLAY.get(channel_type, channel_type.title())
+
+
+# ── Protocols ───────────────────────────────────────────────────────
 
 class VerificationCallback(Protocol):
     async def __call__(
@@ -37,6 +53,13 @@ class IntervalProvider(Protocol):
         ...
 
 
+# ── Session key type ────────────────────────────────────────────────
+
+SessionKey = tuple[int, int]  # (guild_id, member_id)
+
+
+# ── Data classes ────────────────────────────────────────────────────
+
 @dataclass
 class VerificationSession:
     """Represents an active verification timer for a specific member in a channel."""
@@ -48,6 +71,10 @@ class VerificationSession:
     created_at: datetime
     generation: int
     task: Optional[asyncio.Task[None]] = None
+
+    @property
+    def key(self) -> SessionKey:
+        return (self.guild_id, self.member_id)
 
 
 @dataclass
@@ -73,41 +100,49 @@ class VerificationManager:
         self._get_interval = get_interval
         self._on_verification_due = on_verification_due
         self._random_fn = random_fn
-        self._sessions: dict[int, VerificationSession] = {}
+        self._sessions: dict[SessionKey, VerificationSession] = {}
         self._generation_counter = 0
         self.metrics = Metrics()
+
+    @staticmethod
+    def _key(guild_id: int, member_id: int) -> SessionKey:
+        return (guild_id, member_id)
 
     def _next_generation(self) -> int:
         self._generation_counter += 1
         return self._generation_counter
 
-    def is_scheduled(self, member_id: int) -> bool:
+    def is_scheduled(self, guild_id: int, member_id: int) -> bool:
         """Check if a member currently has a verification session."""
-        return member_id in self._sessions
+        return self._key(guild_id, member_id) in self._sessions
 
-    def cancel(self, member_id: int) -> None:
+    def cancel(self, guild_id: int, member_id: int) -> None:
         """Cancel the pending verification session for a member."""
-        session = self._sessions.pop(member_id, None)
+        key = self._key(guild_id, member_id)
+        session = self._sessions.pop(key, None)
         if session:
             if session.task and not session.task.done():
                 session.task.cancel()
             self.metrics.cancelled += 1
-            logger.debug("Cancelled verification for member %s in channel %s.", member_id, session.channel_id)
+            logger.debug(
+                "Cancelled verification for member %s in guild %s channel %s.",
+                member_id, guild_id, session.channel_id,
+            )
 
     def cancel_for_channel(self, channel_id: int) -> None:
         """Cancel verification sessions for all members in a given channel."""
-        member_ids = [
-            member_id
-            for member_id, session in self._sessions.items()
+        keys = [
+            key
+            for key, session in self._sessions.items()
             if session.channel_id == channel_id
         ]
-        for member_id in member_ids:
-            self.cancel(member_id)
+        for guild_id, member_id in keys:
+            self.cancel(guild_id, member_id)
 
     def shutdown(self) -> None:
         """Cancel all pending verification sessions."""
-        for member_id in list(self._sessions.keys()):
-            self.cancel(member_id)
+        for guild_id, member_id in list(self._sessions.keys()):
+            self.cancel(guild_id, member_id)
 
     async def evaluate_channel(
         self,
@@ -136,14 +171,15 @@ class VerificationManager:
             return
 
         for member_id in human_member_ids:
+            key = self._key(guild_id, member_id)
             # Idempotency check: if already scheduled for this specific channel, do nothing
-            existing = self._sessions.get(member_id)
+            existing = self._sessions.get(key)
             if existing and existing.channel_id == channel_id and existing.channel_type == channel_type:
                 continue
 
             # If they were in another channel previously and moved, cancel old session
             if existing:
-                self.cancel(member_id)
+                self.cancel(guild_id, member_id)
 
             await self._schedule(guild_id, member_id, channel_id, channel_type)
 
@@ -168,12 +204,16 @@ class VerificationManager:
             generation=generation,
         )
 
-        self._sessions[member_id] = session
+        key = self._key(guild_id, member_id)
+        self._sessions[key] = session
         session.task = asyncio.create_task(
             self._timer_loop(session, delay)
         )
         self.metrics.scheduled += 1
-        logger.debug("Scheduled verification for member %s in %ss (gen %s).", member_id, delay, generation)
+        logger.debug(
+            "Scheduled verification for member %s in guild %s in %ss (gen %s).",
+            member_id, guild_id, delay, generation,
+        )
 
     async def _timer_loop(self, session: VerificationSession, delay: int) -> None:
         """Wait for the delay, then invoke the callback."""
@@ -183,7 +223,8 @@ class VerificationManager:
             return
 
         # Check generation token to prevent race conditions
-        current = self._sessions.get(session.member_id)
+        key = session.key
+        current = self._sessions.get(key)
         if current is None or current.generation != session.generation:
             logger.debug("Timer for member %s aborted due to generation mismatch.", session.member_id)
             return
@@ -200,11 +241,11 @@ class VerificationManager:
             )
         except Exception:
             logger.exception("Verification callback failed for member %s.", session.member_id)
-            self.cancel(session.member_id)
+            self.cancel(session.guild_id, session.member_id)
             return
 
         # Recheck token in case it was cancelled while awaiting callback
-        current = self._sessions.get(session.member_id)
+        current = self._sessions.get(key)
         if current is None or current.generation != session.generation:
             return
 
@@ -220,4 +261,4 @@ class VerificationManager:
         else:
             self.metrics.verification_failed += 1
             # Verification failed, end session
-            self.cancel(session.member_id)
+            self.cancel(session.guild_id, session.member_id)

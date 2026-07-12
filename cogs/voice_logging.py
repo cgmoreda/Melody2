@@ -20,7 +20,7 @@ from services.command_parser import (
 )
 from services.discord_output import send_context_lines_chunks, send_context_text_chunks, split_lines_chunks
 from services.guild_config import GuildConfigService
-from services.verification_manager import VerificationManager
+from services.verification_manager import VerificationManager, channel_type_display_name
 from services.voice_alert import VoiceAlertService
 from services.voice_service import VoiceService
 
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 _VOICE_SERVICE = VoiceService()
 logger = logging.getLogger(__name__)
 VOICE_SESSION_MIN_SECONDS = 60.0
-SoloRemovalAction = Literal["afk", "disconnect"]
+VerificationRemovalAction = Literal["afk", "disconnect"]
 VoiceHoursAction = Literal[
     "leaderboard",
     "top",
@@ -1027,16 +1027,17 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
             return False
 
         config = await self._config.get(guild_id)
-        confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds, voice_channel)
+        confirmation = await self._ask_still_working(member, config.voice_confirm_timeout_seconds, voice_channel, channel_type)
         if confirmation is WorkConfirmationResult.CONFIRMED:
             return True
 
         if confirmation is WorkConfirmationResult.DM_FAILED:
-            await self._notify_watchdog_dm_failure(guild, member)
+            await self._notify_verification_dm_failure(guild, member)
 
-        removal_action: SoloRemovalAction | None = None
+        display_name = channel_type_display_name(channel_type)
+        removal_action: VerificationRemovalAction | None = None
         if member.voice is not None:
-            removal_action = await self._move_member_out_of_solo_check(member)
+            removal_action = await self._move_member_out_of_channel(member, display_name)
 
         if removal_action is None:
             if confirmation is WorkConfirmationResult.TIMED_OUT:
@@ -1089,31 +1090,34 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
         return False
 
     @staticmethod
-    async def _move_member_out_of_solo_check(member: discord.Member) -> SoloRemovalAction | None:
+    async def _move_member_out_of_channel(member: discord.Member, display_name: str) -> VerificationRemovalAction | None:
+        reason = f"Failed or missed {display_name} channel work check"
         target_channel = member.guild.afk_channel
         if target_channel is not None:
             try:
-                await member.move_to(target_channel, reason="Failed or missed solo-channel work check")
+                await member.move_to(target_channel, reason=reason)
                 return "afk"
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
         try:
-            await member.move_to(None, reason="Failed or missed solo-channel work check")
+            await member.move_to(None, reason=reason)
             return "disconnect"
         except (discord.Forbidden, discord.HTTPException):
             return None
 
     async def _ask_still_working(
-        self, 
-        member: discord.Member, 
+        self,
+        member: discord.Member,
         timeout_seconds: int,
         voice_channel: Optional[discord.VoiceChannel] = None,
+        channel_type: str = "solo",
     ) -> WorkConfirmationResult:
         view = WorkConfirmationView(member.id, timeout_seconds)
         timeout_minutes = max(1, timeout_seconds // 60)
+        display_name = channel_type_display_name(channel_type)
         prompt = (
-            "Are you still working in the solo channel?\n"
+            f"Are you still working in the {display_name} channel?\n"
             f"Click **Yes, still working** within {timeout_minutes} minutes to keep your session."
         )
 
@@ -1158,12 +1162,12 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
 
         return WorkConfirmationResult.TIMED_OUT
 
-    async def _resolve_watchdog_alert_recipient(self, guild: discord.Guild) -> Optional[discord.Member]:
+    async def _resolve_verification_alert_recipient(self, guild: discord.Guild) -> Optional[discord.Member]:
         if self._coach_secretary is not None:
             try:
                 config = await self._coach_secretary.get_config(guild.id)
             except Exception:
-                logger.exception("Failed loading coach config for solo watchdog alert in guild %s", guild.id)
+                logger.exception("Failed loading coach config for verification alert in guild %s", guild.id)
                 config = None
             if config is not None:
                 coach = guild.get_member(config.coach_id)
@@ -1182,22 +1186,22 @@ class VoiceLoggingCog(commands.Cog, name="VoiceLogging"):
                 return member
         return None
 
-    async def _notify_watchdog_dm_failure(self, guild: discord.Guild, member: discord.Member) -> None:
-        recipient = await self._resolve_watchdog_alert_recipient(guild)
+    async def _notify_verification_dm_failure(self, guild: discord.Guild, member: discord.Member) -> None:
+        recipient = await self._resolve_verification_alert_recipient(guild)
         if recipient is None:
-            logger.warning("No coach or __reda fallback found for solo watchdog alert in guild %s", guild.id)
+            logger.warning("No coach or __reda fallback found for verification alert in guild %s", guild.id)
             return
 
         guild_name = getattr(guild, "name", str(guild.id))
         member_name = getattr(member, "display_name", str(member.id))
         try:
             await recipient.send(
-                f"I could not DM {member_name} ({member.id}) for the solo-channel work check "
+                f"I could not DM {member_name} ({member.id}) for the work check "
                 f"in {guild_name}. Disconnecting them and closing the session."
             )
         except (discord.Forbidden, discord.HTTPException):
             logger.warning(
-                "Failed sending solo watchdog alert to %s in guild %s",
+                "Failed sending verification alert to %s in guild %s",
                 getattr(recipient, "id", "unknown"),
                 guild.id,
             )

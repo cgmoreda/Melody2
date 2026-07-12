@@ -39,8 +39,8 @@ async def test_evaluate_channel_schedules_solo(manager):
         channel_type="solo",
         human_member_ids=[2, 3],
     )
-    assert manager.is_scheduled(2)
-    assert manager.is_scheduled(3)
+    assert manager.is_scheduled(1, 2)
+    assert manager.is_scheduled(1, 3)
     assert manager.metrics.scheduled == 2
 
 
@@ -52,7 +52,7 @@ async def test_evaluate_channel_schedules_duo_when_alone(manager):
         channel_type="duo",
         human_member_ids=[2],
     )
-    assert manager.is_scheduled(2)
+    assert manager.is_scheduled(1, 2)
     assert manager.metrics.scheduled == 1
 
 
@@ -65,7 +65,7 @@ async def test_evaluate_channel_cancels_duo_when_not_alone(manager):
         channel_type="duo",
         human_member_ids=[2],
     )
-    assert manager.is_scheduled(2)
+    assert manager.is_scheduled(1, 2)
 
     # Second member joins
     await manager.evaluate_channel(
@@ -74,8 +74,8 @@ async def test_evaluate_channel_cancels_duo_when_not_alone(manager):
         channel_type="duo",
         human_member_ids=[2, 3],
     )
-    assert not manager.is_scheduled(2)
-    assert not manager.is_scheduled(3)
+    assert not manager.is_scheduled(1, 2)
+    assert not manager.is_scheduled(1, 3)
     assert manager.metrics.cancelled == 1
 
 
@@ -109,14 +109,15 @@ async def test_timer_loop_generation_mismatch(manager):
         channel_type="solo",
         human_member_ids=[2],
     )
-    session = manager._sessions[2]
+    key = (1, 2)
+    session = manager._sessions[key]
 
     # Simulate a new session replacing the old one
     new_session = VerificationSession(
         member_id=2, guild_id=1, channel_id=101, channel_type="solo",
         created_at=session.created_at, generation=session.generation + 1
     )
-    manager._sessions[2] = new_session
+    manager._sessions[key] = new_session
 
     # Run the timer loop manually with the OLD session
     await manager._timer_loop(session, 0)
@@ -136,7 +137,8 @@ async def test_timer_loop_reschedules_on_success(manager, on_due):
         channel_type="solo",
         human_member_ids=[2],
     )
-    session = manager._sessions[2]
+    key = (1, 2)
+    session = manager._sessions[key]
 
     # Run loop manually (delay=0)
     await manager._timer_loop(session, 0)
@@ -158,7 +160,8 @@ async def test_timer_loop_cancels_on_failure(manager, on_due):
         channel_type="solo",
         human_member_ids=[2],
     )
-    session = manager._sessions[2]
+    key = (1, 2)
+    session = manager._sessions[key]
 
     # Run loop manually
     await manager._timer_loop(session, 0)
@@ -166,4 +169,4 @@ async def test_timer_loop_cancels_on_failure(manager, on_due):
     on_due.assert_called_once_with(1, 2, 101, "solo")
     assert manager.metrics.completed == 1
     assert manager.metrics.verification_failed == 1
-    assert not manager.is_scheduled(2)
+    assert not manager.is_scheduled(1, 2)
