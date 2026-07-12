@@ -170,6 +170,12 @@ class VerificationManager:
             self.cancel_for_channel(channel_id)
             return
 
+        current_member_ids = set(human_member_ids)
+        # Cancel sessions for members who have left this channel.
+        for (g_id, m_id), sess in list(self._sessions.items()):
+            if g_id == guild_id and sess.channel_id == channel_id and m_id not in current_member_ids:
+                self.cancel(g_id, m_id)
+
         for member_id in human_member_ids:
             key = self._key(guild_id, member_id)
             # Idempotency check: if already scheduled for this specific channel, do nothing
